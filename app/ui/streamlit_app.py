@@ -9,14 +9,19 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
 from app.agent import IndustrialAgent
 from app.analysis import analyze_file
+from app.analysis.detection import DETECTOR_RECOMMENDED_THRESHOLDS
 from app.config import get_settings
 from app.data import save_uploaded_file
+from app.diagnosis import AutomaticDiagnosisService, build_fallback_diagnosis
+from app.llm import format_llm_error
+from app.model_store import list_autoencoder_models
 from app.models import AnalysisConfig, AnalysisResult
 
 
@@ -47,13 +52,35 @@ def run_app() -> None:
         _render_empty_state()
         return
 
-    overview_tab, evidence_tab, report_tab, agent_tab = st.tabs(
-        ["风险总览", "时序证据", "诊断报告", "智能体协同"]
+    (
+        overview_tab,
+        evidence_tab,
+        regime_tab,
+        root_cause_tab,
+        relationship_tab,
+        report_tab,
+        agent_tab,
+    ) = st.tabs(
+        [
+            "风险总览",
+            "时序证据",
+            "工况识别",
+            "根因诊断",
+            "关联诊断",
+            "诊断报告",
+            "智能决策",
+        ]
     )
     with overview_tab:
         _render_overview(result)
     with evidence_tab:
         _render_evidence(result)
+    with regime_tab:
+        _render_regimes(result)
+    with root_cause_tab:
+        _render_root_causes(result)
+    with relationship_tab:
+        _render_relationships(result)
     with report_tab:
         _render_report(result)
     with agent_tab:
@@ -100,13 +127,23 @@ def _render_sidebar() -> tuple[Path, AnalysisConfig] | None:
 
         st.divider()
         st.subheader("检测参数")
-        detector_options = ["hybrid", "mad", "isolation_forest"]
+        detector_options = [
+            "time_frequency_relation",
+            "window_autoencoder",
+            "hybrid",
+            "pca_reconstruction",
+            "mad",
+            "isolation_forest",
+        ]
         detector = st.selectbox(
             "异常检测器",
             options=detector_options,
             index=detector_options.index(settings.anomaly_detector),
             format_func={
-                "hybrid": "时序-工况混合检测器（推荐）",
+                "time_frequency_relation": "时频关系多路径检测器（推荐）",
+                "window_autoencoder": "滑动窗口 AutoEncoder 检测器（快速基线）",
+                "hybrid": "时序-工况混合检测器",
+                "pca_reconstruction": "PCA 多变量重构检测器",
                 "mad": "稳健 MAD",
                 "isolation_forest": "Isolation Forest",
             }.get,
@@ -115,9 +152,12 @@ def _render_sidebar() -> tuple[Path, AnalysisConfig] | None:
             "异常阈值",
             min_value=2.0,
             max_value=10.0,
-            value=float(settings.anomaly_threshold),
+            value=float(
+                DETECTOR_RECOMMENDED_THRESHOLDS.get(detector, settings.anomaly_threshold)
+            ),
             step=0.1,
             help="越低越敏感，也更容易误报。",
+            key=f"threshold_{detector}",
         )
         window = st.number_input(
             "滚动窗口（采样点）",
@@ -135,6 +175,13 @@ def _render_sidebar() -> tuple[Path, AnalysisConfig] | None:
 
         run_clicked = st.button("开始智能分析", type="primary", width="stretch")
         st.caption("原始 CSV 由本地算法处理，大模型只读取结构化分析摘要。")
+        stored_models = list_autoencoder_models()
+        if stored_models:
+            latest = stored_models[0]
+            st.caption(
+                f"健康模型仓库：{len(stored_models)} 个｜最新 v{latest['format_version']}｜"
+                f"{latest['sensor_count']} 传感器"
+            )
 
     if not run_clicked:
         return None
@@ -168,6 +215,14 @@ def _render_empty_state() -> None:
     with right:
         st.metric("默认样例", "SKAB valve1 / 0.csv")
         st.caption(f"数据可用：{'是' if settings.default_skab_file.exists() else '否'}")
+        stored_models = list_autoencoder_models()
+        st.metric("已训练健康模型", len(stored_models))
+        if stored_models:
+            latest = stored_models[0]
+            st.caption(
+                f"最新模型：{latest['model_id']}｜v{latest['format_version']}｜"
+                f"{latest['window_size']} 点窗口"
+            )
 
 
 def _render_overview(result: AnalysisResult) -> None:
@@ -299,6 +354,140 @@ def _render_evidence(result: AnalysisResult) -> None:
             st.success("该传感器末段未发现明显趋势漂移。")
 
 
+def _render_relationships(result: AnalysisResult) -> None:
+    """展示异常事件内的相关性变化和领先滞后线索。"""
+
+    if not result.relationship_diagnostics:
+        st.info("当前异常事件不足以形成稳定的多传感器关系判断。")
+        return
+
+    options = {
+        f"事件 {item['事件编号']}｜{item['开始时间']}": item
+        for item in result.relationship_diagnostics
+    }
+    selected_label = st.selectbox("选择异常事件", options=list(options), key="relationship_event")
+    diagnostic = options[selected_label]
+    st.subheader(diagnostic["关系结论"])
+    st.caption(diagnostic["使用边界"])
+
+    relation_rows = pd.DataFrame(diagnostic["重点关系"])
+    left, right = st.columns([1.1, 0.9], gap="large")
+    with left:
+        st.dataframe(relation_rows, hide_index=True, width="stretch")
+    with right:
+        st.plotly_chart(_build_relationship_chart(diagnostic), width="stretch")
+
+    st.subheader("建议排查顺序")
+    for index, relation in enumerate(diagnostic["重点关系"][:3], start=1):
+        st.markdown(
+            f"**{index}.** {relation['时滞解释']}；事件前后相关性变化 "
+            f"{relation['相关性变化']}，优先核查两测点对应的共同负载、控制指令和部件链路。"
+        )
+
+
+def _render_root_causes(result: AnalysisResult) -> None:
+    """展示确定性候选根因、证据缺口和待确认工单。"""
+
+    if not result.event_diagnoses:
+        st.success("当前没有异常事件需要生成候选根因。")
+        return
+
+    options = {
+        f"事件 {item.event_number}｜{item.event_start}｜{item.risk_level}": item
+        for item in result.event_diagnoses
+    }
+    selected_label = st.selectbox("选择异常事件", list(options), key="root_cause_event")
+    diagnosis = options[selected_label]
+    primary = diagnosis.primary_candidate
+    if primary is None:
+        st.warning("当前证据不足以形成可排序候选，需要补充设备和工况资料。")
+        return
+
+    metrics = st.columns(4)
+    metrics[0].metric("诊断状态", diagnosis.diagnosis_status)
+    metrics[1].metric("首要候选", primary.name)
+    metrics[2].metric("候选置信度", f"{primary.confidence:.0%}")
+    metrics[3].metric("工况上下文", diagnosis.regime_context)
+    st.progress(primary.confidence, text=f"置信等级：{primary.confidence_level}")
+    st.caption("置信度来自通用模式与时序证据匹配，不代表企业设备故障已确诊。")
+
+    left, right = st.columns(2, gap="large")
+    with left:
+        st.subheader("支持证据")
+        for item in primary.supporting_evidence:
+            st.markdown(f"- {item}")
+    with right:
+        st.subheader("证据缺口")
+        for item in primary.missing_evidence:
+            st.markdown(f"- {item}")
+
+    st.subheader("候选根因排序")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "排名": index,
+                    "候选根因": item.name,
+                    "类别": item.category,
+                    "置信度": f"{item.confidence:.0%}",
+                    "等级": item.confidence_level,
+                    "规则来源": item.source,
+                }
+                for index, item in enumerate(diagnosis.candidates, start=1)
+            ]
+        ),
+        hide_index=True,
+        width="stretch",
+    )
+
+    st.subheader("现场处置顺序")
+    for index, action in enumerate(diagnosis.work_order_actions, start=1):
+        st.markdown(f"**{index}.** {action}")
+
+    work_order = next(
+        (
+            item
+            for item in result.work_order_drafts
+            if item.event_number == diagnosis.event_number
+        ),
+        None,
+    )
+    if work_order:
+        with st.expander(f"工单草案 {work_order.work_order_id}", expanded=True):
+            st.json(
+                {
+                    "优先级": work_order.priority,
+                    "标题": work_order.title,
+                    "状态": work_order.status,
+                    "建议角色": work_order.assigned_role,
+                    "必须回写": list(work_order.required_feedback),
+                }
+            )
+
+
+def _render_regimes(result: AnalysisResult) -> None:
+    """展示稳定工况、过渡强度和异常事件工况上下文。"""
+
+    regimes = result.operating_regimes
+    if regimes is None:
+        st.info("当前分析未生成工况识别结果。")
+        return
+
+    metrics = st.columns(4)
+    metrics[0].metric("稳定工况", regimes.state_count)
+    metrics[1].metric("过渡点", int(regimes.transition_mask.sum()))
+    metrics[2].metric("事件上下文", len(regimes.event_contexts))
+    metrics[3].metric("抑制事件", regimes.suppressed_event_count)
+
+    st.plotly_chart(_build_regime_chart(result), width="stretch")
+    st.subheader("异常事件与工况切换关系")
+    if regimes.event_contexts:
+        st.dataframe(pd.DataFrame(regimes.event_contexts), hide_index=True, width="stretch")
+    else:
+        st.success("当前没有异常事件需要进行工况归因。")
+    st.caption("工况切换重合只用于提示干扰来源，默认不会删除告警事件。")
+
+
 def _render_report(result: AnalysisResult) -> None:
     """显示并下载自动生成的分析报告。"""
 
@@ -312,42 +501,74 @@ def _render_report(result: AnalysisResult) -> None:
 
 
 def _render_agent(result: AnalysisResult) -> None:
-    """提供基于当前结果的自然语言协同分析。"""
+    """提供单次自动诊断和可选的多轮追问。"""
 
     settings = get_settings()
-    st.caption("Agent 可调用同一套分析工具和本地工业知识库，不替代确定性算法。")
-    st.code(json.dumps(result.to_summary(), ensure_ascii=False, indent=2, default=str), language="json")
+    st.subheader("自动诊断结论")
+    st.caption("确定性分析和知识检索先完成，GLM-5 仅调用一次生成最终诊断。")
 
-    if not settings.llm_enabled:
-        st.warning("尚未检测到 DASHSCOPE_API_KEY。基础分析可正常使用，配置密钥后开放对话。")
-        return
+    result_key = str(result.source_path)
+    stored_diagnosis = st.session_state.get("automatic_diagnosis")
+    if st.session_state.get("automatic_diagnosis_source") != result_key:
+        stored_diagnosis = None
+        st.session_state.pop("automatic_diagnosis", None)
 
-    if "messages" not in st.session_state:
-        st.session_state["messages"] = []
-    for message in st.session_state["messages"]:
-        st.chat_message(message["role"]).write(message["content"])
+    if st.button("生成完整诊断", type="primary", key="generate_diagnosis"):
+        if not settings.llm_enabled:
+            stored_diagnosis = build_fallback_diagnosis(result)
+            st.info("未配置大模型，当前展示确定性降级诊断。")
+        else:
+            with st.spinner("正在检索工业知识并生成诊断结论..."):
+                automatic = AutomaticDiagnosisService(settings).diagnose(result)
+                stored_diagnosis = automatic.diagnosis
+                if automatic.status == "fallback" and automatic.error:
+                    st.error(automatic.error)
+                    st.info("已切换为确定性降级诊断，工业分析结果不受影响。")
+        st.session_state["automatic_diagnosis"] = stored_diagnosis
+        st.session_state["automatic_diagnosis_source"] = result_key
 
-    question = st.chat_input("例如：结合当前结果，解释最严重事件的证据和排查顺序")
-    if not question:
-        return
-    enriched_question = (
-        f"当前页面已经分析的文件是：{result.source_path}。"
-        f"当前结构化摘要如下：{json.dumps(result.to_summary(), ensure_ascii=False, default=str)}\n"
-        f"用户问题：{question}"
-    )
-    st.session_state["messages"].append({"role": "user", "content": question})
-    st.chat_message("user").write(question)
+    if stored_diagnosis:
+        st.markdown(stored_diagnosis)
 
-    try:
-        if "industrial_agent" not in st.session_state:
-            st.session_state["industrial_agent"] = IndustrialAgent()
-        response = st.chat_message("assistant").write_stream(
-            st.session_state["industrial_agent"].stream(enriched_question)
+    with st.expander("查看智能体证据与继续追问"):
+        st.code(
+            json.dumps(result.to_summary(), ensure_ascii=False, indent=2, default=str),
+            language="json",
         )
-        st.session_state["messages"].append({"role": "assistant", "content": str(response)})
-    # 大模型网络、鉴权和工具调用错误都应停留在对话区域，不能中断分析看板。
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Agent 调用失败：{exc}")
+        st.caption("多轮追问会产生额外模型请求，比赛接口每分钟最多调用 5 次。")
+
+        if not settings.llm_enabled:
+            st.warning("尚未检测到 LLM_API_KEY。基础分析和降级诊断仍可正常使用。")
+            return
+
+        if "messages" not in st.session_state:
+            st.session_state["messages"] = []
+        for message in st.session_state["messages"]:
+            st.chat_message(message["role"]).write(message["content"])
+
+        question = st.chat_input("继续追问当前异常证据或排查顺序")
+        if not question:
+            return
+        enriched_question = (
+            f"当前页面已经分析的文件是：{result.source_path}。"
+            f"当前结构化摘要如下：{json.dumps(result.to_summary(), ensure_ascii=False, default=str)}\n"
+            f"用户问题：{question}"
+        )
+        st.session_state["messages"].append({"role": "user", "content": question})
+        st.chat_message("user").write(question)
+
+        try:
+            if "industrial_agent" not in st.session_state:
+                st.session_state["industrial_agent"] = IndustrialAgent()
+            response = st.chat_message("assistant").write_stream(
+                st.session_state["industrial_agent"].stream(enriched_question)
+            )
+            st.session_state["messages"].append(
+                {"role": "assistant", "content": str(response)}
+            )
+        # 大模型网络、鉴权和工具调用错误都应停留在对话区域，不能中断分析看板。
+        except Exception as exc:  # noqa: BLE001
+            st.error(format_llm_error(exc))
 
 
 def _build_risk_chart(result: AnalysisResult) -> go.Figure:
@@ -378,6 +599,55 @@ def _build_risk_chart(result: AnalysisResult) -> go.Figure:
         legend={"orientation": "h", "y": 1.08},
         xaxis_title=None,
         yaxis_title="稳健异常分数",
+    )
+    return figure
+
+
+def _build_regime_chart(result: AnalysisResult) -> go.Figure:
+    """绘制稳定工况编号、过渡强度和异常事件位置。"""
+
+    regimes = result.operating_regimes
+    if regimes is None:
+        return go.Figure()
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=result.dataframe["datetime"],
+            y=regimes.regime_labels + 1,
+            name="稳定工况编号",
+            line={"color": "#197278", "width": 1.8, "shape": "hv"},
+            yaxis="y",
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=result.dataframe["datetime"],
+            y=regimes.transition_score,
+            name="工况切换强度",
+            line={"color": "#D14D3F", "width": 1.3},
+            fill="tozeroy",
+            fillcolor="rgba(209,77,63,0.10)",
+            yaxis="y2",
+        )
+    )
+    transition_indexes = regimes.transition_mask.astype(bool)
+    figure.add_trace(
+        go.Scatter(
+            x=result.dataframe.loc[transition_indexes, "datetime"],
+            y=regimes.transition_score.loc[transition_indexes],
+            name="过渡区",
+            mode="markers",
+            marker={"color": "#161B22", "size": 4},
+            yaxis="y2",
+        )
+    )
+    figure.update_layout(
+        height=430,
+        margin={"l": 10, "r": 10, "t": 20, "b": 10},
+        legend={"orientation": "h", "y": 1.08},
+        xaxis_title=None,
+        yaxis={"title": "工况编号", "dtick": 1},
+        yaxis2={"title": "切换强度", "overlaying": "y", "side": "right"},
     )
     return figure
 
@@ -467,6 +737,60 @@ def _build_forecast_chart(result: AnalysisResult, sensor: str) -> go.Figure:
         legend={"orientation": "h", "y": 1.08},
         xaxis_title=None,
         yaxis_title=sensor,
+    )
+    return figure
+
+
+def _build_relationship_chart(diagnostic: dict[str, object]) -> go.Figure:
+    """用紧凑关系图展示事件内最重要的传感器关联变化。"""
+
+    sensors = list(diagnostic.get("主导传感器", []))
+    relations = list(diagnostic.get("重点关系", []))
+    positions = {
+        sensor: (
+            float(np.cos(2 * np.pi * index / max(len(sensors), 1))),
+            float(np.sin(2 * np.pi * index / max(len(sensors), 1))),
+        )
+        for index, sensor in enumerate(sensors)
+    }
+    figure = go.Figure()
+    for relation in relations:
+        left_sensor = str(relation["传感器A"])
+        right_sensor = str(relation["传感器B"])
+        if left_sensor not in positions or right_sensor not in positions:
+            continue
+        left = positions[left_sensor]
+        right = positions[right_sensor]
+        change = abs(float(relation["相关性变化"]))
+        figure.add_trace(
+            go.Scatter(
+                x=[left[0], right[0]],
+                y=[left[1], right[1]],
+                mode="lines",
+                line={"width": 1.5 + 5 * min(change, 1.0), "color": "#D14D3F"},
+                hovertext=str(relation["时滞解释"]),
+                hoverinfo="text",
+                showlegend=False,
+            )
+        )
+    figure.add_trace(
+        go.Scatter(
+            x=[positions[sensor][0] for sensor in sensors],
+            y=[positions[sensor][1] for sensor in sensors],
+            text=sensors,
+            mode="markers+text",
+            textposition="bottom center",
+            marker={"size": 24, "color": "#197278", "line": {"width": 2, "color": "white"}},
+            hoverinfo="text",
+            showlegend=False,
+        )
+    )
+    figure.update_layout(
+        height=360,
+        margin={"l": 10, "r": 10, "t": 10, "b": 10},
+        xaxis={"visible": False, "range": [-1.4, 1.4]},
+        yaxis={"visible": False, "range": [-1.4, 1.4], "scaleanchor": "x"},
+        plot_bgcolor="white",
     )
     return figure
 

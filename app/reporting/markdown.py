@@ -113,11 +113,126 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
                 f"{detail['均值偏移标准差']} |"
             )
 
-    lines.extend(["", "## 6. 运维处置建议", ""])
+    lines.extend(["", "## 6. 工况识别与切换证据", ""])
+    regimes = result.operating_regimes
+    if regimes is None:
+        lines.append("本次未执行无监督工况识别。")
+    else:
+        lines.extend(
+            [
+                f"- 识别稳定工况数量：{regimes.state_count}",
+                f"- 工况过渡点数量：{int(regimes.transition_mask.sum())}",
+                f"- 是否启用过渡期弱告警抑制：{'是' if regimes.suppression_applied else '否'}",
+                f"- 被抑制事件数量：{regimes.suppressed_event_count}",
+                "",
+                "| 事件 | 主要工况 | 过渡期重合率 | 峰值切换分数 | 工况判断 |",
+                "| ---: | --- | ---: | ---: | --- |",
+            ]
+        )
+        for context in regimes.event_contexts:
+            lines.append(
+                f"| {context['事件编号']} | {context['主要工况']} | "
+                f"{context['过渡期重合率']:.2%} | {context['峰值切换分数']} | "
+                f"{context['工况判断']} |"
+            )
+        lines.extend(
+            [
+                "",
+                "> 工况切换重合只用于提示负载或控制动作干扰，不能直接把异常事件判为误报。",
+            ]
+        )
+
+    lines.extend(["", "## 7. 多传感器关系证据", ""])
+    if not result.relationship_diagnostics:
+        lines.append("当前异常事件不足以形成稳定的相关性或时滞判断。")
+    else:
+        for diagnostic in result.relationship_diagnostics:
+            lines.extend(
+                [
+                    f"### 事件 {diagnostic['事件编号']}",
+                    "",
+                    f"- 关系结论：{diagnostic['关系结论']}",
+                    f"- 主导传感器：{', '.join(diagnostic['主导传感器'])}",
+                    f"- 使用边界：{diagnostic['使用边界']}",
+                    "",
+                    "| 传感器 A | 传感器 B | 事件前相关 | 事件期相关 | 相关性变化 | 最佳时滞 | 时滞解释 |",
+                    "| --- | --- | ---: | ---: | ---: | ---: | --- |",
+                ]
+            )
+            for relation in diagnostic["重点关系"]:
+                lines.append(
+                    f"| {relation['传感器A']} | {relation['传感器B']} | "
+                    f"{relation['事件前相关系数']} | {relation['事件期相关系数']} | "
+                    f"{relation['相关性变化']} | {relation['最佳时滞']} | "
+                    f"{relation['时滞解释']} |"
+                )
+            lines.append("")
+
+    lines.extend(["", "## 8. 候选根因与证据链", ""])
+    if not result.event_diagnoses:
+        lines.append("当前没有异常事件需要生成候选根因。")
+    else:
+        for diagnosis in result.event_diagnoses:
+            primary = diagnosis.primary_candidate
+            lines.extend(
+                [
+                    f"### 事件 {diagnosis.event_number}",
+                    "",
+                    f"- 诊断状态：{diagnosis.diagnosis_status}",
+                    f"- 工况上下文：{diagnosis.regime_context}",
+                ]
+            )
+            if primary:
+                lines.extend(
+                    [
+                        f"- 首要候选：**{primary.name}**",
+                        f"- 类别：{primary.category}",
+                        f"- 置信度：{primary.confidence:.0%}（{primary.confidence_level}）",
+                        f"- 规则来源：{primary.source}",
+                        "",
+                        "支持证据：",
+                        *[f"- {item}" for item in primary.supporting_evidence],
+                        "",
+                        "证据缺口：",
+                        *[f"- {item}" for item in primary.missing_evidence],
+                    ]
+                )
+            lines.extend(
+                [
+                    "",
+                    "> 当前候选仅用于安排现场排查顺序，不能替代设备故障确认。",
+                    "",
+                ]
+            )
+
+    lines.extend(["", "## 9. 待确认工单草案", ""])
+    if not result.work_order_drafts:
+        lines.append("当前没有待生成的处置工单。")
+    else:
+        for work_order in result.work_order_drafts:
+            lines.extend(
+                [
+                    f"### {work_order.work_order_id}｜{work_order.title}",
+                    "",
+                    f"- 优先级：{work_order.priority}",
+                    f"- 状态：{work_order.status}",
+                    f"- 建议角色：{work_order.assigned_role}",
+                    "- 处置步骤：",
+                    *[
+                        f"  {index}. {action}"
+                        for index, action in enumerate(work_order.actions, start=1)
+                    ],
+                    "- 必须回写：",
+                    *[f"  - {item}" for item in work_order.required_feedback],
+                    "",
+                ]
+            )
+
+    lines.extend(["", "## 10. 运维处置建议", ""])
     for index, recommendation in enumerate(result.recommendations, start=1):
         lines.append(f"{index}. {recommendation}")
 
-    lines.extend(["", "## 7. 趋势预测与风险预警", ""])
+    lines.extend(["", "## 11. 趋势预测与风险预警", ""])
     if not result.forecast_results:
         lines.append("当前数据长度不足，未生成预测结果。")
     else:
@@ -148,10 +263,13 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
     lines.extend(
         [
             "",
-            "## 8. 方法说明",
+            "## 12. 方法说明",
             "",
             (
-                "系统先由确定性算法完成数据校验、稳健异常检测、标签评估和趋势计算。"
+                "系统先由确定性算法完成数据校验、稳健异常检测、无监督工况识别、标签评估和趋势计算，"
+                "并比较异常事件前后的传感器相关性与差分时滞。确定性根因引擎再把事件前后"
+                "变化方向、关系证据、工况上下文和预测趋势与通用故障模式匹配，输出候选根因、"
+                "证据缺口和工单草案。"
                 "预测模块在五类候选模型上开展时间顺序滚动回测，以 RMSE 为主选择最优模型，"
                 "并融合历史残差和模型分歧构造 95% 预测区间。之后将结构化结果交给智能体解释。"
                 "原始工业数据不会直接交由大模型判断，"

@@ -6,9 +6,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from app.analysis import analyze_file
 from app.analysis.forecast import build_time_frequency_features, forecast_sensors
 from app.analysis.warning import build_risk_alerts
-from app.models import AnomalyEvent
+from app.api.server import _result_payload
+from app.models import AnalysisConfig, AnomalyEvent
 
 
 def test_forecast_returns_future_values_and_backtest_metrics() -> None:
@@ -76,7 +78,44 @@ def test_api_module_is_importable() -> None:
         pytest.skip("当前环境未安装 FastAPI")
     paths = {route.path for route in server.app.routes}
     assert "/health" in paths
+    assert "/api/v1/models" in paths
     assert "/api/v1/files" in paths
     assert "/api/v1/analyze" in paths
+    assert "/api/v1/diagnose" in paths
     assert "/api/v1/model-compare" in paths
     assert "/api/v1/forecast-compare" in paths
+
+
+def test_api_payload_exposes_root_causes_and_work_orders(tmp_path) -> None:
+    """万悟分析协议应直接暴露确定性根因和工单草案。"""
+
+    rows = 180
+    pressure = np.ones(rows)
+    flow = np.ones(rows)
+    pressure[110:130] += 3.0
+    flow[110:130] -= 0.8
+    dataframe = pd.DataFrame(
+        {
+            "datetime": pd.date_range("2026-01-01", periods=rows, freq="s"),
+            "Pressure": pressure,
+            "Volume Flow RateRMS": flow,
+        }
+    )
+    csv_path = tmp_path / "api_sample.csv"
+    dataframe.to_csv(csv_path, sep=";", index=False)
+    result = analyze_file(
+        csv_path,
+        AnalysisConfig(
+            detector="mad",
+            threshold=3.0,
+            rolling_window=31,
+            min_event_length=2,
+        ),
+        write_report=False,
+        run_forecast=False,
+        run_regime=False,
+    )
+    payload = _result_payload("run_test", result)
+
+    assert payload["root_cause_diagnoses"]
+    assert payload["work_order_drafts"]

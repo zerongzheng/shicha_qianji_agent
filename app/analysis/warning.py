@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.models import AnomalyEvent
+from app.models import AnomalyEvent, OperatingRegimeResult
 
 
 def build_risk_alerts(
     forecast_results: dict[str, dict[str, Any]],
     events: list[AnomalyEvent],
+    relationship_diagnostics: list[dict[str, Any]] | None = None,
+    operating_regimes: OperatingRegimeResult | None = None,
 ) -> list[dict[str, Any]]:
     """生成风险等级、可信度、触发原因和人工核查动作。
 
@@ -18,13 +20,37 @@ def build_risk_alerts(
     """
 
     alerts: list[dict[str, Any]] = []
+    relationship_map = {
+        int(item.get("事件编号", 0)): item for item in relationship_diagnostics or []
+    }
+    regime_map = {
+        int(item.get("事件编号", 0)): item
+        for item in (operating_regimes.event_contexts if operating_regimes else [])
+    }
     for index, event in enumerate(events[:5], start=1):
         evidence = [
             f"异常事件持续 {event.duration_points} 个采样点",
             f"峰值风险分数为 {event.peak_score:.2f}",
             f"主导测点为{'、'.join(event.dominant_sensors)}",
         ]
+        diagnostic = relationship_map.get(index)
+        if diagnostic:
+            evidence.append(str(diagnostic.get("关系结论", "")))
+        regime_context = regime_map.get(index)
+        if regime_context:
+            evidence.append(
+                f"{regime_context['工况判断']}，过渡期重合率为"
+                f"{float(regime_context['过渡期重合率']):.1%}"
+            )
         checks = ["核查主导传感器的量程、接线和采集状态", "核对设备负载与近期操作记录"]
+        if diagnostic and diagnostic.get("重点关系"):
+            strongest = diagnostic["重点关系"][0]
+            checks.append(
+                f"优先核查 {strongest['传感器A']} 与 {strongest['传感器B']} 的共同工艺链路："
+                f"{strongest['时滞解释']}"
+            )
+        if regime_context and regime_context.get("工况判断") == "工况切换期事件":
+            checks.insert(0, "优先核对阀门动作、负载变化和控制指令是否与事件时间重合")
         alerts.append(
             {
                 "alert_id": f"current-event-{index:03d}",

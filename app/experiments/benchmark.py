@@ -11,13 +11,28 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from statistics import mean
+from time import perf_counter
 from zoneinfo import ZoneInfo
 
+from app.analysis.detection import DETECTOR_RECOMMENDED_THRESHOLDS
 from app.analysis.pipeline import analyze_file
 from app.config import get_settings
-from app.models import AnalysisConfig, AnalysisResult
+from app.models import (
+    TFR_RECOMMENDED_FREQUENCY_WEIGHT,
+    TFR_RECOMMENDED_RELATION_WEIGHT,
+    TFR_RECOMMENDED_TIME_WEIGHT,
+    AnalysisConfig,
+    AnalysisResult,
+)
 
-DEFAULT_DETECTORS = ("mad", "isolation_forest", "hybrid")
+DEFAULT_DETECTORS = (
+    "mad",
+    "isolation_forest",
+    "pca_reconstruction",
+    "window_autoencoder",
+    "time_frequency_relation",
+    "hybrid",
+)
 
 
 @dataclass(frozen=True)
@@ -41,6 +56,7 @@ class BenchmarkRecord:
     detection_delay: float | None
     false_positive_events: int
     changepoint_false_event_rate: float
+    inference_seconds: float
 
 
 @dataclass(frozen=True)
@@ -60,6 +76,7 @@ def run_skab_benchmark(
     output_dir: str | Path | None = None,
     files: tuple[Path, ...] | None = None,
     thresholds: dict[str, float] | None = None,
+    config_overrides: dict[str, dict[str, float]] | None = None,
     report_prefix: str = "skab_benchmark",
 ) -> BenchmarkResult:
     """递归运行 SKAB 全场景对比实验。"""
@@ -84,24 +101,58 @@ def run_skab_benchmark(
     records: list[BenchmarkRecord] = []
     failed_tasks: dict[str, str] = {}
     for detector in detectors:
+        overrides = (config_overrides or {}).get(detector, {})
         config = AnalysisConfig(
             detector=detector,
-            threshold=(thresholds or {}).get(detector, settings.anomaly_threshold),
+            threshold=(thresholds or {}).get(
+                detector,
+                DETECTOR_RECOMMENDED_THRESHOLDS.get(detector, settings.anomaly_threshold),
+            ),
             rolling_window=settings.rolling_window,
             min_event_length=settings.min_event_length,
             merge_gap=settings.merge_gap,
             contamination=settings.contamination,
+            hybrid_mad_weight=float(overrides.get("hybrid_mad_weight", 0.50)),
+            hybrid_forest_weight=float(overrides.get("hybrid_forest_weight", 0.30)),
+            hybrid_pca_weight=float(overrides.get("hybrid_pca_weight", 0.20)),
+            autoencoder_window=int(overrides.get("autoencoder_window", 16)),
+            autoencoder_hidden=int(overrides.get("autoencoder_hidden", 24)),
+            autoencoder_bottleneck=int(overrides.get("autoencoder_bottleneck", 6)),
+            autoencoder_max_iter=int(overrides.get("autoencoder_max_iter", 250)),
+            autoencoder_max_training_windows=int(
+                overrides.get("autoencoder_max_training_windows", 3000)
+            ),
+            tfr_time_weight=float(
+                overrides.get("tfr_time_weight", TFR_RECOMMENDED_TIME_WEIGHT)
+            ),
+            tfr_frequency_weight=float(
+                overrides.get("tfr_frequency_weight", TFR_RECOMMENDED_FREQUENCY_WEIGHT)
+            ),
+            tfr_relation_weight=float(
+                overrides.get("tfr_relation_weight", TFR_RECOMMENDED_RELATION_WEIGHT)
+            ),
+            tfr_frequency_components=int(overrides.get("tfr_frequency_components", 8)),
+            tfr_relation_components=int(overrides.get("tfr_relation_components", 4)),
         )
         for file_path in selected_files:
             task_name = f"{detector}:{file_path.parent.name}/{file_path.name}"
             try:
-                result = analyze_file(file_path, config=config, write_report=False)
+                started_at = perf_counter()
+                result = analyze_file(
+                    file_path,
+                    config=config,
+                    write_report=False,
+                    run_forecast=False,
+                    run_regime=False,
+                )
+                inference_seconds = perf_counter() - started_at
                 records.append(
                     to_benchmark_record(
                         detector,
                         file_path.parent.name,
                         config.threshold,
                         result,
+                        inference_seconds,
                     )
                 )
             except Exception as exc:  # noqa: BLE001
@@ -142,6 +193,7 @@ def build_benchmark_report(
                     detector_records,
                     "changepoint_false_event_rate",
                 ),
+                "inference_seconds": _average(detector_records, "inference_seconds"),
             }
         )
     ranking_rows.sort(
@@ -157,8 +209,8 @@ def build_benchmark_report(
         "",
         "## 1. 模型总排名",
         "",
-        "| 排名 | 检测器 | 阈值 | 文件数 | 点级 F1 | PR-AUC | 事件级 F1 | 平均延迟 | 平均误报事件 | 变点误报占比 |",
-        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| 排名 | 检测器 | 阈值 | 文件数 | 点级 F1 | PR-AUC | 事件级 F1 | 平均延迟 | 平均误报事件 | 变点误报占比 | 单文件耗时/秒 |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for rank, row in enumerate(ranking_rows, start=1):
         lines.append(
@@ -166,7 +218,7 @@ def build_benchmark_report(
             f"{row['point_f1']:.4f} | "
             f"{row['pr_auc']:.4f} | {row['event_f1']:.4f} | {row['delay']:.2f} | "
             f"{row['false_events']:.2f} | "
-            f"{row['changepoint_rate']:.2%} |"
+            f"{row['changepoint_rate']:.2%} | {row['inference_seconds']:.4f} |"
         )
 
     lines.extend(["", "## 2. 分场景结果", ""])
@@ -223,6 +275,7 @@ def to_benchmark_record(
     scenario: str,
     threshold: float,
     result: AnalysisResult,
+    inference_seconds: float,
 ) -> BenchmarkRecord:
     """把单文件分析结果压缩为实验记录。"""
 
@@ -248,6 +301,7 @@ def to_benchmark_record(
         detection_delay=metrics.mean_detection_delay,
         false_positive_events=metrics.false_positive_event_count,
         changepoint_false_event_rate=metrics.changepoint_false_event_rate,
+        inference_seconds=inference_seconds,
     )
 
 

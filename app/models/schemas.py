@@ -6,18 +6,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+TFR_RECOMMENDED_TIME_WEIGHT = 0.67
+TFR_RECOMMENDED_FREQUENCY_WEIGHT = 0.00
+TFR_RECOMMENDED_RELATION_WEIGHT = 0.33
 
 
 @dataclass(frozen=True)
 class AnalysisConfig:
     """一次分析任务使用的算法参数。"""
 
-    detector: str = "hybrid"
+    detector: str = "time_frequency_relation"
     threshold: float = 4.5
     rolling_window: int = 61
     min_event_length: int = 3
@@ -25,6 +29,29 @@ class AnalysisConfig:
     contamination: float = 0.01
     random_state: int = 42
     use_healthy_baseline: bool = True
+    hybrid_mad_weight: float = 0.50
+    hybrid_forest_weight: float = 0.30
+    hybrid_pca_weight: float = 0.20
+    # AutoEncoder 以连续窗口为学习单元，既观察同一时刻的多传感器关系，也观察前后动态。
+    # 这些参数进入统一配置，便于 API、实验脚本和后续万悟工作流使用同一套模型设置。
+    autoencoder_window: int = 16
+    autoencoder_hidden: int = 24
+    autoencoder_bottleneck: int = 6
+    autoencoder_max_iter: int = 250
+    autoencoder_max_training_windows: int = 3000
+    # 时频关系多路径模型：时域窗口重构、频谱形态重构和传感器关系重构独立校准后融合。
+    tfr_time_weight: float = TFR_RECOMMENDED_TIME_WEIGHT
+    tfr_frequency_weight: float = TFR_RECOMMENDED_FREQUENCY_WEIGHT
+    tfr_relation_weight: float = TFR_RECOMMENDED_RELATION_WEIGHT
+    tfr_frequency_components: int = 8
+    tfr_relation_components: int = 4
+    # 工况层默认只输出解释证据，不改变告警。必须经过固定验证集实验后才开启过渡期弱告警抑制。
+    suppress_transition_events: bool = False
+    regime_window: int = 31
+    regime_max_states: int = 4
+    regime_transition_quantile: float = 0.98
+    regime_suppression_overlap: float = 0.75
+    regime_suppression_peak_ratio: float = 1.35
 
 
 @dataclass(frozen=True)
@@ -94,6 +121,67 @@ class EvaluationMetrics:
     changepoint_false_event_rate: float
 
 
+@dataclass(frozen=True)
+class OperatingRegimeResult:
+    """无监督工况识别和异常事件工况归因结果。"""
+
+    regime_labels: pd.Series
+    transition_score: pd.Series
+    transition_mask: pd.Series
+    state_count: int
+    segments: list[dict[str, Any]]
+    event_contexts: list[dict[str, Any]]
+    suppression_applied: bool = False
+    suppressed_event_count: int = 0
+
+
+@dataclass(frozen=True)
+class RootCauseCandidate:
+    """一个由通用故障模式与时序证据共同形成的候选根因。"""
+
+    pattern_id: str
+    name: str
+    category: str
+    confidence: float
+    confidence_level: str
+    supporting_evidence: tuple[str, ...]
+    missing_evidence: tuple[str, ...]
+    verification_steps: tuple[str, ...]
+    source: str = "内置通用故障模式库"
+
+
+@dataclass(frozen=True)
+class EventDiagnosis:
+    """单个异常事件的确定性根因排序和现场验证结论。"""
+
+    event_number: int
+    event_start: pd.Timestamp
+    event_end: pd.Timestamp
+    risk_level: str
+    diagnosis_status: str
+    primary_candidate: RootCauseCandidate | None
+    candidates: tuple[RootCauseCandidate, ...]
+    sensor_changes: tuple[dict[str, Any], ...]
+    regime_context: str
+    work_order_actions: tuple[str, ...]
+    limitations: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class WorkOrderDraft:
+    """可由万悟或后续数据库直接接收的结构化处置任务草案。"""
+
+    work_order_id: str
+    event_number: int
+    priority: str
+    title: str
+    status: str
+    assigned_role: str
+    actions: tuple[str, ...]
+    evidence_summary: tuple[str, ...]
+    required_feedback: tuple[str, ...]
+
+
 @dataclass
 class AnalysisResult:
     """完整分析任务的输出，也是页面、报告和 Agent 的共同数据源。"""
@@ -109,8 +197,12 @@ class AnalysisResult:
     metrics: EvaluationMetrics | None
     trend_summary: dict[str, dict[str, Any]]
     recommendations: list[str]
+    operating_regimes: OperatingRegimeResult | None = None
+    relationship_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     forecast_results: dict[str, dict[str, Any]] = field(default_factory=dict)
     risk_alerts: list[dict[str, Any]] = field(default_factory=list)
+    event_diagnoses: list[EventDiagnosis] = field(default_factory=list)
+    work_order_drafts: list[WorkOrderDraft] = field(default_factory=list)
     report_text: str = ""
 
     def to_summary(self) -> dict[str, Any]:
@@ -143,10 +235,55 @@ class AnalysisResult:
                 else "当前数据没有 anomaly 标签，无法计算监督评估指标"
             ),
             "趋势判断": self.trend_summary,
+            "工况识别": _regime_overview(self.operating_regimes),
+            "多传感器关系证据": self.relationship_diagnostics,
+            "候选根因诊断": [_event_diagnosis_summary(item) for item in self.event_diagnoses],
+            "处置工单草案": [asdict(item) for item in self.work_order_drafts[:8]],
             "预测结果": _forecast_overview(self.forecast_results),
             "风险预警": self.risk_alerts,
             "运维建议": self.recommendations,
         }
+
+
+def _event_diagnosis_summary(diagnosis: EventDiagnosis) -> dict[str, Any]:
+    """压缩确定性诊断结果，避免把重复验证步骤全部发送给大模型。"""
+
+    return {
+        "事件编号": diagnosis.event_number,
+        "诊断状态": diagnosis.diagnosis_status,
+        "风险等级": diagnosis.risk_level,
+        "工况上下文": diagnosis.regime_context,
+        "首要候选根因": (
+            asdict(diagnosis.primary_candidate) if diagnosis.primary_candidate else None
+        ),
+        "其他候选": [
+            {
+                "名称": item.name,
+                "类别": item.category,
+                "置信度": item.confidence,
+                "置信等级": item.confidence_level,
+            }
+            for item in diagnosis.candidates[1:3]
+        ],
+        "传感器变化": list(diagnosis.sensor_changes[:5]),
+        "现场动作": list(diagnosis.work_order_actions[:5]),
+        "使用边界": list(diagnosis.limitations),
+    }
+
+
+def _regime_overview(result: OperatingRegimeResult | None) -> dict[str, Any] | str:
+    """只暴露工况段和事件归因，不向大模型发送逐点标签序列。"""
+
+    if result is None:
+        return "未执行工况识别"
+    return {
+        "稳定工况数量": result.state_count,
+        "过渡点数量": int(result.transition_mask.sum()),
+        "工况分段": result.segments[:12],
+        "异常事件工况上下文": result.event_contexts[:10],
+        "是否启用过渡期抑制": result.suppression_applied,
+        "被抑制事件数": result.suppressed_event_count,
+    }
 
 
 def _top_sensors(events: list[AnomalyEvent]) -> list[str]:

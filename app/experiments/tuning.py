@@ -175,7 +175,15 @@ def _tune_detector(
     failed_files = 0
     for file_path in (*validation_files, *healthy_files):
         try:
-            cached_results.append(analyze_file(file_path, config=base_config, write_report=False))
+            cached_results.append(
+                analyze_file(
+                    file_path,
+                    config=base_config,
+                    write_report=False,
+                    run_forecast=False,
+                    run_regime=False,
+                )
+            )
         # 调优是批量实验任务，单文件损坏不能终止其余候选参数；失败数量会进入目标惩罚。
         except Exception:  # noqa: BLE001
             failed_files += 1

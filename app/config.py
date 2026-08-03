@@ -28,9 +28,16 @@ class Settings:
     default_skab_file: Path
     default_skab_dir: Path
     healthy_baseline_file: Path
-    dashscope_api_key: str
-    dashscope_base_url: str
-    chat_model: str
+    llm_provider: str
+    llm_api_key: str
+    llm_base_url: str
+    llm_chat_model: str
+    llm_embedding_model: str
+    llm_ocr_model: str
+    llm_vision_model: str
+    document_parser_url: str
+    llm_requests_per_minute: int
+    embedding_requests_per_minute: int
     anomaly_detector: str
     anomaly_threshold: float
     rolling_window: int
@@ -46,7 +53,13 @@ class Settings:
     def llm_enabled(self) -> bool:
         """只有配置了密钥时才启用大模型，基础分析不依赖网络。"""
 
-        return bool(self.dashscope_api_key.strip())
+        return bool(self.llm_api_key.strip())
+
+    @property
+    def embedding_enabled(self) -> bool:
+        """配置了密钥和 Embedding 模型时才启用向量检索。"""
+
+        return self.llm_enabled and bool(self.llm_embedding_model.strip())
 
 
 def _resolve_path(raw_path: str) -> Path:
@@ -76,13 +89,31 @@ def get_settings() -> Settings:
                 "../SKAB/data/anomaly-free/anomaly-free.csv",
             )
         ),
-        dashscope_api_key=os.getenv("DASHSCOPE_API_KEY", ""),
-        dashscope_base_url=os.getenv(
-            "DASHSCOPE_BASE_URL",
-            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        llm_provider=os.getenv("LLM_PROVIDER", "yuanjing_maas"),
+        llm_api_key=os.getenv("LLM_API_KEY", os.getenv("DASHSCOPE_API_KEY", "")),
+        llm_base_url=os.getenv(
+            "LLM_BASE_URL",
+            os.getenv(
+                "DASHSCOPE_BASE_URL",
+                "https://maas-api.ai-yuanjing.com/openapi/compatible-mode/v1",
+            ),
+        ).rstrip("/"),
+        llm_chat_model=os.getenv(
+            "LLM_CHAT_MODEL",
+            os.getenv("DASHSCOPE_CHAT_MODEL", "glm-5"),
         ),
-        chat_model=os.getenv("DASHSCOPE_CHAT_MODEL", "qwen-plus"),
-        anomaly_detector=os.getenv("ANOMALY_DETECTOR", "hybrid"),
+        llm_embedding_model=os.getenv("LLM_EMBEDDING_MODEL", "qwen3-embed-0.6b"),
+        llm_ocr_model=os.getenv("LLM_OCR_MODEL", "glm-ocr"),
+        llm_vision_model=os.getenv("LLM_VISION_MODEL", "YuanjingVL"),
+        document_parser_url=os.getenv(
+            "DOCUMENT_PARSER_URL",
+            "https://maas-api.ai-yuanjing.com/openapi/v1/rag/model_parser_file",
+        ),
+        llm_requests_per_minute=int(os.getenv("LLM_REQUESTS_PER_MINUTE", "5")),
+        embedding_requests_per_minute=int(
+            os.getenv("EMBEDDING_REQUESTS_PER_MINUTE", "5")
+        ),
+        anomaly_detector=os.getenv("ANOMALY_DETECTOR", "time_frequency_relation"),
         anomaly_threshold=float(os.getenv("ANOMALY_THRESHOLD", "4.5")),
         rolling_window=int(os.getenv("ROLLING_WINDOW", "61")),
         min_event_length=int(os.getenv("MIN_EVENT_LENGTH", "3")),

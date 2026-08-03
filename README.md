@@ -28,12 +28,13 @@ SKAB / 企业 CSV
 ```text
 shichi_qianji_agent/
 ├─ app/                         # 所有可复用业务代码
-│  ├─ agent/                   # LangChain 工具与 DashScope Agent
+│  ├─ agent/                   # LangChain 多轮工具 Agent，作为可选追问能力
 │  ├─ analysis/                # 画像、检测、评估、趋势、建议和流程编排
 │  ├─ api/                     # 万悟工作流可调用的 REST API
 │  ├─ data/                    # SKAB / 通用 CSV 数据接入
+│  ├─ diagnosis/               # 确定性分析 + RAG + 单次 GLM-5 自动诊断
 │  ├─ experiments/             # 数据划分、阈值调优、基准对比和独立测试
-│  ├─ knowledge/               # 轻量本地 RAG 检索
+│  ├─ knowledge/               # 关键词 + 比赛 Embedding 的混合 RAG 检索
 │  ├─ observability/           # 运行链路和算法侧 JSONL 日志
 │  ├─ models/                  # 模块之间共享的数据结构
 │  ├─ reporting/               # Markdown 报告生成
@@ -113,12 +114,14 @@ Invoke-RestMethod http://127.0.0.1:8000/health
 ```text
 POST /api/v1/files       上传 CSV，返回 file_id
 POST /api/v1/analyze     传入 file_id 和可选 config，返回统一 JSON
+POST /api/v1/diagnose    一次完成分析、知识检索和单次大模型诊断
 POST /api/v1/model-compare     比较异常检测器
 POST /api/v1/forecast-compare  比较预测模型并返回最优模型与区间
 ```
 
-万悟侧建议使用工作流的 API 节点串联：文件上传 → 工业分析 API → 万悟知识库 → 大模型
-总结。万悟负责 Agent 编排，本项目负责确定性工业计算。
+比赛演示和低调用额度场景优先使用：文件上传 → `/api/v1/diagnose` → 展示诊断。
+该端点由 Python 一次完成工业分析和知识检索，最后只调用一次 GLM-5。需要在万悟中自定义
+条件分支或知识库时，再调用 `/api/v1/analyze` 获取结构化证据自行编排。
 
 批量分析 valve1 文件夹前 5 个文件：
 
@@ -126,7 +129,7 @@ POST /api/v1/forecast-compare  比较预测模型并返回最优模型与区间
 uv run shichi-qianji --dir ..\SKAB\data\valve1 --max-files 5
 ```
 
-运行三个检测器的全量基准对比：
+运行五个检测器的全量基准对比：
 
 ```powershell
 uv run python main.py --benchmark --data-root ..\SKAB\data
@@ -138,22 +141,54 @@ uv run python main.py --benchmark --data-root ..\SKAB\data
 uv run python main.py --tune --data-root ..\SKAB\data
 ```
 
+运行 Hybrid 融合权重消融实验：
+
+```powershell
+uv run python main.py --ablate-hybrid --data-root ..\SKAB\data
+```
+
+该命令只使用验证集选择 MAD、Isolation Forest、PCA 的融合比例和告警阈值，随后冻结配置
+运行独立测试集。消融结果不能使用测试集反向修改权重。
+
+运行无监督工况识别与过渡期告警策略评测：
+
+```powershell
+uv run python main.py --evaluate-regimes --data-root ..\SKAB\data
+```
+
+工况算法不读取 `changepoint` 和 `anomaly`，两类标签只在专项实验中用于事后评价。当前
+固定划分实验显示，过渡期抑制会降低事件召回和事件级 F1，因此产品默认只展示工况上下文，
+不删除告警。
+
 该命令会按完整文件划分验证集和测试集。健康文件只用于无监督标定；候选阈值仅在验证集
 选择，参数冻结后再运行独立测试。`outputs/experiments/` 会保存数据划分、所有候选阈值、
 最终测试指标和 Markdown 报告，可直接用于后续实验表格与答辩材料。
 
 ## 大模型配置
 
-项目使用阿里云百炼的 OpenAI 兼容接口，变量命名与 `dinner-agent` 保持一致：
+项目默认使用比赛方提供的联通元景 MaaS OpenAI 兼容接口。聊天、Embedding、OCR 和视觉
+模型均通过 `.env` 配置，真实密钥不会进入 Git 仓库：
 
 ```dotenv
-DASHSCOPE_API_KEY=你的密钥
-DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-DASHSCOPE_CHAT_MODEL=qwen-plus
+LLM_PROVIDER=yuanjing_maas
+LLM_API_KEY=your_competition_api_key
+LLM_BASE_URL=https://maas-api.ai-yuanjing.com/openapi/compatible-mode/v1
+LLM_CHAT_MODEL=glm-5
+LLM_EMBEDDING_MODEL=qwen3-embed-0.6b
+LLM_REQUESTS_PER_MINUTE=5
+EMBEDDING_REQUESTS_PER_MINUTE=5
 ```
 
-若 Windows 系统环境变量中已经存在 `DASHSCOPE_API_KEY`，`.env` 中可以留空。
-未配置密钥时，数据分析、图表、指标和报告仍然能够正常工作，只有 Agent 对话不可用。
+本地知识检索使用关键词与语义向量混合评分。知识向量缓存在
+`outputs/knowledge_index/`，知识内容或 Embedding 模型变化后会自动重建；比赛接口限流、
+断网或鉴权失败时自动退回关键词检索，不影响工业算法和分析报告运行。
+
+比赛接口的每个端点每分钟最多调用 5 次。项目通过 `outputs/rate_limits/` 中的共享状态文件
+自动控制最小请求间隔，Streamlit、FastAPI 和命令行即使同时运行也会共同遵守额度。一次
+自动诊断只调用一次聊天模型；多轮工具 Agent 通常需要两次以上请求，因此仅作为可选追问。
+
+未配置密钥或接口限流时，数据分析、图表、指标和报告仍正常运行，自动诊断会返回基于算法
+证据和本地知识的确定性降级结论。
 
 ## 元景万悟接入
 
@@ -170,10 +205,27 @@ uv run python api_main.py
 
 ## 当前算法处于什么阶段
 
-当前已形成三类可解释工程基线：滚动 MAD 识别局部偏离，Isolation Forest 识别多变量
-动态工况异常，混合检测器融合两类证据。健康数据用于统一风险分数标尺，评估同时覆盖
+当前已形成六类异常检测模型：滚动 MAD 识别局部偏离，Isolation Forest 识别多变量
+动态工况异常，PCA 重构检测器识别健康变量关系被破坏的异常，滑动窗口 AutoEncoder
+学习健康工况下的非线性时序关系，Hybrid 融合传统三类证据，时频关系多路径模型进一步
+融合时域窗口、频谱形态和传感器耦合结构。固定划分消融选择了“时域 0.67 + 关系 0.33”、
+阈值 4.50；该配置在独立测试上将事件级 F1 从 AutoEncoder 的 0.4500 提升至 0.4748，
+平均误报事件从 3.53 降至 3.35，因此作为当前面向完整故障事件识别的推荐模型。
+AutoEncoder 的点级 F1、PR-AUC、速度仍略优，保留为快速工程基线。频域路径在合成主频漂移
+测试中有效，但当前 SKAB 消融未证明总体增益，默认权重为 0，待企业振动数据到位后重估。
+AutoEncoder 的窗口分数只落在窗口结束点，避免未来信息提前影响历史告警；相同健康基线的
+模型会在进程内缓存，并持久化到带版本与校验和的本地模型仓库。服务重启后可直接恢复，
+首次训练后可被批量分析、FastAPI 和 Streamlit 请求复用。
+系统还会比较异常前后的传感器相关性，在差分序列上搜索领先与滞后关系，为根因排查提供
+传播线索，并通过无监督滚动水平聚类和因果变化强度识别稳定工况与切换期。工况证据进入
+报告、预警和大模型诊断，但不直接将切换期异常判为误报。健康数据用于统一风险分数标尺，评估同时覆盖
 点级 F1、PR-AUC、事件级 F1、检测延迟、误报事件和工况变点干扰。它们用于建立可信的
-实验底座和系统闭环，仍不应包装成最终自研竞赛模型。
+实验底座和系统闭环。当前多路径模型已经具备自研模型雏形，但仍需在企业数据上复验。
+
+在企业知识库尚未到位时，项目已增加确定性根因排序层：系统计算事件前后测点变化方向，
+融合主导传感器、关系时滞、工况上下文和预测趋势，与内置通用故障模式匹配，输出候选根因、
+置信度、支持证据、证据缺口和待确认工单草案。内置模式不等于企业故障规则，置信度上限为
+78%，详细设计与后续知识库替换方式见 `docs/ROOT_CAUSE_DIAGNOSIS.md`。
 
 预测侧已经由单一局部线性基线升级为五模型候选体系：最近值持续、指数平滑、局部线性
 趋势、滞后特征岭回归和时频特征增强岭回归。系统对每个传感器按时间顺序开展滚动回测，
@@ -183,11 +235,12 @@ uv run python api_main.py
 
 下一阶段应按以下顺序升级：
 
-1. 在当前固定划分上增加 PCA/AutoEncoder、LSTM-AE 或 TranAD 等候选模型。
-2. 在当前多模型工程底座上增加跨文件训练的 TCN、PatchTST 或轻量 Transformer，并开展消融实验。
-3. 将 changepoint、工况切换和真正设备异常分开建模，进一步降低状态切换误报。
-4. 将设备手册、维修工单和告警规则迁移至万悟知识库，保留来源引用。
-5. 通过现场反馈回写异常根因和处置结果，形成持续学习闭环。
+1. 在企业振动数据上重估频域路径，验证其对转速、频带能量和周期漂移的识别价值。
+2. 对窗口长度、瓶颈维度和动态特征开展结构消融，进一步降低检测延迟和训练时间。
+3. 在当前多模型工程底座上增加跨文件训练的 TCN、PatchTST 或轻量 Transformer，并开展消融实验。
+4. 将 changepoint、工况切换和真正设备异常分开建模，进一步降低状态切换误报。
+5. 将设备手册、维修工单和告警规则迁移至万悟知识库，保留来源引用。
+6. 通过现场反馈回写异常根因和处置结果，形成持续学习闭环。
 
 ## 运行测试
 

@@ -7,8 +7,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from app.analysis.detection import apply_detection_threshold
+from app.analysis.detection import DETECTOR_RECOMMENDED_THRESHOLDS, apply_detection_threshold
+from app.api.server import _parse_config
 from app.experiments.split import build_skab_split
+from app.experiments.tfr_ablation import TfrAblationRecord, select_tfr_candidate
 from app.experiments.tuning import ThresholdTrial, select_best_trial
 from app.models import AnalysisConfig
 
@@ -95,3 +97,69 @@ def test_threshold_selection_rejects_low_recall_shortcut() -> None:
     )
 
     assert select_best_trial([reliable, silent]) == reliable
+
+
+def test_api_uses_detector_specific_frozen_threshold() -> None:
+    """万悟未显式传阈值时，应使用对应检测器的验证集冻结值。"""
+
+    pca_config = _parse_config({"detector": "pca_reconstruction"})
+    autoencoder_config = _parse_config({"detector": "window_autoencoder"})
+    overridden = _parse_config({"detector": "pca_reconstruction", "threshold": 7.5})
+
+    assert pca_config.threshold == DETECTOR_RECOMMENDED_THRESHOLDS["pca_reconstruction"]
+    assert autoencoder_config.threshold == DETECTOR_RECOMMENDED_THRESHOLDS["window_autoencoder"]
+    assert overridden.threshold == 7.5
+
+
+def test_api_uses_frozen_tfr_weights_by_default() -> None:
+    """万悟未显式传权重时，应使用固定消融实验选出的路径配置。"""
+
+    config = _parse_config({"detector": "time_frequency_relation"})
+
+    assert config.tfr_time_weight == 0.67
+    assert config.tfr_frequency_weight == 0.0
+    assert config.tfr_relation_weight == 0.33
+    assert config.threshold == 4.5
+
+
+def test_api_parses_regime_suppression_boolean_strings() -> None:
+    """万悟 JSON 或表单传入字符串 false 时不能误开启告警抑制。"""
+
+    disabled = _parse_config({"suppress_transition_events": "false"})
+    enabled = _parse_config({"suppress_transition_events": "true"})
+
+    assert not disabled.suppress_transition_events
+    assert enabled.suppress_transition_events
+
+
+def test_tfr_candidate_selection_rejects_low_recall_shortcut() -> None:
+    """消融选择不能让低召回候选仅凭较少误报胜出。"""
+
+    reliable = TfrAblationRecord(
+        candidate_id="time_relation",
+        time_weight=0.67,
+        frequency_weight=0.0,
+        relation_weight=0.33,
+        threshold=5.0,
+        objective=0.20,
+        point_f1=0.30,
+        event_f1=0.40,
+        event_recall=0.70,
+        average_false_events=3.0,
+        healthy_false_event_rate=1.0,
+    )
+    silent = TfrAblationRecord(
+        candidate_id="full_equal_aux",
+        time_weight=0.50,
+        frequency_weight=0.25,
+        relation_weight=0.25,
+        threshold=9.0,
+        objective=0.25,
+        point_f1=0.20,
+        event_f1=0.20,
+        event_recall=0.30,
+        average_false_events=0.5,
+        healthy_false_event_rate=0.0,
+    )
+
+    assert select_tfr_candidate([silent, reliable]) == reliable

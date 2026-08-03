@@ -14,10 +14,13 @@ from app.analysis.detection import detect_anomalies
 from app.analysis.evaluation import evaluate_predictions
 from app.analysis.forecast import forecast_sensors
 from app.analysis.profiling import build_profile
+from app.analysis.regime import analyze_operating_regimes, suppress_transition_only_events
+from app.analysis.relationships import analyze_event_relationships
 from app.analysis.trend import analyze_recent_trends
 from app.analysis.warning import build_risk_alerts
 from app.config import get_settings
 from app.data.loader import load_time_series
+from app.diagnosis import diagnose_root_causes
 from app.models import AnalysisConfig, AnalysisResult
 from app.reporting import build_markdown_report, save_report
 
@@ -55,8 +58,14 @@ def analyze_file(
     file_path: str | Path,
     config: AnalysisConfig | None = None,
     write_report: bool = True,
+    run_forecast: bool = True,
+    run_regime: bool = True,
 ) -> AnalysisResult:
-    """执行一次完整的单文件工业时序分析。"""
+    """执行单文件工业时序分析。
+
+    `run_forecast=False` 仅供异常检测基准和阈值调优使用，避免在比较检测器时重复运行
+    与实验目标无关的五模型预测；产品分析和页面入口保持默认完整流程。
+    """
 
     settings = get_settings()
     config = config or AnalysisConfig(
@@ -88,22 +97,62 @@ def analyze_file(
         config=config,
         healthy_reference=healthy_reference,
     )
+    if run_regime:
+        operating_regimes = analyze_operating_regimes(
+            dataframe,
+            profile.sensor_columns,
+            detection.events,
+            config,
+        )
+        predicted_labels, events, operating_regimes = suppress_transition_only_events(
+            operating_regimes,
+            detection.events,
+            detection.predicted_labels,
+            config,
+        )
+    else:
+        operating_regimes = None
+        predicted_labels = detection.predicted_labels
+        events = detection.events
     metrics = evaluate_predictions(
         dataframe,
-        detection.predicted_labels,
+        predicted_labels,
         detection.combined_score,
         merge_gap=config.merge_gap,
     )
     trends = analyze_recent_trends(dataframe, profile.sensor_columns)
-    recommendations = generate_recommendations(profile, detection.events, trends, metrics)
-    forecasts = forecast_sensors(
+    relationship_diagnostics = analyze_event_relationships(
         dataframe,
         profile.sensor_columns,
-        horizon=settings.forecast_horizon,
-        lookback=settings.forecast_lookback,
-        holdout=settings.forecast_holdout,
+        events,
     )
-    risk_alerts = build_risk_alerts(forecasts, detection.events)
+    recommendations = generate_recommendations(profile, events, trends, metrics)
+    forecasts = (
+        forecast_sensors(
+            dataframe,
+            profile.sensor_columns,
+            horizon=settings.forecast_horizon,
+            lookback=settings.forecast_lookback,
+            holdout=settings.forecast_holdout,
+        )
+        if run_forecast
+        else {}
+    )
+    risk_alerts = build_risk_alerts(
+        forecasts,
+        events,
+        relationship_diagnostics,
+        operating_regimes,
+    )
+    event_diagnoses, work_order_drafts = diagnose_root_causes(
+        dataframe=dataframe,
+        sensor_columns=profile.sensor_columns,
+        events=events,
+        relationship_diagnostics=relationship_diagnostics,
+        operating_regimes=operating_regimes,
+        trend_summary=trends,
+        forecast_results=forecasts,
+    )
 
     result = AnalysisResult(
         source_path=source_path,
@@ -112,13 +161,17 @@ def analyze_file(
         profile=profile,
         anomaly_scores=detection.sensor_scores,
         combined_score=detection.combined_score,
-        predicted_labels=detection.predicted_labels,
-        events=detection.events,
+        predicted_labels=predicted_labels,
+        events=events,
         metrics=metrics,
         trend_summary=trends,
         recommendations=recommendations,
+        operating_regimes=operating_regimes,
+        relationship_diagnostics=relationship_diagnostics,
         forecast_results=forecasts,
         risk_alerts=risk_alerts,
+        event_diagnoses=event_diagnoses,
+        work_order_drafts=work_order_drafts,
     )
     result.report_text = build_markdown_report(result, config)
 

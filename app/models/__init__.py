@@ -1,19 +1,33 @@
 """跨模块共享的数据结构。"""
 
 from app.models.schemas import (
+    TFR_RECOMMENDED_FREQUENCY_WEIGHT,
+    TFR_RECOMMENDED_RELATION_WEIGHT,
+    TFR_RECOMMENDED_TIME_WEIGHT,
     AnalysisConfig,
     AnalysisResult,
     AnomalyEvent,
     DataProfile,
     EvaluationMetrics,
+    EventDiagnosis,
+    OperatingRegimeResult,
+    RootCauseCandidate,
     SensorProfile,
+    WorkOrderDraft,
 )
 
 __all__ = [
+    "TFR_RECOMMENDED_FREQUENCY_WEIGHT",
+    "TFR_RECOMMENDED_RELATION_WEIGHT",
+    "TFR_RECOMMENDED_TIME_WEIGHT",
     "AnalysisConfig",
     "AnalysisResult",
     "AnomalyEvent",
     "DataProfile",
     "EvaluationMetrics",
+    "EventDiagnosis",
+    "OperatingRegimeResult",
+    "RootCauseCandidate",
     "SensorProfile",
+    "WorkOrderDraft",
 ]

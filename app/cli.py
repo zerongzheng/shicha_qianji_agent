@@ -6,8 +6,15 @@ import argparse
 import json
 
 from app.analysis import analyze_file, analyze_folder
+from app.analysis.detection import DETECTOR_RECOMMENDED_THRESHOLDS
 from app.config import get_settings
-from app.experiments import run_skab_benchmark, tune_and_evaluate
+from app.experiments import (
+    evaluate_regime_strategy,
+    run_hybrid_weight_ablation,
+    run_skab_benchmark,
+    run_tfr_weight_ablation,
+    tune_and_evaluate,
+)
 from app.models import AnalysisConfig
 
 
@@ -21,22 +28,49 @@ def main() -> None:
     parser.add_argument("--max-files", type=int, default=0, help="批量文件上限，0 表示全部")
     parser.add_argument(
         "--detector",
-        choices=["mad", "isolation_forest", "hybrid"],
+        choices=[
+            "mad",
+            "isolation_forest",
+            "pca_reconstruction",
+            "window_autoencoder",
+            "time_frequency_relation",
+            "hybrid",
+        ],
         default=settings.anomaly_detector,
     )
-    parser.add_argument("--threshold", type=float, default=settings.anomaly_threshold)
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="告警阈值；不填写时使用所选检测器在验证集冻结的推荐阈值",
+    )
     parser.add_argument("--window", type=int, default=settings.rolling_window)
     parser.add_argument("--min-event-length", type=int, default=settings.min_event_length)
     parser.add_argument("--contamination", type=float, default=settings.contamination)
     parser.add_argument(
         "--benchmark",
         action="store_true",
-        help="运行 SKAB 全场景 MAD、Isolation Forest、混合检测器对比实验",
+        help="运行 SKAB 全场景 MAD、Isolation Forest、PCA 重构和混合检测器对比实验",
     )
     parser.add_argument(
         "--tune",
         action="store_true",
         help="在验证集调优阈值，并在独立测试集生成最终实验报告",
+    )
+    parser.add_argument(
+        "--ablate-hybrid",
+        action="store_true",
+        help="在验证集比较 Hybrid 融合权重，并用冻结配置运行独立测试",
+    )
+    parser.add_argument(
+        "--ablate-tfr",
+        action="store_true",
+        help="比较时域、频域和关系路径组合，并用冻结配置运行独立测试",
+    )
+    parser.add_argument(
+        "--evaluate-regimes",
+        action="store_true",
+        help="在固定验证/测试划分上评价工况识别和过渡期弱告警抑制",
     )
     parser.add_argument(
         "--threshold-grid",
@@ -50,16 +84,57 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    threshold = (
+        args.threshold
+        if args.threshold is not None
+        else DETECTOR_RECOMMENDED_THRESHOLDS.get(args.detector, settings.anomaly_threshold)
+    )
     config = AnalysisConfig(
         detector=args.detector,
-        threshold=args.threshold,
+        threshold=threshold,
         rolling_window=_ensure_odd_window(args.window),
         min_event_length=args.min_event_length,
         merge_gap=settings.merge_gap,
         contamination=args.contamination,
     )
 
-    if args.tune:
+    if args.evaluate_regimes:
+        evaluation = evaluate_regime_strategy(args.data_root)
+        summary = {
+            "recommended": evaluation.recommended,
+            "record_count": len(evaluation.records),
+            "csv_path": str(evaluation.csv_path),
+            "report_path": str(evaluation.report_path),
+        }
+    elif args.ablate_tfr:
+        ablation = run_tfr_weight_ablation(args.data_root)
+        summary = {
+            "selected_weights": {
+                "time": ablation.selected.time_weight,
+                "frequency": ablation.selected.frequency_weight,
+                "relation": ablation.selected.relation_weight,
+            },
+            "selected_threshold": ablation.selected.threshold,
+            "validation_objective": ablation.selected.objective,
+            "ablation_csv_path": str(ablation.csv_path),
+            "ablation_report_path": str(ablation.report_path),
+            "test_report_path": str(ablation.test_benchmark.report_path),
+        }
+    elif args.ablate_hybrid:
+        ablation = run_hybrid_weight_ablation(args.data_root)
+        summary = {
+            "selected_weights": {
+                "mad": ablation.selected.mad_weight,
+                "isolation_forest": ablation.selected.forest_weight,
+                "pca": ablation.selected.pca_weight,
+            },
+            "selected_threshold": ablation.selected.threshold,
+            "validation_objective": ablation.selected.objective,
+            "ablation_csv_path": str(ablation.csv_path),
+            "ablation_report_path": str(ablation.report_path),
+            "test_report_path": str(ablation.test_benchmark.report_path),
+        }
+    elif args.tune:
         tuning = tune_and_evaluate(
             args.data_root,
             thresholds=_parse_threshold_grid(args.threshold_grid),
