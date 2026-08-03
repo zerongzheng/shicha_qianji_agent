@@ -24,6 +24,7 @@ class Settings:
 
     project_root: Path
     output_dir: Path
+    database_path: Path
     knowledge_dir: Path
     default_skab_file: Path
     default_skab_dir: Path
@@ -76,6 +77,9 @@ def get_settings() -> Settings:
     return Settings(
         project_root=PROJECT_ROOT,
         output_dir=PROJECT_ROOT / "outputs",
+        database_path=_resolve_path(
+            os.getenv("DATABASE_PATH", "outputs/shichi_qianji.db")
+        ),
         knowledge_dir=PROJECT_ROOT / "resources" / "knowledge",
         default_skab_file=_resolve_path(
             os.getenv("SKAB_DEFAULT_FILE", "../SKAB/data/valve1/0.csv")

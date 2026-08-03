@@ -16,6 +16,7 @@ SKAB / 企业 CSV
     -> SKAB 标签量化评估
     -> 近期趋势与漂移研判
     -> 运维处置建议
+    -> SQLite 任务归档与工单反馈闭环
     -> Markdown 报告与 Streamlit 看板
     -> 万悟工作流/API 编排或本地 LangChain 备用智能问答
 ```
@@ -36,6 +37,7 @@ shichi_qianji_agent/
 │  ├─ experiments/             # 数据划分、阈值调优、基准对比和独立测试
 │  ├─ knowledge/               # 关键词 + 比赛 Embedding 的混合 RAG 检索
 │  ├─ observability/           # 运行链路和算法侧 JSONL 日志
+│  ├─ storage/                 # SQLite 任务、结果和工单持久化
 │  ├─ models/                  # 模块之间共享的数据结构
 │  ├─ reporting/               # Markdown 报告生成
 │  ├─ ui/                      # Streamlit 页面
@@ -117,11 +119,34 @@ POST /api/v1/analyze     传入 file_id 和可选 config，返回统一 JSON
 POST /api/v1/diagnose    一次完成分析、知识检索和单次大模型诊断
 POST /api/v1/model-compare     比较异常检测器
 POST /api/v1/forecast-compare  比较预测模型并返回最优模型与区间
+GET  /api/v1/runs              查询历史分析任务
+GET  /api/v1/runs/{run_id}     查询任务参数与完整结构化结果
+GET  /api/v1/work-orders       查询工单队列
+PATCH /api/v1/work-orders/{record_id} 回写工单状态与现场反馈
 ```
 
 比赛演示和低调用额度场景优先使用：文件上传 → `/api/v1/diagnose` → 展示诊断。
 该端点由 Python 一次完成工业分析和知识检索，最后只调用一次 GLM-5。需要在万悟中自定义
 条件分支或知识库时，再调用 `/api/v1/analyze` 获取结构化证据自行编排。
+
+## SQLite 数据库
+
+项目默认把 SQLite 数据库保存到 `outputs/shichi_qianji.db`，该文件属于运行数据，不提交
+GitHub。可以在 `.env` 中调整位置：
+
+```dotenv
+DATABASE_PATH=outputs/shichi_qianji.db
+```
+
+数据库包含三类业务记录：
+
+- `uploaded_files`：保存上传文件编号、文件名、SHA-256、大小和受控存储位置；
+- `analysis_runs`：保存分析任务状态、算法参数、耗时、错误和完整结构化结果；
+- `work_orders`：保存任务下的工单、优先级、状态、现场确认根因和处置反馈。
+
+原始 CSV 不写进 SQLite，仍保存在 `outputs/api_uploads/`。每张算法工单同时包含原始
+`work_order_id` 和全局唯一 `record_id`；万悟更新工单时必须使用 `record_id`，避免不同
+分析任务的事件编号相同而串单。
 
 批量分析 valve1 文件夹前 5 个文件：
 

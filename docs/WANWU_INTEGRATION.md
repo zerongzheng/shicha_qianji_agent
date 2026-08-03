@@ -12,6 +12,8 @@
     -> 调用时察千机 POST /api/v1/diagnose
     -> Python 完成分析与知识检索，GLM-5 单次生成诊断
     -> 万悟直接展示异常证据、趋势预警和处置顺序
+    -> 查询 GET /api/v1/work-orders 展示待办工单
+    -> PATCH /api/v1/work-orders/{record_id} 回写现场结果
 ```
 
 ## 启动本地分析服务
@@ -39,6 +41,8 @@ Content-Type: multipart/form-data
 返回：{"file_id":"...","file_name":"..."}
 ```
 
+上传成功后还会返回 `sha256` 和 `size_bytes`，数据库据此追踪同一份数据和文件完整性。
+
 ### 执行分析
 
 ```json
@@ -65,6 +69,41 @@ Content-Type: multipart/form-data
 - `risk_alerts`：当前异常与趋势预测形成的结构化预警；
 - `recommendations`：处置建议；
 - `run_id`：用于日志和后续结果追踪。
+
+`work_order_drafts` 中的 `record_id` 是数据库全局唯一工单编号。后续万悟工单节点应保存并
+传递这个字段，不要只使用可能在不同任务间重复的 `work_order_id`。
+
+### 查询历史任务
+
+```text
+GET /api/v1/runs?limit=20&status=success
+GET /api/v1/runs/{run_id}
+```
+
+列表接口返回任务摘要，详情接口返回算法参数、文件哈希、任务状态、耗时以及完整分析结果。
+万悟可以据此搭建“历史诊断记录”页面，也可以在工作流异常后查询任务状态。
+
+### 工单闭环
+
+```text
+GET /api/v1/work-orders?status=待确认&limit=50
+GET /api/v1/work-orders?run_id=run_xxx
+PATCH /api/v1/work-orders/{record_id}
+```
+
+现场反馈请求体示例：
+
+```json
+{
+  "status": "已完成",
+  "confirmed_cause": "阀门执行器卡滞",
+  "feedback_note": "清理执行器并复测，压力与流量恢复正常",
+  "handled_by": "设备运维组"
+}
+```
+
+允许的状态为：`待确认`、`已确认`、`处理中`、`已完成`、`已关闭`。限制状态集合是为了让
+万悟看板能够稳定统计完成率、处置周期和各类根因，而不是产生无法汇总的自由文本状态。
 
 ### 一站式自动诊断
 
@@ -152,6 +191,7 @@ POST /api/v1/forecast-compare
 4. 展示 `root_cause_diagnoses`、`work_order_drafts` 和结构化风险证据；
 5. 使用 `automatic_diagnosis.diagnosis` 作为面向运维人员的解释文本；
 6. 需要模型比选时再调用 `/api/v1/model-compare` 或 `/api/v1/forecast-compare`。
+7. 将 `work_order_drafts[].record_id` 传给工单卡片；现场确认后调用 PATCH 接口回写结果。
 
 若比赛平台要求使用万悟知识库和大模型节点，可改用 `/api/v1/analyze`，再由万悟完成知识
 检索和最终解释。两种模式不要在同一次请求中重复调用大模型。
@@ -178,8 +218,9 @@ X-API-Key: 你的服务密钥
 ```
 
 服务只接受 `file_id`，不接受 `E:\`、`..\` 或任意绝对路径。上传文件保存在 `outputs/api_uploads/`，
-运行记录保存在 `outputs/logs/runs.jsonl`。正式部署时应将这两个目录迁移到对象存储和数据库，
-并增加文件过期清理、租户隔离和 HTTPS。
+运行日志保存在 `outputs/logs/runs.jsonl`，任务、结果和工单保存在
+`outputs/shichi_qianji.db`。正式部署时应将上传目录迁移到对象存储，将 SQLite 迁移到
+PostgreSQL，并增加文件过期清理、租户隔离和 HTTPS。
 
 ## 现阶段边界
 

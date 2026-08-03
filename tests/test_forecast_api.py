@@ -82,6 +82,10 @@ def test_api_module_is_importable() -> None:
     assert "/api/v1/files" in paths
     assert "/api/v1/analyze" in paths
     assert "/api/v1/diagnose" in paths
+    assert "/api/v1/runs" in paths
+    assert "/api/v1/runs/{run_id}" in paths
+    assert "/api/v1/work-orders" in paths
+    assert "/api/v1/work-orders/{record_id}" in paths
     assert "/api/v1/model-compare" in paths
     assert "/api/v1/forecast-compare" in paths
 
@@ -119,3 +123,4 @@ def test_api_payload_exposes_root_causes_and_work_orders(tmp_path) -> None:
 
     assert payload["root_cause_diagnoses"]
     assert payload["work_order_drafts"]
+    assert payload["work_order_drafts"][0]["record_id"].startswith("run_test:")

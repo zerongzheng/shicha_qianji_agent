@@ -27,6 +27,7 @@ from app.models import (
     AnalysisConfig,
 )
 from app.observability import RunLogger
+from app.storage import get_repository
 
 try:
     from fastapi import FastAPI, File, Header, HTTPException, UploadFile
@@ -99,6 +100,15 @@ def _parse_config(payload: dict[str, Any] | None) -> AnalysisConfig:
     )
 
 
+def _parse_request_config(payload: dict[str, Any] | None) -> AnalysisConfig:
+    """把万悟参数格式错误转换为明确的 400 响应。"""
+
+    try:
+        return _parse_config(payload)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"分析参数不合法：{exc}") from exc
+
+
 def _parse_bool(value: Any) -> bool:
     """避免字符串 "false" 被 Python 误判为 True。"""
 
@@ -147,7 +157,14 @@ def _result_payload(run_id: str, result: Any) -> dict[str, Any]:
         "root_cause_diagnoses": [
             diagnosis_to_dict(item) for item in result.event_diagnoses
         ],
-        "work_order_drafts": [asdict(item) for item in result.work_order_drafts],
+        "work_order_drafts": [
+            {
+                **asdict(item),
+                # 算法工单编号在不同任务中可能重复，数据库记录编号加入 run_id 命名空间。
+                "record_id": f"{run_id}:{item.work_order_id}",
+            }
+            for item in result.work_order_drafts
+        ],
         "forecast_results": result.forecast_results,
         "risk_alerts": result.risk_alerts,
         "recommendations": result.recommendations,
@@ -160,13 +177,60 @@ def _result_payload(run_id: str, result: Any) -> dict[str, Any]:
     }
 
 
+def _find_uploaded_file(file_id: str) -> Path:
+    """校验 file_id、定位 CSV，并把历史上传目录补登记到数据库。"""
+
+    if not file_id or Path(file_id).name != file_id:
+        raise HTTPException(status_code=400, detail="必须提供合法 file_id")
+    matches = list((UPLOAD_DIR / file_id).glob("*.csv"))
+    if len(matches) != 1:
+        raise HTTPException(status_code=404, detail="找不到对应上传文件")
+    get_repository().register_file(file_id, matches[0].name, matches[0])
+    return matches[0]
+
+
+def _start_persisted_run(
+    logger: RunLogger,
+    file_id: str,
+    operation: str,
+    detector: str,
+    config: dict[str, Any],
+) -> None:
+    """统一创建数据库任务，避免各路由遗漏审计字段。"""
+
+    get_repository().start_run(
+        run_id=logger.run_id,
+        file_id=file_id,
+        operation=operation,
+        detector=detector,
+        config=config,
+    )
+
+
+def _finish_persisted_run(
+    logger_record: dict[str, Any],
+    response: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> None:
+    """使用与 JSONL 日志相同的耗时完成数据库任务归档。"""
+
+    get_repository().finish_run(
+        run_id=str(logger_record["run_id"]),
+        status=str(logger_record["status"]),
+        duration_ms=float(logger_record["duration_ms"]),
+        result=response,
+        error=error,
+    )
+
+
 if app:
 
     @app.get("/health")
     def health() -> dict[str, str]:
         """供万悟或部署平台检查服务是否在线。"""
 
-        return {"status": "ok", "service": "shichi-qianji"}
+        get_repository()
+        return {"status": "ok", "service": "shichi-qianji", "database": "sqlite"}
 
     @app.get("/api/v1/models")
     def list_models(
@@ -186,7 +250,7 @@ if app:
     async def upload_file(
         file: Annotated[UploadFile, File(...)],
         x_api_key: Annotated[str | None, Header()] = None,
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         """上传 CSV 并返回受控 file_id。"""
 
         _check_api_key(x_api_key)
@@ -197,7 +261,13 @@ if app:
         target_dir.mkdir(parents=True, exist_ok=True)
         target_path = target_dir / Path(file.filename).name
         target_path.write_bytes(await file.read())
-        return {"file_id": file_id, "file_name": target_path.name}
+        metadata = get_repository().register_file(file_id, target_path.name, target_path)
+        return {
+            "file_id": file_id,
+            "file_name": target_path.name,
+            "sha256": metadata["sha256"],
+            "size_bytes": metadata["size_bytes"],
+        }
 
     @app.post("/api/v1/analyze")
     def analyze(
@@ -208,27 +278,37 @@ if app:
 
         _check_api_key(x_api_key)
         file_id = str(payload.get("file_id", ""))
-        if not file_id or Path(file_id).name != file_id:
-            raise HTTPException(status_code=400, detail="必须提供合法 file_id")
-        matches = list((UPLOAD_DIR / file_id).glob("*.csv"))
-        if len(matches) != 1:
-            raise HTTPException(status_code=404, detail="找不到对应上传文件")
+        source_path = _find_uploaded_file(file_id)
 
         logger = RunLogger(run_id=f"run_{uuid.uuid4().hex[:12]}")
+        config = _parse_request_config(payload.get("config"))
+        _start_persisted_run(
+            logger,
+            file_id,
+            "analyze",
+            config.detector,
+            asdict(config),
+        )
         try:
-            config = _parse_config(payload.get("config"))
-            result = analyze_file(matches[0], config=config, write_report=True)
+            result = analyze_file(source_path, config=config, write_report=True)
             response = _result_payload(logger.run_id, result)
-            logger.finish(
-                "success",
-                "analyze",
-                {"file_id": file_id, "detector": config.detector},
-                {"events": len(result.events), "alerts": len(result.risk_alerts)},
-            )
-            return response
         except Exception as exc:
-            logger.finish("failed", "analyze", {"file_id": file_id}, error=str(exc))
+            log_record = logger.finish(
+                "failed",
+                "analyze",
+                {"file_id": file_id},
+                error=str(exc),
+            )
+            _finish_persisted_run(log_record, error=str(exc))
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        log_record = logger.finish(
+            "success",
+            "analyze",
+            {"file_id": file_id, "detector": config.detector},
+            {"events": len(result.events), "alerts": len(result.risk_alerts)},
+        )
+        _finish_persisted_run(log_record, response=response)
+        return response
 
     @app.post("/api/v1/diagnose")
     def diagnose(
@@ -239,33 +319,106 @@ if app:
 
         _check_api_key(x_api_key)
         file_id = str(payload.get("file_id", ""))
-        if not file_id or Path(file_id).name != file_id:
-            raise HTTPException(status_code=400, detail="必须提供合法 file_id")
-        matches = list((UPLOAD_DIR / file_id).glob("*.csv"))
-        if len(matches) != 1:
-            raise HTTPException(status_code=404, detail="找不到对应上传文件")
+        source_path = _find_uploaded_file(file_id)
 
         logger = RunLogger(run_id=f"run_{uuid.uuid4().hex[:12]}")
+        config = _parse_request_config(payload.get("config"))
+        _start_persisted_run(
+            logger,
+            file_id,
+            "diagnose",
+            config.detector,
+            asdict(config),
+        )
         try:
-            config = _parse_config(payload.get("config"))
-            result = analyze_file(matches[0], config=config, write_report=True)
+            result = analyze_file(source_path, config=config, write_report=True)
             response = _result_payload(logger.run_id, result)
             automatic = AutomaticDiagnosisService().diagnose(result)
             response["automatic_diagnosis"] = automatic.to_dict()
-            logger.finish(
-                "success",
-                "diagnose",
-                {"file_id": file_id, "detector": config.detector},
-                {
-                    "events": len(result.events),
-                    "alerts": len(result.risk_alerts),
-                    "diagnosis_status": automatic.status,
-                },
-            )
-            return response
         except Exception as exc:
-            logger.finish("failed", "diagnose", {"file_id": file_id}, error=str(exc))
+            log_record = logger.finish(
+                "failed",
+                "diagnose",
+                {"file_id": file_id},
+                error=str(exc),
+            )
+            _finish_persisted_run(log_record, error=str(exc))
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        log_record = logger.finish(
+            "success",
+            "diagnose",
+            {"file_id": file_id, "detector": config.detector},
+            {
+                "events": len(result.events),
+                "alerts": len(result.risk_alerts),
+                "diagnosis_status": automatic.status,
+            },
+        )
+        _finish_persisted_run(log_record, response=response)
+        return response
+
+    @app.get("/api/v1/runs")
+    def list_runs(
+        limit: int = 20,
+        status: str | None = None,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """返回历史分析任务摘要，供万悟任务中心或看板调用。"""
+
+        _check_api_key(x_api_key)
+        runs = get_repository().list_runs(limit=limit, status=status)
+        return {"status": "success", "run_count": len(runs), "runs": runs}
+
+    @app.get("/api/v1/runs/{run_id}")
+    def get_run(
+        run_id: str,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """返回指定任务的参数、状态和完整结构化结果。"""
+
+        _check_api_key(x_api_key)
+        run = get_repository().get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="找不到对应分析任务")
+        return {"status": "success", "run": run}
+
+    @app.get("/api/v1/work-orders")
+    def list_work_orders(
+        limit: int = 50,
+        status: str | None = None,
+        run_id: str | None = None,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """按优先级返回待办工单，可筛选状态和所属任务。"""
+
+        _check_api_key(x_api_key)
+        work_orders = get_repository().list_work_orders(
+            limit=limit,
+            status=status,
+            run_id=run_id,
+        )
+        return {
+            "status": "success",
+            "work_order_count": len(work_orders),
+            "work_orders": work_orders,
+        }
+
+    @app.patch("/api/v1/work-orders/{record_id}")
+    def update_work_order(
+        record_id: str,
+        payload: dict[str, Any],
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """接收万悟或现场人员回写的工单状态与确认结果。"""
+
+        _check_api_key(x_api_key)
+        try:
+            work_order = get_repository().update_work_order(record_id, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"status": "success", "work_order": work_order}
 
     @app.post("/api/v1/model-compare")
     def model_compare(
@@ -276,11 +429,7 @@ if app:
 
         _check_api_key(x_api_key)
         file_id = str(payload.get("file_id", ""))
-        if not file_id or Path(file_id).name != file_id:
-            raise HTTPException(status_code=400, detail="必须提供合法 file_id")
-        matches = list((UPLOAD_DIR / file_id).glob("*.csv"))
-        if len(matches) != 1:
-            raise HTTPException(status_code=404, detail="找不到对应上传文件")
+        source_path = _find_uploaded_file(file_id)
 
         requested = payload.get(
             "detectors",
@@ -312,13 +461,20 @@ if app:
             )
 
         logger = RunLogger(run_id=f"run_{uuid.uuid4().hex[:12]}")
+        base = payload.get("config") or {}
+        _start_persisted_run(
+            logger,
+            file_id,
+            "model_compare",
+            "multiple_detectors",
+            {"detectors": detectors, "config": base},
+        )
         records: list[dict[str, Any]] = []
         try:
-            base = payload.get("config") or {}
             for detector in detectors:
                 config = _parse_config({**base, "detector": detector})
                 result = analyze_file(
-                    matches[0],
+                    source_path,
                     config=config,
                     write_report=False,
                     run_forecast=False,
@@ -346,16 +502,23 @@ if app:
                 "models": records,
                 "selection_rule": "优先事件级 F1，其次 PR-AUC 和点级 F1；最终需结合误报与延迟人工确认",
             }
-            logger.finish(
-                "success",
-                "model_compare",
-                {"file_id": file_id, "detectors": detectors},
-                {"model_count": len(records)},
-            )
-            return response
         except Exception as exc:
-            logger.finish("failed", "model_compare", {"file_id": file_id}, error=str(exc))
+            log_record = logger.finish(
+                "failed",
+                "model_compare",
+                {"file_id": file_id},
+                error=str(exc),
+            )
+            _finish_persisted_run(log_record, error=str(exc))
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        log_record = logger.finish(
+            "success",
+            "model_compare",
+            {"file_id": file_id, "detectors": detectors},
+            {"model_count": len(records)},
+        )
+        _finish_persisted_run(log_record, response=response)
+        return response
 
     @app.post("/api/v1/forecast-compare")
     def forecast_compare(
@@ -366,11 +529,7 @@ if app:
 
         _check_api_key(x_api_key)
         file_id = str(payload.get("file_id", ""))
-        if not file_id or Path(file_id).name != file_id:
-            raise HTTPException(status_code=400, detail="必须提供合法 file_id")
-        matches = list((UPLOAD_DIR / file_id).glob("*.csv"))
-        if len(matches) != 1:
-            raise HTTPException(status_code=404, detail="找不到对应上传文件")
+        source_path = _find_uploaded_file(file_id)
 
         requested_models = payload.get("models", list(MODEL_LABELS))
         models = [str(item) for item in requested_models]
@@ -382,9 +541,22 @@ if app:
             )
 
         logger = RunLogger(run_id=f"run_{uuid.uuid4().hex[:12]}")
+        _start_persisted_run(
+            logger,
+            file_id,
+            "forecast_compare",
+            "forecast_model_selection",
+            {
+                "models": models,
+                "sensors": payload.get("sensors"),
+                "horizon": payload.get("horizon", settings.forecast_horizon),
+                "lookback": payload.get("lookback", settings.forecast_lookback),
+                "holdout": payload.get("holdout", settings.forecast_holdout),
+            },
+        )
         try:
-            dataframe = load_time_series(matches[0])
-            profile = build_profile(dataframe, matches[0].name)
+            dataframe = load_time_series(source_path)
+            profile = build_profile(dataframe, source_path.name)
             requested_sensors = payload.get("sensors") or profile.sensor_columns
             sensors = [str(item) for item in requested_sensors]
             invalid_sensors = set(sensors) - set(profile.sensor_columns)
@@ -409,16 +581,23 @@ if app:
                 "selection_rule": "每个传感器按时间顺序滚动回测，以 RMSE 为主、MAE 为辅选择最优模型",
                 "forecast_results": results,
             }
-            logger.finish(
-                "success",
-                "forecast_compare",
-                {"file_id": file_id, "models": models, "sensors": sensors},
-                {"sensor_count": len(results)},
-            )
-            return response
         except Exception as exc:
-            logger.finish("failed", "forecast_compare", {"file_id": file_id}, error=str(exc))
+            log_record = logger.finish(
+                "failed",
+                "forecast_compare",
+                {"file_id": file_id},
+                error=str(exc),
+            )
+            _finish_persisted_run(log_record, error=str(exc))
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        log_record = logger.finish(
+            "success",
+            "forecast_compare",
+            {"file_id": file_id, "models": models, "sensors": sensors},
+            {"sensor_count": len(results)},
+        )
+        _finish_persisted_run(log_record, response=response)
+        return response
 
 
 def run() -> None:
