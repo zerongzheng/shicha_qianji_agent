@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import secrets
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated, Any
@@ -16,9 +17,31 @@ from app.analysis.detection import DETECTOR_RECOMMENDED_THRESHOLDS
 from app.analysis.forecast import MODEL_LABELS, forecast_sensors
 from app.analysis.pipeline import analyze_file
 from app.analysis.profiling import build_profile
+from app.api.jobs import JobQueueFullError, get_job_manager
+from app.api.schemas import (
+    AnalysisRequest,
+    AnalysisResponse,
+    ErrorResponse,
+    FileUploadResponse,
+    ForecastCompareRequest,
+    JobAcceptedResponse,
+    JobCancelledResponse,
+    JobCreateRequest,
+    JobResultResponse,
+    JobStatusResponse,
+    ModelCompareRequest,
+    RunIdRequest,
+    WanwuJobAcceptedResponse,
+    WanwuJobCreateRequest,
+    WanwuWorkOrderListRequest,
+    WanwuWorkOrderUpdateRequest,
+    WorkOrderUpdateRequest,
+)
+from app.api.wanwu_openapi import build_wanwu_openapi
 from app.config import get_settings
 from app.data.loader import load_time_series
 from app.diagnosis import AutomaticDiagnosisService, diagnosis_to_dict
+from app.integrations import receive_wanwu_csv
 from app.model_store import list_autoencoder_models
 from app.models import (
     TFR_RECOMMENDED_FREQUENCY_WEIGHT,
@@ -38,7 +61,40 @@ except ImportError:  # 让未安装 API 依赖时，核心分析和 Streamlit �
 
 settings = get_settings()
 UPLOAD_DIR = settings.output_dir / "api_uploads"
-app = FastAPI(title="时察千机工业时序分析服务", version="0.4.0") if FastAPI else None
+
+
+@asynccontextmanager
+async def _lifespan(_app: Any):
+    """启动时清理中断任务，关闭时等待后台线程完成。"""
+
+    get_repository().fail_incomplete_runs("服务重启导致任务中断，请重新提交")
+    try:
+        yield
+    finally:
+        cancelled_run_ids = get_job_manager().shutdown()
+        get_job_manager.cache_clear()
+        repository = get_repository()
+        for run_id in cancelled_run_ids:
+            repository.cancel_run(run_id, "服务关闭取消了尚未执行的排队任务")
+        repository.fail_incomplete_runs("服务关闭导致任务中断，请重新提交")
+
+
+app = (
+    FastAPI(
+        title="时察千机工业时序分析服务",
+        version="0.5.0",
+        description="工业多变量时序异常检测、预测、根因诊断与运维工单服务。",
+        servers=[
+            {
+                "url": settings.api_public_base_url,
+                "description": "时察千机工业分析服务",
+            }
+        ],
+        lifespan=_lifespan,
+    )
+    if FastAPI
+    else None
+)
 
 
 def _check_api_key(api_key: str | None) -> None:
@@ -189,6 +245,144 @@ def _find_uploaded_file(file_id: str) -> Path:
     return matches[0]
 
 
+def _store_uploaded_csv(file_name: str, content: bytes) -> tuple[str, Path, dict[str, Any]]:
+    """把已校验 CSV 写入受控目录并登记哈希，供所有上传入口复用。"""
+
+    if not content:
+        raise HTTPException(status_code=400, detail="CSV 文件内容不能为空")
+    if len(content) > settings.max_upload_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"CSV 文件超过 {settings.max_upload_bytes} 字节限制",
+        )
+    safe_name = Path(file_name).name
+    if not safe_name.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="当前只允许上传 CSV 文件")
+    file_id = uuid.uuid4().hex
+    target_dir = UPLOAD_DIR / file_id
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = target_dir / safe_name
+    target_path.write_bytes(content)
+    metadata = get_repository().register_file(file_id, safe_name, target_path)
+    return file_id, target_path, metadata
+
+
+def _submit_analysis_job(
+    *,
+    file_id: str,
+    source_path: Path,
+    operation: str,
+    config: AnalysisConfig,
+) -> dict[str, Any]:
+    """登记并提交异步任务，保持普通 API 与万悟适配接口行为一致。"""
+
+    run_id = f"run_{uuid.uuid4().hex[:12]}"
+    repository = get_repository()
+    repository.start_run(
+        run_id=run_id,
+        file_id=file_id,
+        operation=operation,
+        detector=config.detector,
+        config=asdict(config),
+        status="queued",
+    )
+    try:
+        get_job_manager().submit(
+            run_id,
+            _execute_analysis_job,
+            run_id,
+            file_id,
+            source_path,
+            operation,
+            config,
+        )
+    except JobQueueFullError as exc:
+        repository.finish_run(run_id, "failed", 0.0, error=str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {
+        "status": "queued",
+        "run_id": run_id,
+        "operation": operation,
+        "status_url": f"/api/v1/jobs/{run_id}",
+        "result_url": f"/api/v1/jobs/{run_id}/result",
+    }
+
+
+def _job_status_payload(run: dict[str, Any]) -> dict[str, Any]:
+    """普通 API 与万悟 JSON 接口共用任务状态结构。"""
+
+    return {
+        "status": "success",
+        "run_id": run["run_id"],
+        "job_status": run["status"],
+        "operation": run["operation"],
+        "detector": run["detector"],
+        "file_id": run["file_id"],
+        "file_name": run["file_name"],
+        "started_at": run["started_at"],
+        "finished_at": run["finished_at"],
+        "duration_ms": run["duration_ms"],
+        "error": run["error"],
+        "result_ready": run["status"] == "success" and run["result"] is not None,
+    }
+
+
+def _get_run_or_404(run_id: str) -> dict[str, Any]:
+    """读取任务，找不到时返回统一 404。"""
+
+    run = get_repository().get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="找不到对应异步任务")
+    return run
+
+
+def _job_result_payload(run_id: str) -> dict[str, Any]:
+    """按状态返回异步结果或明确业务错误。"""
+
+    run = _get_run_or_404(run_id)
+    if run["status"] in {"queued", "running"}:
+        raise HTTPException(status_code=409, detail="任务尚未完成")
+    if run["status"] == "cancelled":
+        raise HTTPException(status_code=409, detail="任务已取消，没有可用结果")
+    if run["status"] == "failed":
+        raise HTTPException(status_code=422, detail=run["error"] or "任务执行失败")
+    if run["result"] is None:
+        raise HTTPException(status_code=409, detail="任务结果尚未就绪")
+    return {"status": "success", "run_id": run_id, "result": run["result"]}
+
+
+def _cancel_job_payload(run_id: str) -> dict[str, Any]:
+    """取消排队任务，供路径参数接口和万悟 JSON 接口共同调用。"""
+
+    repository = get_repository()
+    run = _get_run_or_404(run_id)
+    if run["status"] == "cancelled":
+        return {
+            "status": "success",
+            "run_id": run_id,
+            "job_status": "cancelled",
+            "message": "任务此前已取消",
+        }
+    if run["status"] != "queued":
+        raise HTTPException(
+            status_code=409,
+            detail=f"只有 queued 任务可以取消，当前状态为 {run['status']}",
+        )
+    if not get_job_manager().cancel(run_id):
+        raise HTTPException(
+            status_code=409,
+            detail="任务已经获得执行线程，无法取消，请继续查询任务状态",
+        )
+    if not repository.cancel_run(run_id, "用户或平台取消了排队任务"):
+        raise HTTPException(status_code=409, detail="任务状态已发生变化，请重新查询")
+    return {
+        "status": "success",
+        "run_id": run_id,
+        "job_status": "cancelled",
+        "message": "排队任务已取消",
+    }
+
+
 def _start_persisted_run(
     logger: RunLogger,
     file_id: str,
@@ -223,7 +417,58 @@ def _finish_persisted_run(
     )
 
 
+def _execute_analysis_job(
+    run_id: str,
+    file_id: str,
+    source_path: Path,
+    operation: str,
+    config: AnalysisConfig,
+) -> None:
+    """后台执行分析或自动诊断，并把最终状态写回 SQLite。"""
+
+    logger = RunLogger(run_id=run_id)
+    repository = get_repository()
+    try:
+        repository.mark_run_running(run_id)
+        result = analyze_file(source_path, config=config, write_report=True)
+        response = _result_payload(run_id, result)
+        diagnosis_status = None
+        if operation == "diagnose":
+            automatic = AutomaticDiagnosisService().diagnose(result)
+            response["automatic_diagnosis"] = automatic.to_dict()
+            diagnosis_status = automatic.status
+    except Exception as exc:  # noqa: BLE001  后台任务必须自行落库，不能依赖 FastAPI。
+        log_record = logger.finish(
+            "failed",
+            operation,
+            {"file_id": file_id, "detector": config.detector},
+            error=str(exc),
+        )
+        _finish_persisted_run(log_record, error=str(exc))
+        return
+
+    output_summary = {
+        "events": len(result.events),
+        "alerts": len(result.risk_alerts),
+    }
+    if diagnosis_status:
+        output_summary["diagnosis_status"] = diagnosis_status
+    log_record = logger.finish(
+        "success",
+        operation,
+        {"file_id": file_id, "detector": config.detector},
+        output_summary,
+    )
+    _finish_persisted_run(log_record, response=response)
+
+
 if app:
+
+    @app.get("/integrations/wanwu/openapi.json", include_in_schema=False)
+    def wanwu_openapi() -> dict[str, Any]:
+        """返回仅包含万悟可稳定调用工具的精简 OpenAPI。"""
+
+        return build_wanwu_openapi(app.openapi(), settings.api_public_base_url)
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -246,7 +491,11 @@ if app:
             "models": models,
         }
 
-    @app.post("/api/v1/files")
+    @app.post(
+        "/api/v1/files",
+        response_model=FileUploadResponse,
+        responses={400: {"model": ErrorResponse}},
+    )
     async def upload_file(
         file: Annotated[UploadFile, File(...)],
         x_api_key: Annotated[str | None, Header()] = None,
@@ -256,12 +505,8 @@ if app:
         _check_api_key(x_api_key)
         if not file.filename or not file.filename.lower().endswith(".csv"):
             raise HTTPException(status_code=400, detail="当前只允许上传 CSV 文件")
-        file_id = uuid.uuid4().hex
-        target_dir = UPLOAD_DIR / file_id
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target_path = target_dir / Path(file.filename).name
-        target_path.write_bytes(await file.read())
-        metadata = get_repository().register_file(file_id, target_path.name, target_path)
+        content = await file.read(settings.max_upload_bytes + 1)
+        file_id, target_path, metadata = _store_uploaded_csv(file.filename, content)
         return {
             "file_id": file_id,
             "file_name": target_path.name,
@@ -269,19 +514,24 @@ if app:
             "size_bytes": metadata["size_bytes"],
         }
 
-    @app.post("/api/v1/analyze")
+    @app.post(
+        "/api/v1/analyze",
+        response_model=AnalysisResponse,
+        response_model_exclude_none=True,
+        responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+    )
     def analyze(
-        payload: dict[str, Any],
+        payload: AnalysisRequest,
         x_api_key: Annotated[str | None, Header()] = None,
     ) -> dict[str, Any]:
         """分析已上传文件，供万悟工作流 API 节点调用。"""
 
         _check_api_key(x_api_key)
-        file_id = str(payload.get("file_id", ""))
+        file_id = payload.file_id
         source_path = _find_uploaded_file(file_id)
 
         logger = RunLogger(run_id=f"run_{uuid.uuid4().hex[:12]}")
-        config = _parse_request_config(payload.get("config"))
+        config = _parse_request_config(payload.config.as_overrides())
         _start_persisted_run(
             logger,
             file_id,
@@ -310,19 +560,24 @@ if app:
         _finish_persisted_run(log_record, response=response)
         return response
 
-    @app.post("/api/v1/diagnose")
+    @app.post(
+        "/api/v1/diagnose",
+        response_model=AnalysisResponse,
+        response_model_exclude_none=True,
+        responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+    )
     def diagnose(
-        payload: dict[str, Any],
+        payload: AnalysisRequest,
         x_api_key: Annotated[str | None, Header()] = None,
     ) -> dict[str, Any]:
         """一次完成确定性分析、知识检索和单次大模型诊断。"""
 
         _check_api_key(x_api_key)
-        file_id = str(payload.get("file_id", ""))
+        file_id = payload.file_id
         source_path = _find_uploaded_file(file_id)
 
         logger = RunLogger(run_id=f"run_{uuid.uuid4().hex[:12]}")
-        config = _parse_request_config(payload.get("config"))
+        config = _parse_request_config(payload.config.as_overrides())
         _start_persisted_run(
             logger,
             file_id,
@@ -356,6 +611,227 @@ if app:
         )
         _finish_persisted_run(log_record, response=response)
         return response
+
+    @app.post(
+        "/api/v1/jobs",
+        response_model=JobAcceptedResponse,
+        status_code=202,
+        responses={
+            404: {"model": ErrorResponse},
+            503: {"model": ErrorResponse},
+        },
+    )
+    def create_job(
+        payload: JobCreateRequest,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """提交异步分析任务，立即返回供万悟轮询的 run_id。"""
+
+        _check_api_key(x_api_key)
+        source_path = _find_uploaded_file(payload.file_id)
+        config = _parse_request_config(payload.config.as_overrides())
+        return _submit_analysis_job(
+            file_id=payload.file_id,
+            source_path=source_path,
+            operation=payload.operation,
+            config=config,
+        )
+
+    @app.get(
+        "/api/v1/jobs/{run_id}",
+        response_model=JobStatusResponse,
+        responses={404: {"model": ErrorResponse}},
+    )
+    def get_job_status(
+        run_id: str,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """返回异步任务当前状态；万悟选择器只需读取 job_status。"""
+
+        _check_api_key(x_api_key)
+        return _job_status_payload(_get_run_or_404(run_id))
+
+    @app.delete(
+        "/api/v1/jobs/{run_id}",
+        response_model=JobCancelledResponse,
+        responses={
+            404: {"model": ErrorResponse},
+            409: {"model": ErrorResponse},
+        },
+    )
+    def cancel_job(
+        run_id: str,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """取消仍在等待线程池执行的任务。"""
+
+        _check_api_key(x_api_key)
+        return _cancel_job_payload(run_id)
+
+    @app.get(
+        "/api/v1/jobs/{run_id}/result",
+        response_model=JobResultResponse,
+        responses={
+            404: {"model": ErrorResponse},
+            409: {"model": ErrorResponse},
+            422: {"model": ErrorResponse},
+        },
+    )
+    def get_job_result(
+        run_id: str,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """任务成功后返回完整结果；未完成和失败使用不同状态码。"""
+
+        _check_api_key(x_api_key)
+        return _job_result_payload(run_id)
+
+    @app.post(
+        "/api/v1/wanwu/jobs/submit",
+        operation_id="submit_industrial_analysis",
+        summary="提交工业时序分析",
+        response_model=WanwuJobAcceptedResponse,
+        status_code=202,
+        responses={
+            400: {"model": ErrorResponse},
+            413: {"model": ErrorResponse},
+            503: {"model": ErrorResponse},
+        },
+    )
+    def wanwu_submit_job(
+        payload: WanwuJobCreateRequest,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """从万悟文件 URL 或 Base64 接收 CSV，并在一次调用中提交异步任务。"""
+
+        _check_api_key(x_api_key)
+        try:
+            incoming = receive_wanwu_csv(
+                file_url=payload.file_url,
+                file_base64=payload.file_base64,
+                requested_file_name=payload.file_name,
+                max_bytes=settings.max_upload_bytes,
+                download_timeout=settings.wanwu_download_timeout,
+                allow_private_urls=settings.wanwu_allow_private_file_urls,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        file_id, source_path, metadata = _store_uploaded_csv(
+            incoming.file_name,
+            incoming.content,
+        )
+        config = _parse_request_config(payload.config.as_overrides())
+        accepted = _submit_analysis_job(
+            file_id=file_id,
+            source_path=source_path,
+            operation=payload.operation,
+            config=config,
+        )
+        return {
+            **accepted,
+            "file_id": file_id,
+            "file_name": incoming.file_name,
+            "file_source": incoming.source_type,
+            "sha256": metadata["sha256"],
+            "size_bytes": metadata["size_bytes"],
+        }
+
+    @app.post(
+        "/api/v1/wanwu/jobs/status",
+        operation_id="get_industrial_analysis_status",
+        summary="查询工业分析任务状态",
+        response_model=JobStatusResponse,
+        responses={404: {"model": ErrorResponse}},
+    )
+    def wanwu_job_status(
+        payload: RunIdRequest,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """使用 JSON 中的 run_id 查询状态，兼容万悟 OpenAPI 工具执行器。"""
+
+        _check_api_key(x_api_key)
+        return _job_status_payload(_get_run_or_404(payload.run_id))
+
+    @app.post(
+        "/api/v1/wanwu/jobs/result",
+        operation_id="get_industrial_analysis_result",
+        summary="获取工业分析结果",
+        response_model=JobResultResponse,
+        responses={
+            404: {"model": ErrorResponse},
+            409: {"model": ErrorResponse},
+            422: {"model": ErrorResponse},
+        },
+    )
+    def wanwu_job_result(
+        payload: RunIdRequest,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """任务成功后通过 JSON 请求获取完整结构化结果。"""
+
+        _check_api_key(x_api_key)
+        return _job_result_payload(payload.run_id)
+
+    @app.post(
+        "/api/v1/wanwu/jobs/cancel",
+        operation_id="cancel_industrial_analysis",
+        summary="取消排队中的工业分析任务",
+        response_model=JobCancelledResponse,
+        responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+    )
+    def wanwu_cancel_job(
+        payload: RunIdRequest,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """通过 JSON 请求取消尚未开始执行的任务。"""
+
+        _check_api_key(x_api_key)
+        return _cancel_job_payload(payload.run_id)
+
+    @app.post(
+        "/api/v1/wanwu/work-orders/list",
+        operation_id="list_industrial_work_orders",
+        summary="查询工业运维工单",
+    )
+    def wanwu_list_work_orders(
+        payload: WanwuWorkOrderListRequest,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """通过 JSON 条件查询工单，避免依赖 GET 查询参数绑定。"""
+
+        _check_api_key(x_api_key)
+        work_orders = get_repository().list_work_orders(
+            limit=payload.limit,
+            status=payload.status,
+            run_id=payload.run_id,
+        )
+        return {
+            "status": "success",
+            "work_order_count": len(work_orders),
+            "work_orders": work_orders,
+        }
+
+    @app.post(
+        "/api/v1/wanwu/work-orders/update",
+        operation_id="update_industrial_work_order",
+        summary="回写工业运维工单",
+        responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+    )
+    def wanwu_update_work_order(
+        payload: WanwuWorkOrderUpdateRequest,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """使用单个 JSON 请求回写工单状态、根因和现场复测说明。"""
+
+        _check_api_key(x_api_key)
+        values = payload.model_dump(exclude={"record_id"}, exclude_unset=True)
+        try:
+            work_order = get_repository().update_work_order(payload.record_id, values)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"status": "success", "work_order": work_order}
 
     @app.get("/api/v1/runs")
     def list_runs(
@@ -406,14 +882,17 @@ if app:
     @app.patch("/api/v1/work-orders/{record_id}")
     def update_work_order(
         record_id: str,
-        payload: dict[str, Any],
+        payload: WorkOrderUpdateRequest,
         x_api_key: Annotated[str | None, Header()] = None,
     ) -> dict[str, Any]:
         """接收万悟或现场人员回写的工单状态与确认结果。"""
 
         _check_api_key(x_api_key)
         try:
-            work_order = get_repository().update_work_order(record_id, payload)
+            work_order = get_repository().update_work_order(
+                record_id,
+                payload.model_dump(exclude_unset=True),
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except LookupError as exc:
@@ -422,46 +901,19 @@ if app:
 
     @app.post("/api/v1/model-compare")
     def model_compare(
-        payload: dict[str, Any],
+        payload: ModelCompareRequest,
         x_api_key: Annotated[str | None, Header()] = None,
     ) -> dict[str, Any]:
         """在同一份上传数据上运行多个检测器，返回可供万悟决策的比较结果。"""
 
         _check_api_key(x_api_key)
-        file_id = str(payload.get("file_id", ""))
+        file_id = payload.file_id
         source_path = _find_uploaded_file(file_id)
 
-        requested = payload.get(
-            "detectors",
-            [
-                "mad",
-                "isolation_forest",
-                "pca_reconstruction",
-                "window_autoencoder",
-                "time_frequency_relation",
-                "hybrid",
-            ],
-        )
-        detectors = [str(item) for item in requested]
-        allowed = {
-            "mad",
-            "isolation_forest",
-            "pca_reconstruction",
-            "window_autoencoder",
-            "time_frequency_relation",
-            "hybrid",
-        }
-        if not detectors or any(detector not in allowed for detector in detectors):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "detectors 只能包含 mad、isolation_forest、"
-                    "pca_reconstruction、window_autoencoder、time_frequency_relation、hybrid"
-                ),
-            )
+        detectors = list(payload.detectors)
 
         logger = RunLogger(run_id=f"run_{uuid.uuid4().hex[:12]}")
-        base = payload.get("config") or {}
+        base = payload.config.as_overrides()
         _start_persisted_run(
             logger,
             file_id,
@@ -522,17 +974,16 @@ if app:
 
     @app.post("/api/v1/forecast-compare")
     def forecast_compare(
-        payload: dict[str, Any],
+        payload: ForecastCompareRequest,
         x_api_key: Annotated[str | None, Header()] = None,
     ) -> dict[str, Any]:
         """比较指定传感器的预测模型，供万悟工作流解释模型选择依据。"""
 
         _check_api_key(x_api_key)
-        file_id = str(payload.get("file_id", ""))
+        file_id = payload.file_id
         source_path = _find_uploaded_file(file_id)
 
-        requested_models = payload.get("models", list(MODEL_LABELS))
-        models = [str(item) for item in requested_models]
+        models = list(payload.models)
         unknown = set(models) - set(MODEL_LABELS)
         if not models or unknown:
             raise HTTPException(
@@ -548,24 +999,24 @@ if app:
             "forecast_model_selection",
             {
                 "models": models,
-                "sensors": payload.get("sensors"),
-                "horizon": payload.get("horizon", settings.forecast_horizon),
-                "lookback": payload.get("lookback", settings.forecast_lookback),
-                "holdout": payload.get("holdout", settings.forecast_holdout),
+                "sensors": payload.sensors,
+                "horizon": payload.horizon,
+                "lookback": payload.lookback,
+                "holdout": payload.holdout,
             },
         )
         try:
             dataframe = load_time_series(source_path)
             profile = build_profile(dataframe, source_path.name)
-            requested_sensors = payload.get("sensors") or profile.sensor_columns
+            requested_sensors = payload.sensors or profile.sensor_columns
             sensors = [str(item) for item in requested_sensors]
             invalid_sensors = set(sensors) - set(profile.sensor_columns)
             if not sensors or invalid_sensors:
                 raise ValueError(f"数据中不存在传感器：{', '.join(sorted(invalid_sensors))}")
 
-            horizon = max(1, min(300, int(payload.get("horizon", settings.forecast_horizon))))
-            lookback = max(30, int(payload.get("lookback", settings.forecast_lookback)))
-            holdout = max(5, int(payload.get("holdout", settings.forecast_holdout)))
+            horizon = payload.horizon
+            lookback = payload.lookback
+            holdout = payload.holdout
             results = forecast_sensors(
                 dataframe,
                 sensors,

@@ -82,6 +82,9 @@ def test_api_module_is_importable() -> None:
     assert "/api/v1/files" in paths
     assert "/api/v1/analyze" in paths
     assert "/api/v1/diagnose" in paths
+    assert "/api/v1/jobs" in paths
+    assert "/api/v1/jobs/{run_id}" in paths
+    assert "/api/v1/jobs/{run_id}/result" in paths
     assert "/api/v1/runs" in paths
     assert "/api/v1/runs/{run_id}" in paths
     assert "/api/v1/work-orders" in paths
@@ -124,3 +127,18 @@ def test_api_payload_exposes_root_causes_and_work_orders(tmp_path) -> None:
     assert payload["root_cause_diagnoses"]
     assert payload["work_order_drafts"]
     assert payload["work_order_drafts"][0]["record_id"].startswith("run_test:")
+
+
+def test_openapi_exposes_wanwu_job_contract() -> None:
+    """OpenAPI 应包含异步任务协议、枚举和部署地址。"""
+
+    from app.api.server import app
+
+    assert app is not None
+    schema = app.openapi()
+    request_schema = schema["components"]["schemas"]["JobCreateRequest"]
+
+    assert schema["servers"][0]["url"]
+    assert request_schema["additionalProperties"] is False
+    assert request_schema["properties"]["operation"]["enum"] == ["analyze", "diagnose"]
+    assert schema["paths"]["/api/v1/jobs"]["post"]["responses"]["202"]

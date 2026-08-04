@@ -119,15 +119,79 @@ POST /api/v1/analyze     传入 file_id 和可选 config，返回统一 JSON
 POST /api/v1/diagnose    一次完成分析、知识检索和单次大模型诊断
 POST /api/v1/model-compare     比较异常检测器
 POST /api/v1/forecast-compare  比较预测模型并返回最优模型与区间
+POST /api/v1/jobs              提交异步分析或诊断任务，立即返回 run_id
+GET  /api/v1/jobs/{run_id}     查询 queued/running/success/failed/cancelled 状态
+DELETE /api/v1/jobs/{run_id}   取消尚未开始执行的排队任务
+GET  /api/v1/jobs/{run_id}/result 获取成功任务的完整结果
 GET  /api/v1/runs              查询历史分析任务
 GET  /api/v1/runs/{run_id}     查询任务参数与完整结构化结果
 GET  /api/v1/work-orders       查询工单队列
 PATCH /api/v1/work-orders/{record_id} 回写工单状态与现场反馈
 ```
 
+万悟自定义工具不要直接导入完整 `/openapi.json`。项目提供了专用 JSON 协议，规避万悟当前
+工具执行器不能正确上传 multipart 二进制文件、不能替换路径参数的问题：
+
+```text
+POST /api/v1/wanwu/jobs/submit        文件 URL/Base64 → 上传登记 → 异步任务
+POST /api/v1/wanwu/jobs/status        JSON 传入 run_id 查询状态
+POST /api/v1/wanwu/jobs/result        JSON 传入 run_id 获取结果
+POST /api/v1/wanwu/jobs/cancel        JSON 传入 run_id 取消排队任务
+POST /api/v1/wanwu/work-orders/list   查询工单
+POST /api/v1/wanwu/work-orders/update 回写工单
+```
+
+精简 OpenAPI 导入地址：
+
+```text
+http://host.docker.internal:8000/integrations/wanwu/openapi.json
+```
+
 比赛演示和低调用额度场景优先使用：文件上传 → `/api/v1/diagnose` → 展示诊断。
 该端点由 Python 一次完成工业分析和知识检索，最后只调用一次 GLM-5。需要在万悟中自定义
 条件分支或知识库时，再调用 `/api/v1/analyze` 获取结构化证据自行编排。
+
+正式万悟工作流建议使用异步接口，避免大文件分析、模型训练或预测计算超过 HTTP 节点超时：
+
+```text
+文件节点取得临时 URL 或 Base64
+→ submit_industrial_analysis，保存 run_id
+→ 循环调用 get_industrial_analysis_status
+→ job_status=success 时调用 get_industrial_analysis_result
+→ job_status=failed 时展示 error
+→ 用户撤回或流程超时时调用 cancel_industrial_analysis
+→ 进入万悟大模型解释和工单节点
+```
+
+同步 `/api/v1/analyze` 和 `/api/v1/diagnose` 保留用于本地调试和小文件快速调用。异步任务
+默认同时执行 2 个、额外排队 8 个，可通过 `.env` 调整。服务重启后，遗留的排队或运行中
+任务会自动标记失败，调用方可以重新提交，不会永久停留在运行状态。
+
+在还没有公网服务器和比赛方万悟配置权限时，可以先完成本地接入自检：
+
+```powershell
+uv run python api_main.py
+uv run shichi-qianji-wanwu-check
+```
+
+自检通过会在 `outputs/wanwu_openapi.json` 生成可直接粘贴到万悟“自定义工具”的精简协议。
+获得 Docker 部署环境后执行：
+
+```powershell
+docker compose -f compose.wanwu.yml up -d --build
+```
+
+在线万悟仍需要一个平台可访问的公网 HTTPS 地址。这是网络和平台权限条件，不能由项目代码
+在没有服务器或平台账号的情况下自动创建；但后端镜像、接口协议、鉴权、状态轮询和自检均已
+准备完成。
+
+FastAPI 在线接口说明位于 `/docs`，标准协议位于 `/openapi.json`。其中 `servers` 地址来自：
+
+```dotenv
+API_PUBLIC_BASE_URL=http://host.docker.internal:8000
+```
+
+比赛方在线万悟接入时必须将其改为实际部署后的公网 HTTPS 地址。
 
 ## SQLite 数据库
 

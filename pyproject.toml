@@ -12,6 +12,7 @@ dependencies = [
     "numpy>=2.2.0",
     "pandas>=2.2.0",
     "plotly>=6.0.0",
+    "pydantic>=2.11.0",
     "python-dotenv>=1.2.0",
     "python-multipart>=0.0.20",
     "scikit-learn>=1.7.0",
@@ -28,6 +29,7 @@ dev = [
 [project.scripts]
 shichi-qianji = "app.cli:main"
 shichi-qianji-api = "app.api.server:run"
+shichi-qianji-wanwu-check = "app.integrations.wanwu_check:main"
 
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"

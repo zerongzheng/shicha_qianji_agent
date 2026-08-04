@@ -48,6 +48,12 @@ class Settings:
     forecast_horizon: int
     forecast_lookback: int
     forecast_holdout: int
+    async_job_workers: int
+    async_job_queue_size: int
+    max_upload_bytes: int
+    wanwu_download_timeout: float
+    wanwu_allow_private_file_urls: bool
+    api_public_base_url: str
     industrial_api_key: str
 
     @property
@@ -126,5 +132,21 @@ def get_settings() -> Settings:
         forecast_horizon=int(os.getenv("FORECAST_HORIZON", "30")),
         forecast_lookback=int(os.getenv("FORECAST_LOOKBACK", "120")),
         forecast_holdout=int(os.getenv("FORECAST_HOLDOUT", "30")),
+        async_job_workers=max(1, int(os.getenv("ASYNC_JOB_WORKERS", "2"))),
+        async_job_queue_size=max(0, int(os.getenv("ASYNC_JOB_QUEUE_SIZE", "8"))),
+        max_upload_bytes=max(1024, int(os.getenv("MAX_UPLOAD_BYTES", "26214400"))),
+        wanwu_download_timeout=max(
+            1.0,
+            float(os.getenv("WANWU_DOWNLOAD_TIMEOUT", "30")),
+        ),
+        wanwu_allow_private_file_urls=os.getenv(
+            "WANWU_ALLOW_PRIVATE_FILE_URLS",
+            "false",
+        ).strip().lower()
+        in {"true", "1", "yes", "on"},
+        api_public_base_url=os.getenv(
+            "API_PUBLIC_BASE_URL",
+            "http://host.docker.internal:8000",
+        ).rstrip("/"),
         industrial_api_key=os.getenv("INDUSTRIAL_API_KEY", ""),
     )

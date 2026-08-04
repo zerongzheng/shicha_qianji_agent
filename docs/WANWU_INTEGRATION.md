@@ -7,14 +7,38 @@
 
 ```text
 万悟 Agent / Workflow
-    -> 上传 CSV 到时察千机 POST /api/v1/files
-    -> 获得 file_id
-    -> 调用时察千机 POST /api/v1/diagnose
-    -> Python 完成分析与知识检索，GLM-5 单次生成诊断
+    -> 文件节点获得 CSV 临时 URL，或将小文件转换为 Base64
+    -> POST /api/v1/wanwu/jobs/submit，一次完成文件登记和异步提交
+    -> POST /api/v1/wanwu/jobs/status 轮询，JSON 中传入 run_id
+    -> success 后 POST /api/v1/wanwu/jobs/result
+    -> Python 完成确定性分析，万悟大模型节点生成单次诊断解释
     -> 万悟直接展示异常证据、趋势预警和处置顺序
     -> 查询 GET /api/v1/work-orders 展示待办工单
     -> PATCH /api/v1/work-orders/{record_id} 回写现场结果
 ```
+
+小文件本地调试仍可直接调用 `/api/v1/analyze` 或 `/api/v1/diagnose`；正式演示优先使用异步
+链路，避免模型训练和预测计算超过万悟 HTTP 节点的单次等待时间。
+
+## 为什么增加万悟专用接口
+
+对本地 `E:\大学课程\竞赛\wanwu` 源码检查后确认，当前 OpenAPI 工具执行器有两个兼容限制：
+
+1. `multipart/form-data` 只会写普通文本字段，不会上传真实文件二进制；
+2. 工具调用不会把 JSON 参数替换进 `/jobs/{run_id}` 这类路径参数。
+
+因此，万悟不应直接使用普通 `/api/v1/files` 和带路径参数的任务接口。项目新增的
+`/api/v1/wanwu/*` 全部使用 `POST + application/json`，文件通过临时下载 URL 或 Base64
+传入，`run_id` 和 `record_id` 也都放在 JSON 请求体中。普通接口仍为 Streamlit、浏览器和
+其他标准客户端保留。
+
+精简 OpenAPI：
+
+```text
+http://host.docker.internal:8000/integrations/wanwu/openapi.json
+```
+
+它只包含六个万悟可稳定调用的工具，并为每个工具固定英文 `operationId`。
 
 ## 启动本地分析服务
 
@@ -183,18 +207,94 @@ POST /api/v1/forecast-compare
 
 ## 万悟工作流建议
 
-比赛演示优先使用低调用额度工作流：
+比赛演示优先使用异步工作流，避免工业分析超过万悟 HTTP 节点超时时间：
 
-1. 文件输入节点接收用户 CSV；
-2. API 节点调用 `/api/v1/files`；
-3. API 节点把 `file_id` 传给 `/api/v1/diagnose`；
-4. 展示 `root_cause_diagnoses`、`work_order_drafts` 和结构化风险证据；
-5. 使用 `automatic_diagnosis.diagnosis` 作为面向运维人员的解释文本；
-6. 需要模型比选时再调用 `/api/v1/model-compare` 或 `/api/v1/forecast-compare`。
-7. 将 `work_order_drafts[].record_id` 传给工单卡片；现场确认后调用 PATCH 接口回写结果。
+1. 文件输入节点接收用户 CSV，并取得平台临时下载 URL；小文件也可传 Base64；
+2. 工具节点调用 `submit_industrial_analysis`，保存返回的 `run_id`；
+3. 循环节点调用 `get_industrial_analysis_status`；
+4. 选择器判断 `job_status`：`queued/running` 继续等待，`success` 进入结果节点，`failed` 展示错误，`cancelled` 结束流程；
+5. 工具节点调用 `get_industrial_analysis_result`；
+6. 展示 `root_cause_diagnoses`、`work_order_drafts` 和结构化风险证据；
+7. 由一个万悟大模型节点生成面向运维人员的解释文本；
+8. 将 `work_order_drafts[].record_id` 传给工单卡片，现场确认后调用 `update_industrial_work_order` 回写结果。
+
+异步任务请求示例：
+
+```json
+{
+  "file_url": "文件节点返回的临时 HTTPS 下载地址",
+  "file_name": "industrial_sample.csv",
+  "operation": "analyze",
+  "config": {
+    "detector": "time_frequency_relation",
+    "threshold": 4.5,
+    "rolling_window": 61,
+    "min_event_length": 3
+  }
+}
+```
+
+提交成功返回 HTTP 202：
+
+```json
+{
+  "status": "queued",
+  "run_id": "run_xxxxxxxxxxxx",
+  "file_id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "file_source": "url",
+  "operation": "analyze",
+  "status_url": "/api/v1/jobs/run_xxxxxxxxxxxx",
+  "result_url": "/api/v1/jobs/run_xxxxxxxxxxxx/result"
+}
+```
+
+建议循环间隔设置为 2 至 5 秒，并设置最大循环次数。不要毫秒级连续查询 SQLite。
+用户撤回分析或工作流达到最大等待次数时，可调用 `cancel_industrial_analysis` 取消仍在
+排队的任务。已经进入 `running` 的计算不会被强制中断，接口会返回 HTTP 409，此时应继续
+查询最终状态，避免算法仍在运行而数据库被错误标记为取消。
 
 若比赛平台要求使用万悟知识库和大模型节点，可改用 `/api/v1/analyze`，再由万悟完成知识
 检索和最终解释。两种模式不要在同一次请求中重复调用大模型。
+
+新的异步工作流中将 `operation` 设为 `analyze`，再使用一个万悟大模型节点；若设为
+`diagnose`，Python 会自行调用 GLM-5，万悟只负责展示，两种模式同样不要叠加。
+
+## 导入 OpenAPI
+
+启动服务后，万悟应导入精简协议：
+
+```text
+http://host.docker.internal:8000/integrations/wanwu/openapi.json
+```
+
+也可以在浏览器打开该地址后导入万悟“资源库 → 自定义工具”。OpenAPI 中的
+`servers` 来自 `.env` 的 `API_PUBLIC_BASE_URL`。本机 Docker 使用
+`http://host.docker.internal:8000`；在线万悟必须改成公网 HTTPS 地址后重新启动 API。
+
+## 暂无部署环境时怎么做
+
+没有公网服务器不会阻止代码继续开发和验证。先启动本地 API：
+
+```powershell
+uv run python api_main.py
+uv run shichi-qianji-wanwu-check
+```
+
+第二条命令会检查健康状态、六个万悟工具和 OpenAPI 服务地址，并导出：
+
+```text
+outputs/wanwu_openapi.json
+```
+
+获得任意支持 Docker Compose 的服务器后执行：
+
+```powershell
+docker compose -f compose.wanwu.yml up -d --build
+```
+
+正式在线接入仍必须具备两个外部条件：一个在线万悟能够访问的公网 HTTPS 地址，以及在万悟
+页面创建自定义工具和工作流的权限。代码无法凭空生成平台账号或公网服务器，但已经把获得
+这些条件后的部署和导入工作压缩为固定命令和固定 Schema。
 
 不要将完整 CSV 直接放进大模型提示词。大模型只读取分析 API 返回的结构化摘要和知识库证据。
 
