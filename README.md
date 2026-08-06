@@ -127,6 +127,7 @@ GET  /api/v1/runs              查询历史分析任务
 GET  /api/v1/runs/{run_id}     查询任务参数与完整结构化结果
 GET  /api/v1/work-orders       查询工单队列
 PATCH /api/v1/work-orders/{record_id} 回写工单状态与现场反馈
+GET  /api/v1/cases             查询现场确认后沉淀的历史故障案例
 ```
 
 万悟自定义工具不要直接导入完整 `/openapi.json`。项目提供了专用 JSON 协议，规避万悟当前
@@ -139,6 +140,7 @@ POST /api/v1/wanwu/jobs/result        JSON 传入 run_id 获取结果
 POST /api/v1/wanwu/jobs/cancel        JSON 传入 run_id 取消排队任务
 POST /api/v1/wanwu/work-orders/list   查询工单
 POST /api/v1/wanwu/work-orders/update 回写工单
+POST /api/v1/wanwu/cases/list         查询可追溯的历史故障案例
 ```
 
 精简 OpenAPI 导入地址：
@@ -161,6 +163,7 @@ http://host.docker.internal:8000/integrations/wanwu/openapi.json
 → job_status=failed 时展示 error
 → 用户撤回或流程超时时调用 cancel_industrial_analysis
 → 进入万悟大模型解释和工单节点
+→ 现场确认根因沉淀案例，下一次相似事件自动复用
 ```
 
 同步 `/api/v1/analyze` 和 `/api/v1/diagnose` 保留用于本地调试和小文件快速调用。异步任务

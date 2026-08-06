@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from app.analysis.advice import generate_recommendations
 from app.analysis.detection import detect_anomalies
@@ -21,7 +23,7 @@ from app.analysis.warning import build_risk_alerts
 from app.config import get_settings
 from app.data.loader import load_time_series
 from app.diagnosis import diagnose_root_causes
-from app.models import AnalysisConfig, AnalysisResult
+from app.models import AnalysisConfig, AnalysisResult, HistoricalCaseMatch
 from app.reporting import build_markdown_report, save_report
 
 
@@ -60,6 +62,11 @@ def analyze_file(
     write_report: bool = True,
     run_forecast: bool = True,
     run_regime: bool = True,
+    case_matcher: Callable[
+        [list[dict[str, Any]], list[str], str],
+        list[HistoricalCaseMatch],
+    ]
+    | None = None,
 ) -> AnalysisResult:
     """执行单文件工业时序分析。
 
@@ -144,6 +151,7 @@ def analyze_file(
         relationship_diagnostics,
         operating_regimes,
     )
+    historical_case_matches: dict[int, list[HistoricalCaseMatch]] = {}
     event_diagnoses, work_order_drafts = diagnose_root_causes(
         dataframe=dataframe,
         sensor_columns=profile.sensor_columns,
@@ -152,6 +160,8 @@ def analyze_file(
         operating_regimes=operating_regimes,
         trend_summary=trends,
         forecast_results=forecasts,
+        case_matcher=case_matcher,
+        historical_matches_output=historical_case_matches,
     )
 
     result = AnalysisResult(
@@ -172,6 +182,7 @@ def analyze_file(
         risk_alerts=risk_alerts,
         event_diagnoses=event_diagnoses,
         work_order_drafts=work_order_drafts,
+        historical_case_matches=historical_case_matches,
     )
     result.report_text = build_markdown_report(result, config)
 

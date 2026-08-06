@@ -204,6 +204,21 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
                     "",
                 ]
             )
+            case_matches = result.historical_case_matches.get(diagnosis.event_number, [])
+            if case_matches:
+                lines.extend(
+                    [
+                        "历史闭环案例：",
+                        *[
+                            (
+                                f"- {item.confirmed_cause}：相似度 {item.similarity:.0%}，"
+                                f"来源工单 {item.source_record_id}"
+                            )
+                            for item in case_matches[:3]
+                        ],
+                        "",
+                    ]
+                )
 
     lines.extend(["", "## 9. 待确认工单草案", ""])
     if not result.work_order_drafts:

@@ -31,6 +31,7 @@ from app.api.schemas import (
     JobStatusResponse,
     ModelCompareRequest,
     RunIdRequest,
+    WanwuCaseListRequest,
     WanwuJobAcceptedResponse,
     WanwuJobCreateRequest,
     WanwuWorkOrderListRequest,
@@ -213,6 +214,10 @@ def _result_payload(run_id: str, result: Any) -> dict[str, Any]:
         "root_cause_diagnoses": [
             diagnosis_to_dict(item) for item in result.event_diagnoses
         ],
+        "historical_case_matches": {
+            str(event_number): [asdict(item) for item in matches]
+            for event_number, matches in result.historical_case_matches.items()
+        },
         "work_order_drafts": [
             {
                 **asdict(item),
@@ -417,6 +422,26 @@ def _finish_persisted_run(
     )
 
 
+def _public_case_record(case: dict[str, Any]) -> dict[str, Any]:
+    """移除内部检索集合，只返回万悟和看板需要的可序列化字段。"""
+
+    signature = case.get("signature", {})
+    return {
+        "case_id": case["case_id"],
+        "confirmed_cause": case["confirmed_cause"],
+        "source_run_id": case["source_run_id"],
+        "source_record_id": case["source_record_id"],
+        "sensor_groups": sorted(signature.get("groups", [])),
+        "direction_features": sorted(signature.get("directions", [])),
+        "dominant_sensor_groups": sorted(signature.get("dominant_groups", [])),
+        "regime_context": signature.get("regime", ""),
+        "evidence_summary": case["evidence_summary"],
+        "feedback_note": case["feedback_note"],
+        "handled_by": case["handled_by"],
+        "closed_at": case["closed_at"],
+    }
+
+
 def _execute_analysis_job(
     run_id: str,
     file_id: str,
@@ -430,7 +455,12 @@ def _execute_analysis_job(
     repository = get_repository()
     try:
         repository.mark_run_running(run_id)
-        result = analyze_file(source_path, config=config, write_report=True)
+        result = analyze_file(
+            source_path,
+            config=config,
+            write_report=True,
+            case_matcher=repository.find_similar_cases,
+        )
         response = _result_payload(run_id, result)
         diagnosis_status = None
         if operation == "diagnose":
@@ -540,7 +570,12 @@ if app:
             asdict(config),
         )
         try:
-            result = analyze_file(source_path, config=config, write_report=True)
+            result = analyze_file(
+                source_path,
+                config=config,
+                write_report=True,
+                case_matcher=get_repository().find_similar_cases,
+            )
             response = _result_payload(logger.run_id, result)
         except Exception as exc:
             log_record = logger.finish(
@@ -586,7 +621,12 @@ if app:
             asdict(config),
         )
         try:
-            result = analyze_file(source_path, config=config, write_report=True)
+            result = analyze_file(
+                source_path,
+                config=config,
+                write_report=True,
+                case_matcher=get_repository().find_similar_cases,
+            )
             response = _result_payload(logger.run_id, result)
             automatic = AutomaticDiagnosisService().diagnose(result)
             response["automatic_diagnosis"] = automatic.to_dict()
@@ -833,6 +873,26 @@ if app:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"status": "success", "work_order": work_order}
 
+    @app.post(
+        "/api/v1/wanwu/cases/list",
+        operation_id="list_industrial_feedback_cases",
+        summary="查询已闭环工业故障案例",
+    )
+    def wanwu_list_cases(
+        payload: WanwuCaseListRequest,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """查询由现场确认工单形成的可追溯案例记忆。"""
+
+        _check_api_key(x_api_key)
+        cases = get_repository().list_confirmed_cases(limit=payload.limit)
+        public_cases = [_public_case_record(item) for item in cases]
+        return {
+            "status": "success",
+            "case_count": len(public_cases),
+            "cases": public_cases,
+        }
+
     @app.get("/api/v1/runs")
     def list_runs(
         limit: int = 20,
@@ -877,6 +937,22 @@ if app:
             "status": "success",
             "work_order_count": len(work_orders),
             "work_orders": work_orders,
+        }
+
+    @app.get("/api/v1/cases")
+    def list_cases(
+        limit: int = 50,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """返回已闭环故障案例，供本地看板核查持续学习状态。"""
+
+        _check_api_key(x_api_key)
+        cases = get_repository().list_confirmed_cases(limit=limit)
+        public_cases = [_public_case_record(item) for item in cases]
+        return {
+            "status": "success",
+            "case_count": len(public_cases),
+            "cases": public_cases,
         }
 
     @app.patch("/api/v1/work-orders/{record_id}")

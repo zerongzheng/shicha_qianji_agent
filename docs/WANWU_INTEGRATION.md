@@ -15,6 +15,8 @@
     -> 万悟直接展示异常证据、趋势预警和处置顺序
     -> 查询 GET /api/v1/work-orders 展示待办工单
     -> PATCH /api/v1/work-orders/{record_id} 回写现场结果
+    -> 已确认根因自动沉淀为历史案例
+    -> 下一次相似事件检索案例并参与候选根因排序
 ```
 
 小文件本地调试仍可直接调用 `/api/v1/analyze` 或 `/api/v1/diagnose`；正式演示优先使用异步
@@ -38,7 +40,7 @@
 http://host.docker.internal:8000/integrations/wanwu/openapi.json
 ```
 
-它只包含六个万悟可稳定调用的工具，并为每个工具固定英文 `operationId`。
+它只包含七个万悟可稳定调用的工具，并为每个工具固定英文 `operationId`。
 
 ## 启动本地分析服务
 
@@ -88,6 +90,7 @@ Content-Type: multipart/form-data
 - `operating_regimes`：稳定工况分段、过渡强度和异常事件的工况上下文；
 - `relationship_diagnostics`：异常前后相关性变化、领先与滞后测点及重点排查链路；
 - `root_cause_diagnoses`：候选根因排序、置信度、支持证据、证据缺口和现场验证步骤；
+- `historical_case_matches`：当前异常命中的已闭环案例、相似度及原工单来源；
 - `work_order_drafts`：按异常事件生成的优先级、处置动作和反馈回写要求；
 - `forecast_results`：各传感器未来窗口、方向、预测风险、置信区间和回测误差；
 - `risk_alerts`：当前异常与趋势预测形成的结构化预警；
@@ -128,6 +131,16 @@ PATCH /api/v1/work-orders/{record_id}
 
 允许的状态为：`待确认`、`已确认`、`处理中`、`已完成`、`已关闭`。限制状态集合是为了让
 万悟看板能够稳定统计完成率、处置周期和各类根因，而不是产生无法汇总的自由文本状态。
+
+当工单状态为 `已确认`、`已完成` 或 `已关闭`，并填写了 `confirmed_cause` 后，系统会从
+原分析结果中提取测点类别、变化方向、主导测点和工况上下文，动态构建历史故障案例。下一次
+分析会按这些确定性特征检索相似案例。案例只作为独立证据参与排序，不会直接覆盖机理规则，
+且每条结论都保留原 `run_id`、`record_id` 和处置反馈，便于追溯和纠错。
+
+```text
+GET  /api/v1/cases
+POST /api/v1/wanwu/cases/list
+```
 
 ### 一站式自动诊断
 
@@ -217,6 +230,7 @@ POST /api/v1/forecast-compare
 6. 展示 `root_cause_diagnoses`、`work_order_drafts` 和结构化风险证据；
 7. 由一个万悟大模型节点生成面向运维人员的解释文本；
 8. 将 `work_order_drafts[].record_id` 传给工单卡片，现场确认后调用 `update_industrial_work_order` 回写结果。
+9. 调用 `list_industrial_feedback_cases` 展示已沉淀案例；后续分析结果中的 `historical_case_matches` 会自动引用相似案例。
 
 异步任务请求示例：
 
@@ -268,8 +282,9 @@ http://host.docker.internal:8000/integrations/wanwu/openapi.json
 ```
 
 也可以在浏览器打开该地址后导入万悟“资源库 → 自定义工具”。OpenAPI 中的
-`servers` 来自 `.env` 的 `API_PUBLIC_BASE_URL`。本机 Docker 使用
-`http://host.docker.internal:8000`；在线万悟必须改成公网 HTTPS 地址后重新启动 API。
+`servers` 来自 `.env` 的 `API_PUBLIC_BASE_URL`。时察千机和万悟都运行在 Docker 且加入
+`wanwu-net` 时使用 `http://shichi-qianji-api:8000`；只有时察千机直接运行在 Windows
+时才使用 `http://host.docker.internal:8000`。在线万悟必须改成公网 HTTPS 地址后重启 API。
 
 ## 暂无部署环境时怎么做
 

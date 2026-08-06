@@ -182,6 +182,23 @@ class WorkOrderDraft:
     required_feedback: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class HistoricalCaseMatch:
+    """从已闭环工单中检索到的相似故障案例。"""
+
+    case_id: str
+    confirmed_cause: str
+    similarity: float
+    source_run_id: str
+    source_record_id: str
+    matched_sensor_groups: tuple[str, ...]
+    matched_directions: tuple[str, ...]
+    evidence_summary: tuple[str, ...]
+    feedback_note: str | None
+    handled_by: str | None
+    closed_at: str
+
+
 @dataclass
 class AnalysisResult:
     """完整分析任务的输出，也是页面、报告和 Agent 的共同数据源。"""
@@ -203,6 +220,9 @@ class AnalysisResult:
     risk_alerts: list[dict[str, Any]] = field(default_factory=list)
     event_diagnoses: list[EventDiagnosis] = field(default_factory=list)
     work_order_drafts: list[WorkOrderDraft] = field(default_factory=list)
+    historical_case_matches: dict[int, list[HistoricalCaseMatch]] = field(
+        default_factory=dict
+    )
     report_text: str = ""
 
     def to_summary(self) -> dict[str, Any]:
@@ -238,6 +258,10 @@ class AnalysisResult:
             "工况识别": _regime_overview(self.operating_regimes),
             "多传感器关系证据": self.relationship_diagnostics,
             "候选根因诊断": [_event_diagnosis_summary(item) for item in self.event_diagnoses],
+            "历史案例复用": {
+                str(event_number): [asdict(item) for item in matches[:3]]
+                for event_number, matches in self.historical_case_matches.items()
+            },
             "处置工单草案": [asdict(item) for item in self.work_order_drafts[:8]],
             "预测结果": _forecast_overview(self.forecast_results),
             "风险预警": self.risk_alerts,
