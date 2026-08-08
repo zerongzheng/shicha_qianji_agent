@@ -29,8 +29,8 @@
 
 因此，万悟不应直接使用普通 `/api/v1/files` 和带路径参数的任务接口。项目新增的
 `/api/v1/wanwu/*` 全部使用 `POST + application/json`，文件通过临时下载 URL 或 Base64
-传入，`run_id` 和 `record_id` 也都放在 JSON 请求体中。普通接口仍为 Streamlit、浏览器和
-其他标准客户端保留。
+传入，`run_id` 和 `record_id` 也都放在 JSON 请求体中。普通接口仍为 Vue3 工作台、
+Streamlit 备用页面和其他标准客户端保留。
 
 精简 OpenAPI：
 
@@ -384,7 +384,7 @@ docker compose -f compose.wanwu.yml up -d --build
 ## 比赛接口额度
 
 比赛方规定聊天、Embedding 等每个接口每分钟最多调用 5 次。项目已经在
-`outputs/rate_limits/` 中按接口维护跨进程请求间隔，避免 Streamlit、FastAPI 和命令行
+`outputs/rate_limits/` 中按接口维护跨进程请求间隔，避免 Vue3、Streamlit、FastAPI 和命令行
 同时调用时互相抢占额度。`/api/v1/diagnose` 只使用一次聊天请求；多轮工具 Agent 通常包含
 两次以上聊天请求，因此仅适合用户后续追问。
 
