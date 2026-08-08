@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +24,8 @@ from app.diagnosis import AutomaticDiagnosisService, build_fallback_diagnosis
 from app.llm import format_llm_error
 from app.model_store import list_autoencoder_models
 from app.models import AnalysisConfig, AnalysisResult
+from app.reporting.case_package import build_case_package_from_result
+from app.storage import get_repository
 
 
 def run_app() -> None:
@@ -42,7 +45,25 @@ def run_app() -> None:
         source_path, config = analysis_request
         with st.spinner("正在完成数据画像、异常检测、趋势分析与报告生成..."):
             try:
-                st.session_state["analysis_result"] = analyze_file(source_path, config=config)
+                repository = get_repository()
+                result = analyze_file(
+                    source_path,
+                    config=config,
+                    case_matcher=repository.find_similar_cases,
+                )
+                st.session_state["analysis_result"] = result
+                # Streamlit 直接调用分析核心，不经过 FastAPI 任务队列，因此在这里补齐
+                # 任务、工单和历史案例的持久化，保证页面演示也能完成真实闭环。
+                try:
+                    st.session_state["analysis_run_id"] = repository.record_local_analysis(
+                        source_path,
+                        operation="streamlit_analyze",
+                        detector=config.detector,
+                        config=asdict(config),
+                        result=result,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    st.warning(f"分析结果已生成，但暂未写入闭环记录：{exc}")
             # 页面是用户输入边界，需要把路径、格式和算法错误转成可读提示。
             except Exception as exc:  # noqa: BLE001
                 st.error(f"分析失败：{exc}")
@@ -60,6 +81,8 @@ def run_app() -> None:
         relationship_tab,
         report_tab,
         agent_tab,
+        work_order_tab,
+        history_tab,
     ) = st.tabs(
         [
             "风险总览",
@@ -69,6 +92,8 @@ def run_app() -> None:
             "关联诊断",
             "诊断报告",
             "智能决策",
+            "运维闭环",
+            "历史记录",
         ]
     )
     with overview_tab:
@@ -85,6 +110,10 @@ def run_app() -> None:
         _render_report(result)
     with agent_tab:
         _render_agent(result)
+    with work_order_tab:
+        _render_work_order_center(result)
+    with history_tab:
+        _render_history_center()
 
 
 def _render_header() -> None:
@@ -230,10 +259,15 @@ def _render_overview(result: AnalysisResult) -> None:
 
     highest_risk = result.events[0].severity if result.events else "正常"
     metrics = result.metrics
+    st.subheader("设备健康总览")
+    st.caption(
+        f"{result.profile.source_name}｜{result.profile.start_time} 至 {result.profile.end_time}｜"
+        f"{len(result.profile.sensor_columns)} 个传感器"
+    )
     metric_columns = st.columns(6)
-    metric_columns[0].metric("设备风险", highest_risk)
-    metric_columns[1].metric("检测器", result.detector_name)
-    metric_columns[2].metric("异常事件", len(result.events))
+    metric_columns[0].metric("当前风险", highest_risk)
+    metric_columns[1].metric("异常事件", len(result.events))
+    metric_columns[2].metric("重点测点", len(_top_sensors(result)))
     metric_columns[3].metric("数据点", result.profile.row_count)
     metric_columns[4].metric("点级 F1", f"{metrics.f1_score:.3f}" if metrics else "无标签")
     metric_columns[5].metric(
@@ -241,14 +275,29 @@ def _render_overview(result: AnalysisResult) -> None:
         f"{metrics.event_f1_score:.3f}" if metrics else "无标签",
     )
 
+    st.markdown(
+        "<div class='workflow-strip'><span>数据接入</span><b>→</b><span>异常发现</span>"
+        "<b>→</b><span>原因研判</span><b>→</b><span>风险预测</span><b>→</b>"
+        "<span>处置建议</span></div>",
+        unsafe_allow_html=True,
+    )
+
     left, right = st.columns([1.15, 0.85], gap="large")
     with left:
-        st.subheader("设备级风险轨迹")
+        st.subheader("异常事件时间线")
         st.plotly_chart(_build_risk_chart(result), width="stretch")
     with right:
+        st.subheader("重点传感器贡献")
+        st.plotly_chart(_build_sensor_contribution_chart(result), width="stretch")
+
+    left, right = st.columns([1.15, 0.85], gap="large")
+    with left:
         st.subheader("优先处置")
         for index, recommendation in enumerate(result.recommendations[:5], start=1):
             st.markdown(f"**{index}.** {recommendation}")
+    with right:
+        st.subheader("风险判断")
+        st.info(_risk_explanation(result))
 
     if result.risk_alerts:
         st.subheader("预测驱动预警")
@@ -308,7 +357,7 @@ def _render_overview(result: AnalysisResult) -> None:
                 }
             )
 
-    st.subheader("高风险事件")
+    st.subheader("异常事件清单")
     if not result.events:
         st.success("当前参数下未形成连续异常事件。")
         return
@@ -324,6 +373,60 @@ def _render_overview(result: AnalysisResult) -> None:
         for event in result.events[:12]
     ]
     st.dataframe(pd.DataFrame(event_rows), hide_index=True, width="stretch")
+
+
+def _top_sensors(result: AnalysisResult) -> list[str]:
+    """按异常事件中的传感器贡献统计重点测点。"""
+
+    scores: dict[str, float] = {}
+    for event in result.events:
+        for sensor, score in event.sensor_scores.items():
+            scores[sensor] = scores.get(sensor, 0.0) + float(score)
+    return [
+        sensor
+        for sensor, _ in sorted(scores.items(), key=lambda item: item[1], reverse=True)[:5]
+    ]
+
+
+def _risk_explanation(result: AnalysisResult) -> str:
+    """将设备级风险转成评委和运维人员都能快速理解的判断。"""
+
+    if not result.events:
+        return "当前没有形成满足持续时间要求的异常事件，系统建议保持监测。"
+    event = result.events[0]
+    sensors = "、".join(event.dominant_sensors) or "未识别"
+    return (
+        f"当前识别到 {len(result.events)} 个异常事件，最高风险为{event.severity}。"
+        f"首个事件持续 {event.duration_points} 个采样点，重点关注 {sensors}。"
+        "候选原因用于安排排查顺序，最终结论仍需结合设备工况和现场确认。"
+    )
+
+
+def _build_sensor_contribution_chart(result: AnalysisResult) -> go.Figure:
+    """绘制异常事件中主导传感器的累计贡献。"""
+
+    scores: dict[str, float] = {}
+    for event in result.events:
+        for sensor, score in event.sensor_scores.items():
+            scores[sensor] = scores.get(sensor, 0.0) + float(score)
+    ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)[:8]
+    figure = go.Figure(
+        go.Bar(
+            x=[value for _, value in ordered][::-1],
+            y=[sensor for sensor, _ in ordered][::-1],
+            orientation="h",
+            marker_color="#197278",
+            hovertemplate="%{y}<br>累计贡献：%{x:.2f}<extra></extra>",
+        )
+    )
+    figure.update_layout(
+        height=390,
+        margin={"l": 10, "r": 10, "t": 20, "b": 30},
+        xaxis_title="累计异常贡献",
+        yaxis_title=None,
+        showlegend=False,
+    )
+    return figure
 
 
 def _render_evidence(result: AnalysisResult) -> None:
@@ -491,13 +594,265 @@ def _render_regimes(result: AnalysisResult) -> None:
 def _render_report(result: AnalysisResult) -> None:
     """显示并下载自动生成的分析报告。"""
 
+    if st.button("生成案例材料包", key="export_case_package"):
+        try:
+            package = build_case_package_from_result(result)
+            st.session_state["case_package"] = package
+            st.success(f"案例材料已生成：{package.case_dir}")
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"案例材料生成失败：{exc}")
+
     st.download_button(
         "下载 Markdown 报告",
         data=result.report_text,
         file_name=f"{result.source_path.stem}_analysis.md",
         mime="text/markdown",
     )
+    package = st.session_state.get("case_package")
+    if package is not None and package.result.source_path == result.source_path:
+        st.subheader("案例材料下载")
+        columns = st.columns(4)
+        columns[0].download_button(
+            "案例摘要",
+            data=package.markdown_path.read_text(encoding="utf-8"),
+            file_name="case_summary.md",
+            mime="text/markdown",
+        )
+        columns[1].download_button(
+            "事件明细",
+            data=package.events_csv_path.read_bytes(),
+            file_name="anomaly_events.csv",
+            mime="text/csv",
+        )
+        columns[2].download_button(
+            "风险图 HTML",
+            data=package.chart_html_path.read_bytes(),
+            file_name="risk_evidence.html",
+            mime="text/html",
+        )
+        columns[3].download_button(
+            "结构化摘要",
+            data=package.summary_json_path.read_bytes(),
+            file_name="case_summary.json",
+            mime="application/json",
+        )
     st.markdown(result.report_text)
+
+
+def _render_work_order_center(result: AnalysisResult) -> None:
+    """展示并回写工单，形成“检测 - 处置 - 反馈 - 案例”闭环。"""
+
+    repository = get_repository()
+    run_id = st.session_state.get("analysis_run_id")
+    st.subheader("运维工单闭环")
+    st.caption("算法生成待确认工单，现场人员补充确认结果；已完成工单会沉淀为历史案例。")
+
+    if run_id:
+        st.info(f"当前分析任务：{run_id}")
+    else:
+        st.warning("当前分析尚未建立持久化任务记录，请重新点击“开始智能分析”。")
+
+    work_orders = repository.list_work_orders(run_id=run_id) if run_id else []
+    if not work_orders:
+        st.success("当前任务没有待处理工单。")
+    else:
+        selected = st.selectbox(
+            "选择需要处理的工单",
+            options=work_orders,
+            format_func=lambda item: (
+                f"{item['record_id']}｜{item['priority']}｜{item['title']}｜{item['status']}"
+            ),
+            key="work_order_selector",
+        )
+        with st.container(border=True):
+            st.markdown(f"**{selected['title']}**")
+            metrics = st.columns(4)
+            metrics[0].metric("优先级", selected["priority"])
+            metrics[1].metric("状态", selected["status"])
+            metrics[2].metric("事件编号", selected["event_number"])
+            metrics[3].metric("责任角色", selected["assigned_role"])
+            st.markdown("**建议动作**")
+            for action in selected["actions"]:
+                st.markdown(f"- {action}")
+            st.markdown("**算法证据**")
+            for evidence in selected["evidence_summary"]:
+                st.markdown(f"- {evidence}")
+
+            statuses = ["待确认", "已确认", "处理中", "已完成", "已关闭"]
+            status = st.selectbox(
+                "更新状态",
+                statuses,
+                index=statuses.index(selected["status"]),
+                key=f"status_{selected['record_id']}",
+            )
+            cause = st.text_input(
+                "现场确认根因",
+                value=selected["confirmed_cause"] or "",
+                key=f"cause_{selected['record_id']}",
+                placeholder="例如：阀门执行器卡滞（待现场确认）",
+            )
+            feedback = st.text_area(
+                "处置与复测记录",
+                value=selected["feedback_note"] or "",
+                key=f"feedback_{selected['record_id']}",
+                height=100,
+                placeholder="填写处理动作、复测结果和是否恢复正常",
+            )
+            handled_by = st.text_input(
+                "处理人员或小组",
+                value=selected["handled_by"] or "",
+                key=f"handled_{selected['record_id']}",
+            )
+            if st.button("保存现场反馈", type="primary", key=f"save_{selected['record_id']}"):
+                try:
+                    updated = repository.update_work_order(
+                        selected["record_id"],
+                        {
+                            "status": status,
+                            "confirmed_cause": cause,
+                            "feedback_note": feedback,
+                            "handled_by": handled_by,
+                        },
+                    )
+                    st.success(f"工单已更新：{updated['status']}")
+                    st.rerun()
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"工单更新失败：{exc}")
+
+    st.divider()
+    st.subheader("已沉淀的历史案例")
+    cases = repository.list_confirmed_cases(limit=20)
+    if not cases:
+        st.info("完成一条工单并填写确认根因后，这里会出现可追溯案例。")
+        return
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "案例编号": item["case_id"],
+                    "确认根因": item["confirmed_cause"],
+                    "来源任务": item["source_run_id"],
+                    "处理人员": item["handled_by"] or "未填写",
+                    "反馈": item["feedback_note"] or "未填写",
+                    "更新时间": item["closed_at"],
+                }
+                for item in cases
+            ]
+        ),
+        hide_index=True,
+        width="stretch",
+    )
+
+
+def _render_history_center() -> None:
+    """集中查看历史分析任务、工单和已确认案例。"""
+
+    repository = get_repository()
+    st.subheader("历史分析与案例")
+    st.caption("用于追踪历次分析、复核处理结果，并查看已沉淀的现场案例。")
+
+    left, right = st.columns([1.0, 1.0], gap="large")
+    with left:
+        st.markdown("**分析任务**")
+        status_options = ["全部", "success", "failed", "running", "queued", "cancelled"]
+        selected_status = st.selectbox(
+            "任务状态",
+            status_options,
+            format_func=lambda value: "全部" if value == "全部" else value,
+            key="history_run_status",
+        )
+        runs = repository.list_runs(
+            limit=50,
+            status=None if selected_status == "全部" else selected_status,
+        )
+        if runs:
+            run_table = pd.DataFrame(
+                [
+                    {
+                        "任务编号": item["run_id"],
+                        "文件": item["file_name"],
+                        "操作": item["operation"],
+                        "检测器": item["detector"],
+                        "状态": item["status"],
+                        "耗时(ms)": round(item["duration_ms"], 1)
+                        if item["duration_ms"] is not None
+                        else None,
+                        "开始时间": item["started_at"],
+                    }
+                    for item in runs
+                ]
+            )
+            st.dataframe(run_table, hide_index=True, width="stretch")
+            run_options = {item["run_id"]: item for item in runs}
+            selected_run_id = st.selectbox(
+                "查看任务详情",
+                list(run_options),
+                key="history_selected_run",
+            )
+            detail = repository.get_run(selected_run_id)
+            if detail:
+                st.json(
+                    {
+                        "任务编号": detail["run_id"],
+                        "状态": detail["status"],
+                        "文件": detail["file_name"],
+                        "参数": detail["config"],
+                        "错误": detail["error"],
+                        "结果摘要": (
+                            detail["result"].get("summary")
+                            if isinstance(detail.get("result"), dict)
+                            else None
+                        ),
+                    }
+                )
+        else:
+            st.info("暂无符合条件的历史分析任务。")
+
+    with right:
+        st.markdown("**工单与历史案例**")
+        work_orders = repository.list_work_orders(limit=50)
+        if work_orders:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "工单编号": item["record_id"],
+                            "优先级": item["priority"],
+                            "标题": item["title"],
+                            "状态": item["status"],
+                            "确认根因": item["confirmed_cause"] or "待确认",
+                            "更新时间": item["updated_at"],
+                        }
+                        for item in work_orders
+                    ]
+                ),
+                hide_index=True,
+                width="stretch",
+            )
+        else:
+            st.info("暂无历史工单。")
+
+        cases = repository.list_confirmed_cases(limit=50)
+        if cases:
+            st.markdown("**已确认案例**")
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "案例编号": item["case_id"],
+                            "确认根因": item["confirmed_cause"],
+                            "相似案例来源任务": item["source_run_id"],
+                            "处理人员": item["handled_by"] or "未填写",
+                            "处置反馈": item["feedback_note"] or "未填写",
+                        }
+                        for item in cases
+                    ]
+                ),
+                hide_index=True,
+                width="stretch",
+            )
+        else:
+            st.info("暂无已确认案例。完成工单反馈后，案例会显示在这里。")
 
 
 def _render_agent(result: AnalysisResult) -> None:
@@ -813,6 +1168,13 @@ def _inject_styles() -> None:
             border-left: 4px solid #197278; background: #eef6f5; color: #155e63;
             padding: 0.55rem 0.8rem; font-weight: 650;
         }
+        .workflow-strip {
+            display: flex; align-items: center; justify-content: space-between;
+            gap: 0.5rem; margin: 0.8rem 0 1.1rem; padding: 0.65rem 0.8rem;
+            border-top: 1px solid #d7dce1; border-bottom: 1px solid #d7dce1;
+            color: #155e63; font-size: 0.88rem; font-weight: 650;
+        }
+        .workflow-strip b { color: #a3adb3; font-weight: 500; }
         div[data-testid="stMetric"] {
             border-top: 3px solid #197278; background: #f7f9fa; padding: 0.75rem;
         }

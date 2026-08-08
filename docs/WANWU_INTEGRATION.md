@@ -8,10 +8,8 @@
 ```text
 万悟 Agent / Workflow
     -> 文件节点获得 CSV 临时 URL，或将小文件转换为 Base64
-    -> POST /api/v1/wanwu/jobs/submit，一次完成文件登记和异步提交
-    -> POST /api/v1/wanwu/jobs/status 轮询，JSON 中传入 run_id
-    -> success 后 POST /api/v1/wanwu/jobs/result
-    -> Python 完成确定性分析，万悟大模型节点生成单次诊断解释
+    -> 比赛演示：POST /api/v1/wanwu/quick-diagnosis，一次返回确定性分析和中文摘要
+    -> 正式工程：POST /api/v1/wanwu/jobs/submit，保存 run_id 后轮询状态和结果
     -> 万悟直接展示异常证据、趋势预警和处置顺序
     -> 查询 GET /api/v1/work-orders 展示待办工单
     -> PATCH /api/v1/work-orders/{record_id} 回写现场结果
@@ -19,8 +17,8 @@
     -> 下一次相似事件检索案例并参与候选根因排序
 ```
 
-小文件本地调试仍可直接调用 `/api/v1/analyze` 或 `/api/v1/diagnose`；正式演示优先使用异步
-链路，避免模型训练和预测计算超过万悟 HTTP 节点的单次等待时间。
+小文件本地调试仍可直接调用 `/api/v1/analyze` 或 `/api/v1/diagnose`。万悟比赛演示优先使用
+快速诊断接口，避免低 QPM 模型被多轮工具编排消耗；正式部署再使用异步链路。
 
 ## 为什么增加万悟专用接口
 
@@ -40,7 +38,35 @@
 http://host.docker.internal:8000/integrations/wanwu/openapi.json
 ```
 
-它只包含七个万悟可稳定调用的工具，并为每个工具固定英文 `operationId`。
+它包含八个万悟可稳定调用的工具，并为每个工具固定英文 `operationId`。其中
+`quick_industrial_diagnosis` 是低调用额度演示入口。
+
+比赛演示专用 Schema：
+
+```text
+http://host.docker.internal:8000/integrations/wanwu/quick-openapi.json
+```
+
+该地址只暴露 `quick_industrial_diagnosis` 一个工具。创建比赛演示智能体时应优先导入这个地址；
+完整八工具 Schema 留给后续正式工作流，不要把两份 Schema 同时绑定到同一个演示智能体。
+
+## 低调用额度快速诊断
+
+```text
+POST /api/v1/wanwu/quick-diagnosis
+```
+
+该接口接收文件 URL 或 Base64 后，由时察千机后端依次完成数据画像、异常检测、工况分析、
+根因候选排序、关键词知识检索和运维建议生成。它不会调用外部 Chat 或 Embedding 接口，
+因此 `model_call_count` 固定为 `0`，不会额外消耗比赛方大模型 QPM。返回的 `presentation` 是
+可直接展示给用户的中文摘要，`analysis` 保留结构化证据，便于万悟后续展示或生成卡片。
+`automatic_diagnosis` 只保留诊断正文、使用边界和知识来源，不重复嵌套完整算法证据，避免
+万悟结果上下文膨胀。
+接口还会按文件内容哈希和完整分析配置复用最近一次成功结果；万悟重复提交时返回
+`cache_hit=true`，不会重复计算或重复生成工单。
+
+这不是删除大模型能力，而是把比赛现场的第一轮结果交给确定性算法完成；`/api/v1/diagnose`
+仍保留给 Streamlit 和需要高质量自然语言诊断的本地流程。
 
 ## 启动本地分析服务
 
@@ -220,6 +246,47 @@ POST /api/v1/forecast-compare
 
 ## 万悟工作流建议
 
+### 比赛演示不要使用普通智能体链路
+
+普通智能体的执行方式是“ChatModel 判断 -> 工具 -> ChatModel 组织最终回复”。即使
+`quick_industrial_diagnosis` 已经返回 `model_call_count=0`，智能体仍可能在工具成功后
+再次请求平台 ChatModel；截图中 `node_1, ChatModel` 的 429 就属于这次二次请求，而不是
+时察千机 API 失败。
+
+比赛演示建议创建一个**工作流**，将最终回复交给结束节点：
+
+```text
+开始节点（File 类型 CSV）
+    -> 工具节点（quick_industrial_diagnosis）
+    -> 结束节点（返回变量或返回文本）
+```
+
+工作流中不要放大模型节点，也不要把工作流再包装成普通智能体后让智能体负责二次总结。
+这样一次演示只产生平台入口所需的最少模型调用；工具返回后的最终输出由结束节点直接完成。
+
+#### 工作流页面配置
+
+1. 在万悟进入“工作流”，新建工作流，不要进入“智能体”页面继续修改当前智能体。
+2. 开始节点添加参数 `industrial_file`，类型选择 `File`，描述填写“工业时序 CSV 文件”，设为必填。
+3. 从自定义工具中添加 `quick_industrial_diagnosis` 工具节点。
+4. 工具节点参数映射建议如下：
+   - `file_url`：引用开始节点 `industrial_file` 的文件 URL 输出；
+   - `file_name`：引用开始节点文件名输出，或填写固定值 `industrial_sample.csv`；
+   - `file_base64`：留空，不要与 `file_url` 同时传入；
+   - `config`：留空，使用时察千机默认参数。
+5. 添加结束节点，选择“返回变量”模式，输出变量引用工具节点的：
+   - `presentation`：面向评委的中文诊断摘要；
+   - `analysis`：结构化证据，可用于卡片展示；
+   - `automatic_diagnosis`：规则诊断和使用边界；
+   - `cache_hit`：是否复用已有结果。
+6. 不添加“大模型节点”。结束节点文档明确支持直接返回上游节点的结构化变量。
+7. 点击“试运行”，上传 CSV，确认工具节点成功且结束节点能直接返回结果。
+8. 试运行成功后发布工作流。之后通过工作流入口或发布后的工作流 API 调用。
+
+如果工作流界面不允许直接把 File 类型映射为 `file_url`，改用开始节点的字符串参数
+`file_url`，让文件节点先提供平台可访问的临时下载地址，再映射到工具节点的 `file_url`。
+不要把 Windows 路径 `E:\\...` 传给服务端。
+
 比赛演示优先使用异步工作流，避免工业分析超过万悟 HTTP 节点超时时间：
 
 1. 文件输入节点接收用户 CSV，并取得平台临时下载 URL；小文件也可传 Base64；
@@ -295,10 +362,11 @@ uv run python api_main.py
 uv run shichi-qianji-wanwu-check
 ```
 
-第二条命令会检查健康状态、六个万悟工具和 OpenAPI 服务地址，并导出：
+第二条命令会检查健康状态、完整八个万悟工具、快速单工具 Schema 和 OpenAPI 服务地址，并同时导出：
 
 ```text
 outputs/wanwu_openapi.json
+outputs/wanwu_quick_openapi.json
 ```
 
 获得任意支持 Docker Compose 的服务器后执行：

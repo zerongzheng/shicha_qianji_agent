@@ -99,6 +99,11 @@ uv run streamlit run streamlit_app.py
 
 浏览器通常会自动打开 `http://localhost:8501`。
 
+页面默认按照校赛演示流程组织：选择数据后，首页先展示设备健康总览、异常事件时间线、
+重点传感器贡献、风险判断和优先处置建议；其他标签页再展开时序证据、工况、根因、关联、
+报告和智能决策。报告页的“生成案例材料包”会复用当前分析结果，不会重新调用大模型，
+并提供 Markdown、事件 CSV、交互式风险图 HTML 和结构化 JSON 下载。
+
 启动工业分析 API（供万悟 API/工作流节点调用）：
 
 ```powershell
@@ -110,6 +115,45 @@ uv run python api_main.py
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8000/health
 ```
+
+校赛阶段建议先运行离线自检：
+
+```powershell
+uv run python main.py --check
+```
+
+该命令只检查 SKAB 路径、输出目录、SQLite 目录和默认样例分析，不调用大模型，也不依赖
+万悟。若提示目录没有写权限，优先检查 `outputs/` 和数据库文件的 Windows 权限；不要删除
+已有数据库或运行结果。
+
+生成可直接整理进网评材料的 SKAB 实验汇总：
+
+```powershell
+uv run python main.py --competition-report
+```
+
+命令默认复用最近一次固定划分实验；如果 `outputs/competition/` 还没有实验产物，会自动
+执行一次阈值调优和独立测试。需要重新运行全部实验时使用：
+
+```powershell
+uv run python main.py --rerun-competition-report
+```
+
+报告和汇总表位于 `outputs/competition/`。报告明确标注当前结果来自 SKAB 公开数据，适合
+支撑校赛阶段的模型对比、算法流程和工程可复现性，不把公开数据指标包装为企业现场成效。
+
+为典型异常文件生成案例材料包：
+
+```powershell
+uv run python main.py --case-package --file ..\SKAB\data\valve1\0.csv
+```
+
+输出位于 `outputs/cases/<场景>/<文件名>/`，包括：
+
+- `case_summary.md`：面向答辩讲解的案例摘要；
+- `anomaly_events.csv`：异常事件和主导传感器明细；
+- `risk_evidence.html`：可缩放的交互式风险曲线；
+- `case_summary.json`：结构化结果，便于后续 API 或页面复用。
 
 接口采用“先上传、后分析”的 `file_id` 模式，不接受万悟传入任意服务器路径：
 
@@ -149,9 +193,26 @@ POST /api/v1/wanwu/cases/list         查询可追溯的历史故障案例
 http://host.docker.internal:8000/integrations/wanwu/openapi.json
 ```
 
-比赛演示和低调用额度场景优先使用：文件上传 → `/api/v1/diagnose` → 展示诊断。
-该端点由 Python 一次完成工业分析和知识检索，最后只调用一次 GLM-5。需要在万悟中自定义
-条件分支或知识库时，再调用 `/api/v1/analyze` 获取结构化证据自行编排。
+完整工程 Schema 适合后续搭建异步分析、工单回写和历史案例闭环；比赛现场的演示智能体建议只导入
+下面这个单工具 Schema，避免万悟为多个工具自动规划多轮调用：
+
+```text
+http://host.docker.internal:8000/integrations/wanwu/quick-openapi.json
+```
+
+它只包含 `quick_industrial_diagnosis`。文件上传后，时察千机一次完成数据画像、异常检测、
+工况分析、根因候选排序和运维建议生成，返回 `presentation` 中文摘要及结构化证据，且
+`model_call_count=0`，不会额外消耗比赛方 GLM-5 QPM。比赛演示应优先使用：
+
+```text
+文件输入 → quick_industrial_diagnosis → 展示 presentation 和 analysis
+```
+
+快速接口还按文件内容哈希和完整分析配置复用最近一次成功结果。万悟重复提交相同文件时会返回
+`cache_hit=true`，避免重复计算和重复生成工单。
+
+本地 Streamlit 的高质量自然语言诊断仍可使用 `/api/v1/diagnose`，该端点会在后端完成
+算法与知识检索后调用一次 GLM-5；不要在同一次万悟流程中再次叠加调用 `/api/v1/diagnose`。
 
 正式万悟工作流建议使用异步接口，避免大文件分析、模型训练或预测计算超过 HTTP 节点超时：
 
@@ -177,7 +238,12 @@ uv run python api_main.py
 uv run shichi-qianji-wanwu-check
 ```
 
-自检通过会在 `outputs/wanwu_openapi.json` 生成可直接粘贴到万悟“自定义工具”的精简协议。
+自检通过会同时生成两个可直接粘贴到万悟“自定义工具”的协议：
+
+```text
+outputs/wanwu_openapi.json          # 完整工程：8 个工具
+outputs/wanwu_quick_openapi.json     # 比赛演示：1 个快速诊断工具
+```
 获得 Docker 部署环境后执行：
 
 ```powershell
@@ -340,5 +406,23 @@ AutoEncoder 的窗口分数只落在窗口结束点，避免未来信息提前�
 uv sync --extra dev
 uv run pytest
 ```
+
+## 生成校赛成果包
+
+为了便于制作网评 PPT 和答辩演示，项目提供统一成果包命令。它会复用或生成固定划分实验，
+并选择不同 SKAB 场景导出典型案例、风险图、事件明细和答辩索引：
+
+```powershell
+uv run python main.py --evidence-pack --case-count 3
+```
+
+输出目录为 `outputs/evidence_pack/`，先阅读其中的 `EVIDENCE_PACK_INDEX.md`，再按索引查看
+实验汇总和案例材料。该成果包只代表 SKAB 校赛阶段验证结果，不代表企业现场成效。
+
+## 演示工单闭环
+
+启动 Streamlit 后完成一次分析，页面会新增“运维闭环”页。选择工单后可以填写现场确认根因、
+处置与复测记录并保存；状态为“已确认”“已完成”或“已关闭”且有确认根因的工单，会自动沉淀为
+历史案例，后续相似异常可以在分析结果中检索到。
 
 测试使用临时构造数据，不依赖本机 SKAB 路径；真实 SKAB 数据用于集成验证。

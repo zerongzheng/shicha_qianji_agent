@@ -30,8 +30,13 @@ class KnowledgeChunk:
     score: float = 0.0
 
 
-def search_knowledge(query: str, top_k: int = 4) -> list[KnowledgeChunk]:
-    """按关键词与语义相似度检索知识，外部接口失败时自动降级。"""
+def search_knowledge(
+    query: str,
+    top_k: int = 4,
+    *,
+    use_embeddings: bool = True,
+) -> list[KnowledgeChunk]:
+    """检索工业知识；确定性模式可显式关闭外部 Embedding 请求。"""
 
     clean_query = query.strip()
     if not clean_query or top_k <= 0:
@@ -42,7 +47,7 @@ def search_knowledge(query: str, top_k: int = 4) -> list[KnowledgeChunk]:
         return []
 
     keyword_scores = _keyword_scores(clean_query, chunks)
-    if not settings.embedding_enabled:
+    if not use_embeddings or not settings.embedding_enabled:
         return _rank_chunks(chunks, keyword_scores, top_k, require_positive=True)
 
     try:

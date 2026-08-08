@@ -21,6 +21,7 @@ from app.api.jobs import JobQueueFullError, get_job_manager
 from app.api.schemas import (
     AnalysisRequest,
     AnalysisResponse,
+    ArchiveRequest,
     ErrorResponse,
     FileUploadResponse,
     ForecastCompareRequest,
@@ -34,6 +35,8 @@ from app.api.schemas import (
     WanwuCaseListRequest,
     WanwuJobAcceptedResponse,
     WanwuJobCreateRequest,
+    WanwuQuickDiagnosisRequest,
+    WanwuQuickDiagnosisResponse,
     WanwuWorkOrderListRequest,
     WanwuWorkOrderUpdateRequest,
     WorkOrderUpdateRequest,
@@ -55,9 +58,11 @@ from app.storage import get_repository
 
 try:
     from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+    from fastapi.middleware.cors import CORSMiddleware
 except ImportError:  # 让未安装 API 依赖时，核心分析和 Streamlit 仍可用。
     FastAPI = None
     File = Header = UploadFile = Any
+    CORSMiddleware = None
 
 
 settings = get_settings()
@@ -96,6 +101,21 @@ app = (
     if FastAPI
     else None
 )
+
+if app is not None and CORSMiddleware is not None:
+    # Vue 开发服务器与 FastAPI 端口不同，需要显式允许本地前端访问 API。
+    # 生产环境应通过环境变量限制为实际部署域名，而不是长期放开所有来源。
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            origin.strip()
+            for origin in settings.frontend_allowed_origins.split(",")
+            if origin.strip()
+        ],
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["*"],
+    )
 
 
 def _check_api_key(api_key: str | None) -> None:
@@ -186,6 +206,9 @@ def _result_payload(run_id: str, result: Any) -> dict[str, Any]:
     """返回稳定的机器可读协议，避免万悟依赖 Markdown 文本解析。"""
 
     summary = result.to_summary()
+    stored_run = get_repository().get_run(run_id)
+    stored_config = stored_run.get("config", {}) if stored_run else {}
+    threshold = float(stored_config.get("threshold", 4.5))
     return {
         "run_id": run_id,
         "status": "success",
@@ -194,10 +217,35 @@ def _result_payload(run_id: str, result: Any) -> dict[str, Any]:
             "row_count": result.profile.row_count,
             "sensor_columns": result.profile.sensor_columns,
             "missing_total": result.profile.missing_total,
+            "sampling_seconds": result.profile.sampling_seconds,
+            "label_columns": result.profile.label_columns,
             "start_time": result.profile.start_time,
             "end_time": result.profile.end_time,
         },
+        "data_quality": {
+            "missing_total": result.profile.missing_total,
+            "missing_rate": round(
+                result.profile.missing_total
+                / max(result.profile.row_count * len(result.profile.sensor_columns), 1),
+                6,
+            ),
+            "sampling_seconds": result.profile.sampling_seconds,
+            "label_columns": result.profile.label_columns,
+            "sensor_profiles": [
+                {
+                    "sensor": item.name,
+                    "missing_count": item.missing_count,
+                    "missing_rate": round(item.missing_rate, 6),
+                    "minimum": round(item.min_value, 6),
+                    "maximum": round(item.max_value, 6),
+                    "mean": round(item.mean_value, 6),
+                    "std": round(item.std_value, 6),
+                }
+                for item in result.profile.sensors[:12]
+            ],
+        },
         "detector": result.detector_name,
+        "visualization": _visualization_payload(result, threshold=threshold),
         "anomaly_events": [event.__dict__ for event in result.events],
         "operating_regimes": (
             {
@@ -235,6 +283,103 @@ def _result_payload(run_id: str, result: Any) -> dict[str, Any]:
             "候选根因来自内置通用故障模式，不是企业设备专属知识，不能替代现场确诊。",
             "无 anomaly 标签的企业数据不计算监督指标。",
         ],
+    }
+
+
+def _visualization_payload(
+    result: Any,
+    max_points: int = 360,
+    threshold: float | None = None,
+) -> dict[str, Any]:
+    """生成前端图表需要的有限采样数据。
+
+    分析结果内部保留完整 DataFrame，但 HTTP 响应不应直接返回整份原始数据。这里按
+    时间顺序均匀抽样，同时保留异常区间的相对位置，让 Vue 可以直接绘制风险曲线和
+    传感器趋势图；完整 CSV 仍保存在后端受控目录中。
+    """
+
+    dataframe = result.dataframe
+    row_count = len(dataframe)
+    if row_count == 0:
+        return {
+            "timestamps": [],
+            "series": {},
+            "risk_scores": [],
+            "anomaly_labels": [],
+            "event_ranges": [],
+            "threshold": threshold,
+        }
+
+    point_count = min(max(60, int(max_points)), row_count)
+    if point_count == 1:
+        sample_indexes = [0]
+    else:
+        sample_indexes = sorted(
+            {
+                round(index * (row_count - 1) / (point_count - 1))
+                for index in range(point_count)
+            }
+        )
+
+    def json_number(value: Any) -> float | None:
+        """把 NumPy 标量和缺失值转换成浏览器可安全读取的数字。"""
+
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return round(number, 6) if number == number and abs(number) != float("inf") else None
+
+    timestamps = [
+        item.isoformat() if hasattr(item, "isoformat") else str(item)
+        for item in dataframe.iloc[sample_indexes]["datetime"]
+    ]
+    series = {
+        sensor: [
+            json_number(value)
+            for value in dataframe.iloc[sample_indexes][sensor]
+        ]
+        for sensor in result.profile.sensor_columns[:8]
+    }
+    risk_scores = [json_number(result.combined_score.iloc[index]) for index in sample_indexes]
+    anomaly_labels = [int(bool(result.predicted_labels.iloc[index])) for index in sample_indexes]
+
+    event_ranges = [
+        {
+            "event_number": index,
+            "start_ratio": round(event.start_index / max(row_count - 1, 1), 6),
+            "end_ratio": round(event.end_index / max(row_count - 1, 1), 6),
+            "severity": event.severity,
+        }
+        for index, event in enumerate(result.events[:12], start=1)
+    ]
+
+    contribution_scores: dict[str, float] = {}
+    for event in result.events:
+        for sensor, score in event.sensor_scores.items():
+            contribution_scores[sensor] = contribution_scores.get(sensor, 0.0) + float(score)
+    if not contribution_scores and not result.anomaly_scores.empty:
+        contribution_scores = {
+            str(sensor): float(result.anomaly_scores[sensor].max())
+            for sensor in result.anomaly_scores.columns
+        }
+    sensor_contributions = [
+        {"sensor": sensor, "score": round(score, 4)}
+        for sensor, score in sorted(
+            contribution_scores.items(), key=lambda item: item[1], reverse=True
+        )[:8]
+    ]
+    return {
+        "sample_indexes": sample_indexes,
+        "row_count": row_count,
+        "sensor_columns": list(series),
+        "timestamps": timestamps,
+        "series": series,
+        "risk_scores": risk_scores,
+        "anomaly_labels": anomaly_labels,
+        "threshold": threshold,
+        "event_ranges": event_ranges,
+        "sensor_contributions": sensor_contributions,
     }
 
 
@@ -439,7 +584,114 @@ def _public_case_record(case: dict[str, Any]) -> dict[str, Any]:
         "feedback_note": case["feedback_note"],
         "handled_by": case["handled_by"],
         "closed_at": case["closed_at"],
+        "archived_at": case.get("archived_at"),
+        "archive_reason": case.get("archive_reason"),
     }
+
+
+def _quick_diagnosis_presentation(response: dict[str, Any]) -> str:
+    """生成万悟可以直接展示的短诊断摘要，不再要求外层模型重复整理。"""
+
+    analysis = response["analysis"]
+    profile = analysis.get("data_profile", {})
+    events = analysis.get("anomaly_events", [])
+    diagnosis = response.get("automatic_diagnosis") or {}
+    diagnosis_text = str(diagnosis.get("diagnosis") or "")
+    lines = [
+        (
+            f"文件：{response['file_name']}，数据点：{profile.get('row_count', 0)}，"
+            f"传感器：{', '.join(profile.get('sensor_columns', [])) or '未识别'}。"
+        ),
+        f"检测器：{response['detector']}，异常事件：{len(events)} 个。",
+    ]
+    if events:
+        for index, event in enumerate(events[:3], start=1):
+            lines.append(
+                f"事件{index}：{event.get('start_time')} 至 {event.get('end_time')}，"
+                f"风险={event.get('severity', '未分级')}，"
+                f"重点变量={', '.join(event.get('dominant_sensors', [])) or '未识别'}。"
+            )
+    else:
+        lines.append("当前配置下未形成持续异常事件。")
+    if diagnosis_text:
+        lines.extend(["诊断摘要：", diagnosis_text[:4000]])
+    lines.append("提示：结果用于辅助排查，故障确诊仍需结合现场工况和人工复核。")
+    return "\n".join(lines)
+
+
+def _quick_analysis_payload(run_id: str, result: Any) -> dict[str, Any]:
+    """压缩完整分析结果，避免万悟下一轮模型上下文被大 JSON 占满。"""
+
+    full = _result_payload(run_id, result)
+    return {
+        "data_profile": full["data_profile"],
+        "visualization": full["visualization"],
+        "anomaly_events": full["anomaly_events"][:10],
+        "operating_regimes": full["operating_regimes"],
+        "relationship_diagnostics": full["relationship_diagnostics"][:10],
+        "root_cause_diagnoses": full["root_cause_diagnoses"][:10],
+        "historical_case_matches": full["historical_case_matches"],
+        "work_order_drafts": full["work_order_drafts"][:10],
+        "forecast_results": full["forecast_results"],
+        "risk_alerts": full["risk_alerts"][:10],
+        "recommendations": full["recommendations"][:10],
+        "summary": full["summary"],
+        "limitations": full["limitations"],
+    }
+
+
+def _quick_automatic_payload(automatic: Any) -> dict[str, Any]:
+    """压缩快速诊断的解释层，避免把同一份算法证据重复返回给万悟。
+
+    ``automatic.to_dict()`` 面向本地调试，会包含完整 ``evidence.analysis_summary``。
+    快速工具已经通过顶层 ``analysis`` 返回了结构化证据，再重复嵌套一份会明显增加
+    万悟结果上下文，也可能诱发平台模型继续总结。因此比赛演示只返回解释正文、边界
+    和知识来源；需要完整证据时读取同一响应的 ``analysis`` 字段。
+    """
+
+    payload = automatic.to_dict()
+    evidence = payload.pop("evidence", {})
+    if isinstance(evidence, dict):
+        payload["knowledge_sources"] = [
+            item.get("source")
+            for item in evidence.get("knowledge", ())
+            if isinstance(item, dict) and item.get("source")
+        ]
+    return payload
+
+
+def _quick_cached_response(
+    stored_run: dict[str, Any] | None,
+    *,
+    file_source: str,
+) -> dict[str, Any] | None:
+    """将数据库中的快速诊断结果恢复为万悟响应；旧记录不满足协议时返回空值。"""
+
+    if stored_run is None:
+        return None
+    result = stored_run.get("result")
+    if not isinstance(result, dict):
+        return None
+    required = {
+        "status",
+        "run_id",
+        "file_id",
+        "file_name",
+        "size_bytes",
+        "detector",
+        "analysis",
+        "automatic_diagnosis",
+        "presentation",
+        "model_call_count",
+        "diagnosis_mode",
+    }
+    if not required.issubset(result):
+        return None
+    cached = dict(result)
+    # 返回本次接收方式，但任务和结果仍明确指向原始成功 run_id。
+    cached["file_source"] = file_source
+    cached["cache_hit"] = True
+    return cached
 
 
 def _execute_analysis_job(
@@ -499,6 +751,16 @@ if app:
         """返回仅包含万悟可稳定调用工具的精简 OpenAPI。"""
 
         return build_wanwu_openapi(app.openapi(), settings.api_public_base_url)
+
+    @app.get("/integrations/wanwu/quick-openapi.json", include_in_schema=False)
+    def wanwu_quick_openapi() -> dict[str, Any]:
+        """返回比赛演示专用的单工具 OpenAPI。"""
+
+        return build_wanwu_openapi(
+            app.openapi(),
+            settings.api_public_base_url,
+            quick_only=True,
+        )
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -777,6 +1039,113 @@ if app:
         }
 
     @app.post(
+        "/api/v1/wanwu/quick-diagnosis",
+        operation_id="quick_industrial_diagnosis",
+        summary="快速完成工业时序分析与诊断",
+        response_model=WanwuQuickDiagnosisResponse,
+        responses={
+            400: {"model": ErrorResponse},
+            413: {"model": ErrorResponse},
+        },
+    )
+    def wanwu_quick_diagnosis(
+        payload: WanwuQuickDiagnosisRequest,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """比赛演示专用单步工具，后端完成分析并避免再次调用外部大模型。"""
+
+        _check_api_key(x_api_key)
+        try:
+            incoming = receive_wanwu_csv(
+                file_url=payload.file_url,
+                file_base64=payload.file_base64,
+                requested_file_name=payload.file_name,
+                max_bytes=settings.max_upload_bytes,
+                download_timeout=settings.wanwu_download_timeout,
+                allow_private_urls=settings.wanwu_allow_private_file_urls,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        file_id, source_path, metadata = _store_uploaded_csv(
+            incoming.file_name,
+            incoming.content,
+        )
+        config = _parse_request_config(payload.config.as_overrides())
+        cached = _quick_cached_response(
+            get_repository().find_successful_run(
+                file_sha256=metadata["sha256"],
+                operation="quick_diagnose",
+                detector=config.detector,
+                config=asdict(config),
+            ),
+            file_source=incoming.source_type,
+        )
+        if cached is not None:
+            return cached
+
+        logger = RunLogger(run_id=f"run_{uuid.uuid4().hex[:12]}")
+        _start_persisted_run(
+            logger,
+            file_id,
+            "quick_diagnose",
+            config.detector,
+            asdict(config),
+        )
+        try:
+            result = analyze_file(
+                source_path,
+                config=config,
+                write_report=True,
+                case_matcher=get_repository().find_similar_cases,
+            )
+            # 快速工具不向 GLM-5 发起请求，避免“外层万悟调用 + 内部诊断调用”叠加限流。
+            automatic = AutomaticDiagnosisService(
+                settings,
+                allow_external_calls=False,
+            ).diagnose(result)
+            analysis = _quick_analysis_payload(logger.run_id, result)
+            response = {
+                "status": "success",
+                "run_id": logger.run_id,
+                "file_id": file_id,
+                "file_name": incoming.file_name,
+                "file_source": incoming.source_type,
+                "size_bytes": metadata["size_bytes"],
+                "detector": config.detector,
+                "analysis": analysis,
+                "automatic_diagnosis": _quick_automatic_payload(automatic),
+                "presentation": "",
+                "model_call_count": 0,
+                "diagnosis_mode": "deterministic",
+                "cache_hit": False,
+            }
+            response["presentation"] = _quick_diagnosis_presentation(response)
+        except Exception as exc:
+            log_record = logger.finish(
+                "failed",
+                "quick_diagnose",
+                {"file_id": file_id, "detector": config.detector},
+                error=str(exc),
+            )
+            _finish_persisted_run(log_record, error=str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        log_record = logger.finish(
+            "success",
+            "quick_diagnose",
+            {"file_id": file_id, "detector": config.detector},
+            {
+                "events": len(result.events),
+                "alerts": len(result.risk_alerts),
+                "model_call_count": 0,
+                "diagnosis_mode": "deterministic",
+            },
+        )
+        _finish_persisted_run(log_record, response=response)
+        return response
+
+    @app.post(
         "/api/v1/wanwu/jobs/status",
         operation_id="get_industrial_analysis_status",
         summary="查询工业分析任务状态",
@@ -842,12 +1211,28 @@ if app:
         _check_api_key(x_api_key)
         work_orders = get_repository().list_work_orders(
             limit=payload.limit,
+            offset=payload.offset,
             status=payload.status,
             run_id=payload.run_id,
+            search=payload.search,
+            priority=payload.priority,
+            include_archived=payload.include_archived,
+            archived_only=payload.archived_only,
+        )
+        total = get_repository().count_work_orders(
+            status=payload.status,
+            run_id=payload.run_id,
+            search=payload.search,
+            priority=payload.priority,
+            include_archived=payload.include_archived,
+            archived_only=payload.archived_only,
         )
         return {
             "status": "success",
-            "work_order_count": len(work_orders),
+            "work_order_count": total,
+            "page_count": len(work_orders),
+            "offset": payload.offset,
+            "limit": payload.limit,
             "work_orders": work_orders,
         }
 
@@ -885,7 +1270,15 @@ if app:
         """查询由现场确认工单形成的可追溯案例记忆。"""
 
         _check_api_key(x_api_key)
-        cases = get_repository().list_confirmed_cases(limit=payload.limit)
+        if payload.include_archived or payload.archived_only:
+            cases = get_repository().list_confirmed_cases(
+                limit=payload.limit,
+                include_archived=payload.include_archived,
+                archived_only=payload.archived_only,
+            )
+        else:
+            # 默认调用保持旧版仓储方法签名兼容，便于万悟适配层和测试替换仓储。
+            cases = get_repository().list_confirmed_cases(limit=payload.limit)
         public_cases = [_public_case_record(item) for item in cases]
         return {
             "status": "success",
@@ -897,12 +1290,19 @@ if app:
     def list_runs(
         limit: int = 20,
         status: str | None = None,
+        include_archived: bool = False,
+        archived_only: bool = False,
         x_api_key: Annotated[str | None, Header()] = None,
     ) -> dict[str, Any]:
         """返回历史分析任务摘要，供万悟任务中心或看板调用。"""
 
         _check_api_key(x_api_key)
-        runs = get_repository().list_runs(limit=limit, status=status)
+        runs = get_repository().list_runs(
+            limit=limit,
+            status=status,
+            include_archived=include_archived,
+            archived_only=archived_only,
+        )
         return {"status": "success", "run_count": len(runs), "runs": runs}
 
     @app.get("/api/v1/runs/{run_id}")
@@ -921,8 +1321,13 @@ if app:
     @app.get("/api/v1/work-orders")
     def list_work_orders(
         limit: int = 50,
+        offset: int = 0,
         status: str | None = None,
         run_id: str | None = None,
+        search: str | None = None,
+        priority: str | None = None,
+        include_archived: bool = False,
+        archived_only: bool = False,
         x_api_key: Annotated[str | None, Header()] = None,
     ) -> dict[str, Any]:
         """按优先级返回待办工单，可筛选状态和所属任务。"""
@@ -930,30 +1335,71 @@ if app:
         _check_api_key(x_api_key)
         work_orders = get_repository().list_work_orders(
             limit=limit,
+            offset=max(0, offset),
             status=status,
             run_id=run_id,
+            search=search,
+            priority=priority,
+            include_archived=include_archived,
+            archived_only=archived_only,
+        )
+        total = get_repository().count_work_orders(
+            status=status,
+            run_id=run_id,
+            search=search,
+            priority=priority,
+            include_archived=include_archived,
+            archived_only=archived_only,
         )
         return {
             "status": "success",
-            "work_order_count": len(work_orders),
+            "work_order_count": total,
+            "page_count": len(work_orders),
+            "offset": max(0, offset),
+            "limit": max(1, min(200, limit)),
             "work_orders": work_orders,
         }
 
     @app.get("/api/v1/cases")
     def list_cases(
         limit: int = 50,
+        include_archived: bool = False,
+        archived_only: bool = False,
         x_api_key: Annotated[str | None, Header()] = None,
     ) -> dict[str, Any]:
         """返回已闭环故障案例，供本地看板核查持续学习状态。"""
 
         _check_api_key(x_api_key)
-        cases = get_repository().list_confirmed_cases(limit=limit)
+        if include_archived or archived_only:
+            cases = get_repository().list_confirmed_cases(
+                limit=limit,
+                include_archived=include_archived,
+                archived_only=archived_only,
+            )
+        else:
+            cases = get_repository().list_confirmed_cases(limit=limit)
         public_cases = [_public_case_record(item) for item in cases]
         return {
             "status": "success",
             "case_count": len(public_cases),
             "cases": public_cases,
         }
+
+    @app.delete("/api/v1/cases/{case_id}")
+    def remove_case(
+        case_id: str,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """永久移除案例记忆，但保留来源分析任务和原始证据。"""
+
+        _check_api_key(x_api_key)
+        try:
+            result = get_repository().remove_confirmed_case(case_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"status": "success", "case": result}
 
     @app.patch("/api/v1/work-orders/{record_id}")
     def update_work_order(
@@ -971,6 +1417,68 @@ if app:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"status": "success", "work_order": work_order}
+
+    @app.post("/api/v1/runs/{run_id}/archive")
+    def archive_run(
+        run_id: str,
+        payload: ArchiveRequest = ArchiveRequest(),
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """归档已结束的分析任务；归档只改变展示状态，不删除分析结果。"""
+
+        _check_api_key(x_api_key)
+        try:
+            run = get_repository().archive_run(run_id, payload.reason)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"status": "success", "run": run}
+
+    @app.post("/api/v1/runs/{run_id}/restore")
+    def restore_run(
+        run_id: str,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """恢复分析任务的默认展示状态。"""
+
+        _check_api_key(x_api_key)
+        try:
+            run = get_repository().restore_run(run_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"status": "success", "run": run}
+
+    @app.post("/api/v1/work-orders/{record_id}/archive")
+    def archive_work_order(
+        record_id: str,
+        payload: ArchiveRequest = ArchiveRequest(),
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """归档已完成或已关闭工单，并同步隐藏由它生成的历史案例。"""
+
+        _check_api_key(x_api_key)
+        try:
+            work_order = get_repository().archive_work_order(record_id, payload.reason)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"status": "success", "work_order": work_order}
+
+    @app.post("/api/v1/work-orders/{record_id}/restore")
+    def restore_work_order(
+        record_id: str,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """恢复已归档工单及其默认展示状态。"""
+
+        _check_api_key(x_api_key)
+        try:
+            work_order = get_repository().restore_work_order(record_id)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"status": "success", "work_order": work_order}

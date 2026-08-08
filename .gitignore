@@ -20,9 +20,13 @@ dist/
 .DS_Store
 Thumbs.db
 
+# Vue 前端依赖
+frontend/node_modules/
+
 # 测试、日志与临时缓存
 .pytest_cache/
 .ruff_cache/
+.runtime-temp/
 .coverage
 *.log
 

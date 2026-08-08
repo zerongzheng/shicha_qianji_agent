@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
 from app.analysis import analyze_file, analyze_folder
 from app.analysis.detection import DETECTOR_RECOMMENDED_THRESHOLDS
 from app.config import get_settings
 from app.experiments import (
+    build_competition_report,
     evaluate_regime_strategy,
     run_hybrid_weight_ablation,
     run_skab_benchmark,
@@ -16,6 +18,8 @@ from app.experiments import (
     tune_and_evaluate,
 )
 from app.models import AnalysisConfig
+from app.reporting.case_package import build_case_package
+from app.reporting.evidence_pack import build_evidence_pack
 
 
 def main() -> None:
@@ -73,6 +77,37 @@ def main() -> None:
         help="在固定验证/测试划分上评价工况识别和过渡期弱告警抑制",
     )
     parser.add_argument(
+        "--competition-report",
+        action="store_true",
+        help="生成校赛阶段 SKAB 全量实验汇总；默认复用最近产物",
+    )
+    parser.add_argument(
+        "--rerun-competition-report",
+        action="store_true",
+        help="重新运行固定划分实验后生成校赛汇总，耗时较长",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="执行不依赖大模型和万悟的本地项目自检",
+    )
+    parser.add_argument(
+        "--case-package",
+        action="store_true",
+        help="为 --file 生成典型案例 Markdown、CSV 和交互式风险图",
+    )
+    parser.add_argument(
+        "--evidence-pack",
+        action="store_true",
+        help="生成校赛成果包：固定实验汇总、典型案例和答辩索引",
+    )
+    parser.add_argument(
+        "--case-count",
+        type=int,
+        default=3,
+        help="--evidence-pack 生成的典型案例数量",
+    )
+    parser.add_argument(
         "--threshold-grid",
         default="2.0,2.5,3.0,3.5,4.0,4.5,5.0,5.5,6.0,7.0,8.0,9.0,10.0",
         help="--tune 使用的逗号分隔候选阈值",
@@ -98,7 +133,43 @@ def main() -> None:
         contamination=args.contamination,
     )
 
-    if args.evaluate_regimes:
+    if args.evidence_pack:
+        pack = build_evidence_pack(
+            args.data_root,
+            case_count=max(1, min(10, args.case_count)),
+            rerun_experiments=args.rerun_competition_report,
+        )
+        summary = {
+            "evidence_pack_dir": str(pack.output_dir),
+            "index_path": str(pack.index_path),
+            "experiment_report_path": str(pack.competition_report.report_path),
+            "case_count": len(pack.cases),
+            "case_dirs": [str(item.case_dir) for item in pack.cases],
+        }
+    elif args.case_package:
+        package = build_case_package(args.file, config=config)
+        summary = {
+            "case_dir": str(package.case_dir),
+            "markdown_path": str(package.markdown_path),
+            "events_csv_path": str(package.events_csv_path),
+            "chart_html_path": str(package.chart_html_path),
+            "summary_json_path": str(package.summary_json_path),
+            "event_count": len(package.result.events),
+        }
+    elif args.check:
+        summary = _run_basic_check(settings)
+    elif args.competition_report or args.rerun_competition_report:
+        report = build_competition_report(
+            args.data_root,
+            rerun_experiments=args.rerun_competition_report,
+        )
+        summary = {
+            "report_path": str(report.report_path),
+            "summary_csv_path": str(report.csv_path),
+            "benchmark_path": str(report.benchmark_path),
+            "split_path": str(report.split_path),
+        }
+    elif args.evaluate_regimes:
         evaluation = evaluate_regime_strategy(args.data_root)
         summary = {
             "recommended": evaluation.recommended,
@@ -195,6 +266,55 @@ def _parse_threshold_grid(raw_grid: str) -> tuple[float, ...]:
     if not thresholds or any(value <= 0 for value in thresholds):
         raise ValueError("--threshold-grid 至少包含一个大于 0 的阈值。")
     return thresholds
+
+
+def _run_basic_check(settings: object) -> dict[str, object]:
+    """检查校赛阶段最基本的本地运行条件，不访问外部模型接口。"""
+
+    default_file = Path(settings.default_skab_file)
+    default_dir = Path(settings.default_skab_dir)
+    output_dir = Path(settings.output_dir)
+    checks: dict[str, bool] = {
+        "默认 SKAB 文件存在": default_file.is_file(),
+        "默认 SKAB 目录存在": default_dir.is_dir(),
+        "输出目录可创建": _ensure_directory(output_dir),
+        "数据库目录可创建": _ensure_directory(Path(settings.database_path).parent),
+    }
+    errors = [name for name, passed in checks.items() if not passed]
+    if not errors:
+        # 只有基础条件通过后才执行一次轻量完整分析，避免给错误路径制造大量异常日志。
+        result = analyze_file(
+            default_file,
+            write_report=False,
+            run_forecast=False,
+            run_regime=True,
+        )
+        checks["默认样例可完成核心分析"] = bool(result.profile.sensor_columns)
+        checks["结果可以转换为结构化摘要"] = bool(result.to_summary())
+    return {
+        "status": "ok" if all(checks.values()) else "failed",
+        "checks": checks,
+        "errors": errors,
+        "llm_enabled": bool(getattr(settings, "llm_enabled", False)),
+        "message": (
+            "本地核心分析可以运行；大模型和万悟属于可选外部能力。"
+            if not errors
+            else "请先修复失败的路径或目录权限，再运行项目。"
+        ),
+    }
+
+
+def _ensure_directory(path: Path) -> bool:
+    """创建并测试项目运行目录；不删除目录中的任何已有数据。"""
+
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
 
 
 if __name__ == "__main__":

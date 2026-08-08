@@ -55,6 +55,7 @@ class Settings:
     wanwu_allow_private_file_urls: bool
     api_public_base_url: str
     industrial_api_key: str
+    frontend_allowed_origins: str
 
     @property
     def llm_enabled(self) -> bool:
@@ -149,4 +150,8 @@ def get_settings() -> Settings:
             "http://host.docker.internal:8000",
         ).rstrip("/"),
         industrial_api_key=os.getenv("INDUSTRIAL_API_KEY", ""),
+        frontend_allowed_origins=os.getenv(
+            "FRONTEND_ALLOWED_ORIGINS",
+            "http://localhost:5173,http://127.0.0.1:5173",
+        ),
     )
