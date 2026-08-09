@@ -6,25 +6,28 @@ import {
   archiveWorkOrder,
   cancelJob,
   getJobResult,
+  getFilePreflight,
   getJobStatus,
   getRun,
   health,
   listCases,
   listRuns,
   listWorkOrders,
+  registerDefaultSkabSample,
   removeCase,
   restoreRun,
   restoreWorkOrder,
   updateWorkOrder,
   uploadCsv,
 } from "./api";
-import TimeSeriesChart from "./components/TimeSeriesChart.vue";
-import ForecastChart from "./components/ForecastChart.vue";
 import ConfirmDialog from "./components/ConfirmDialog.vue";
 import AnalysisProgressPanel from "./components/AnalysisProgressPanel.vue";
 import PreflightModal from "./components/PreflightModal.vue";
 import WorkOrderPanel from "./components/WorkOrderPanel.vue";
 import HistoryPanel from "./components/HistoryPanel.vue";
+import OverviewPanel from "./components/OverviewPanel.vue";
+import EvidencePanel from "./components/EvidencePanel.vue";
+import ForecastPanel from "./components/ForecastPanel.vue";
 
 const tabs = [
   { id: "overview", label: "风险总览" },
@@ -87,6 +90,12 @@ const activeJobId = ref("");
 const cancellingJob = ref(false);
 const cancelRequested = ref(false);
 const retryingRunId = ref("");
+const sampleLoading = ref(false);
+const selectedSampleFileId = ref("");
+const activeJobStorageKey = "shichi_qianji_active_job";
+// 证据页使用筛选和折叠，事件较多时仍然可以按风险快速定位。
+const evidenceRiskFilter = ref("");
+const expandedEvidenceEvent = ref(0);
 
 const config = reactive({
   detector: "time_frequency_relation",
@@ -182,6 +191,45 @@ const highestRisk = computed(() => {
     (levels[event.severity] || 0) > (levels[highest] || 0) ? event.severity : highest,
   "正常");
 });
+const highestRiskEvent = computed(() => {
+  const levels = { 高风险: 3, 中风险: 2, 低风险: 1 };
+  return events.value.reduce((current, event, index) => {
+    if (!current) return { event, index };
+    return (levels[event.severity] || 0) > (levels[current.event.severity] || 0)
+      ? { event, index }
+      : current;
+  }, null);
+});
+const overviewDiagnosis = computed(() => {
+  const item = highestRiskEvent.value;
+  return item ? diagnosisForEvent(item.index + 1) : null;
+});
+const overviewWorkOrder = computed(() => {
+  const item = highestRiskEvent.value;
+  if (!item) return null;
+  return workOrders.value.find((order) => Number(order.event_number) === item.index + 1) || null;
+});
+const overviewAction = computed(() => {
+  const actions = overviewWorkOrder.value?.actions || analysis.value?.recommendations || [];
+  return actions[0] || "请先复核工况、数据质量和现场测点。";
+});
+const visibleEvidenceEvents = computed(() => events.value
+  .map((event, index) => ({ event, index }))
+  .filter(({ event }) => !evidenceRiskFilter.value || event.severity === evidenceRiskFilter.value)
+  .sort((left, right) => Number(right.event.peak_score || 0) - Number(left.event.peak_score || 0)));
+const evidenceCharts = computed(() => new Map(
+  visibleEvidenceEvents.value.map((item) => [item.index, evidenceChartFor(item)]),
+));
+const analysisScope = computed(() => {
+  const sourceName = String(analysis.value?.data_profile?.source_name || selectedFile.value?.name || "");
+  const isSkab = Boolean(selectedFile.value?.isSample) || /skab|valve|anomaly-free/i.test(sourceName);
+  return {
+    label: isSkab ? "SKAB 校赛样例" : "用户上传数据",
+    detail: isSkab
+      ? "用于验证分析流程和工程闭环，不代表联通现场设备成效。"
+      : "结果基于当前上传文件生成，需结合设备台账和现场记录复核。",
+  };
+});
 
 const progressSteps = computed(() => [
   { id: "uploading", label: "接收数据", detail: "校验 CSV 并登记文件" },
@@ -198,6 +246,7 @@ onMounted(async () => {
   } catch {
     apiStatus.value = "离线";
   }
+  await resumeActiveJob();
   window.addEventListener("beforeunload", handleBeforeUnload);
   window.addEventListener("keydown", handleGlobalKeydown);
   window.addEventListener("focus", handleWindowFocus);
@@ -292,6 +341,25 @@ async function changeTab(tabId) {
   activeTab.value = tabId;
 }
 
+function openEvidenceEvent(index) {
+  expandedEvidenceEvent.value = index;
+  activeTab.value = "evidence";
+  window.setTimeout(() => {
+    document.querySelector(`[data-evidence-event="${index}"]`)
+      ?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, 0);
+}
+
+function toggleEvidenceEvent(index) {
+  expandedEvidenceEvent.value = expandedEvidenceEvent.value === index ? -1 : index;
+}
+
+function openConfirmedCases() {
+  activeTab.value = "history";
+  showArchived.value = false;
+  refreshHistory();
+}
+
 function scheduleWorkOrderRefresh() {
   workOrderPage.value = 1;
   if (workOrderFilterTimer.value !== null) window.clearTimeout(workOrderFilterTimer.value);
@@ -337,8 +405,31 @@ async function chooseFile() {
   fileInput.value?.click();
 }
 
+async function loadDefaultSkab() {
+  if (sampleLoading.value || isAnalyzing.value || !(await confirmDiscardChanges())) return;
+  sampleLoading.value = true;
+  errorMessage.value = "";
+  successMessage.value = "";
+  try {
+    const sample = await registerDefaultSkabSample();
+    selectedSampleFileId.value = sample.file_id;
+    selectedFile.value = { name: sample.file_name, size: sample.size_bytes, isSample: true };
+    const preflight = await getFilePreflight(sample.file_id);
+    filePreflight.value = normalizePreflight(preflight);
+    preflightAccepted.value = true;
+    showPreflight.value = false;
+    successMessage.value = "默认 SKAB 样例已准备，可以直接开始分析。";
+  } catch (error) {
+    errorMessage.value = `加载 SKAB 样例失败：${error.message}`;
+  } finally {
+    sampleLoading.value = false;
+  }
+}
+
 function onFileChange(event) {
   selectedFile.value = event.target.files?.[0] || null;
+  // 用户改选真实 CSV 后，必须清除默认样例标记，避免分析时继续使用旧的 sample file_id。
+  selectedSampleFileId.value = "";
   filePreflight.value = null;
   showPreflight.value = false;
   preflightAccepted.value = false;
@@ -463,6 +554,53 @@ function loadAnalysisResult(result, sourceRunId = "") {
   selectedForecastSensor.value = Object.keys(result.forecast_results || {})[0] || "";
 }
 
+function normalizePreflight(payload) {
+  return {
+    ...payload,
+    fileName: payload.file_name,
+    sizeLabel: formatFileSize(payload.size_bytes),
+    datetimeColumn: payload.datetime_column,
+  };
+}
+
+function persistActiveJob(jobId) {
+  if (jobId) window.localStorage.setItem(activeJobStorageKey, jobId);
+  else window.localStorage.removeItem(activeJobStorageKey);
+}
+
+async function resumeActiveJob() {
+  const savedJobId = window.localStorage.getItem(activeJobStorageKey);
+  if (!savedJobId || isAnalyzing.value) return;
+  try {
+    const status = await getJobStatus(savedJobId);
+    if (["success", "failed", "cancelled"].includes(status.job_status)) {
+      persistActiveJob("");
+      return;
+    }
+    runId.value = savedJobId;
+    activeJobId.value = savedJobId;
+    isAnalyzing.value = true;
+    cancelRequested.value = false;
+    jobStatus.value = status.job_status === "queued" ? "排队中" : "执行中";
+    setProgress(status.job_status === "queued" ? "queued" : "running", status.job_status === "queued" ? 20 : 38, "检测到未完成任务，正在恢复分析进度...");
+    startProgressTimer();
+    await pollJob(savedJobId);
+    await refreshHistory();
+    activeTab.value = "overview";
+    setProgress("success", 100, "分析完成，结果已恢复");
+    jobStatus.value = "已完成";
+    successMessage.value = "已恢复上次未完成的分析任务。";
+  } catch (error) {
+    setProgress("failed", progressPercent.value, "任务恢复失败，请到历史记录查看任务状态。");
+    errorMessage.value = error.message;
+  } finally {
+    isAnalyzing.value = false;
+    activeJobId.value = "";
+    persistActiveJob("");
+    stopProgressTimer();
+  }
+}
+
 function stopProgressTimer() {
   if (progressTimer.value !== null) {
     window.clearInterval(progressTimer.value);
@@ -502,12 +640,15 @@ async function startAnalysis() {
   analysis.value = null;
   try {
     await new Promise((resolve) => requestAnimationFrame(resolve));
-    const uploaded = await uploadCsv(selectedFile.value);
+    const uploaded = selectedSampleFileId.value
+      ? { file_id: selectedSampleFileId.value }
+      : await uploadCsv(selectedFile.value);
     setProgress("queued", 20, "文件已接收，正在建立分析任务...");
     jobStatus.value = "已提交";
     const accepted = await createJob(uploaded.file_id, { ...config });
     runId.value = accepted.run_id;
     activeJobId.value = accepted.run_id;
+    persistActiveJob(accepted.run_id);
     await pollJob(accepted.run_id);
     setProgress("finalizing", 94, "分析完成，正在整理风险证据和工单...");
     await new Promise((resolve) => setTimeout(resolve, 350));
@@ -529,6 +670,7 @@ async function startAnalysis() {
   } finally {
     isAnalyzing.value = false;
     activeJobId.value = "";
+    persistActiveJob("");
     stopProgressTimer();
   }
 }
@@ -720,6 +862,7 @@ async function retryHistoryRun(run) {
     const accepted = await createJob(run.file_id, run.config || { ...config });
     runId.value = accepted.run_id;
     activeJobId.value = accepted.run_id;
+    persistActiveJob(accepted.run_id);
     isAnalyzing.value = true;
     cancelRequested.value = false;
     analysis.value = null;
@@ -740,6 +883,7 @@ async function retryHistoryRun(run) {
     retryingRunId.value = "";
     isAnalyzing.value = false;
     activeJobId.value = "";
+    persistActiveJob("");
     stopProgressTimer();
   }
 }
@@ -971,9 +1115,31 @@ async function selectWorkOrder(order) {
   }
 }
 
+async function openRelatedWorkOrder(eventNumber) {
+  if (!analysis.value?.run_id) return;
+  try {
+    const response = await listWorkOrders(showArchived.value, showArchived.value, {
+      limit: 200,
+      offset: 0,
+      run_id: analysis.value.run_id,
+    });
+    const order = (response.work_orders || []).find(
+      (item) => Number(item.event_number) === Number(eventNumber),
+    );
+    activeTab.value = "work-orders";
+    if (order) {
+      await selectWorkOrder(order);
+    } else {
+      showToast({ type: "warning", title: "暂未找到关联工单", detail: `事件 ${eventNumber} 当前没有对应的运维工单。` });
+    }
+  } catch (error) {
+    errorMessage.value = `关联工单加载失败：${error.message}`;
+  }
+}
+
 async function saveFeedback() {
   if (!selectedWorkOrder.value || savingFeedback.value) return;
-  const statusOrder = ["待确认", "已确认", "处理中", "已完成", "已关闭"];
+  const statusOrder = ["待确认", "已确认", "处理中", "待验证", "已完成", "已关闭"];
   const currentIndex = statusOrder.indexOf(selectedWorkOrder.value.status);
   const targetIndex = statusOrder.indexOf(feedback.status);
   if (currentIndex >= 0 && targetIndex > currentIndex + 1) {
@@ -1016,6 +1182,11 @@ async function saveFeedback() {
       : { type: "success", title: "工单状态已保存", detail: "当前还未形成历史案例；填写确认根因并保存为已确认或已完成后即可沉淀。" };
     showToast(feedbackNotice.value);
     successMessage.value = caseCreated ? "现场确认已保存，历史案例已生成。" : "工单状态已保存。";
+    // 保存按钮可能位于长页面下方，保存后把用户带回状态提示位置。
+    window.setTimeout(() => {
+      document.querySelector(".work-order-live-status")
+        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 0);
   } catch (error) {
     feedbackNotice.value = { type: "error", title: "保存失败", detail: error.message };
     showToast(feedbackNotice.value, 0);
@@ -1051,60 +1222,42 @@ function forecastEntries() {
   return Object.entries(forecasts.value);
 }
 
-function forecastDirection(item) {
-  const direction = item?.[1]?.方向;
-  return direction || "维持";
-}
-
-function forecastRisk(item) {
-  return item?.[1]?.风险 || "待评估";
-}
-
 function relationshipForEvent(index) {
   return relationships.value.find((item) => Number(item["事件编号"]) === index) || null;
 }
 
-function finiteValues(values) {
-  return (values || []).map((value) => {
-    const number = Number(value);
-    return Number.isFinite(number) ? number : null;
-  });
-}
+function evidenceChartFor(item) {
+  const visualizationPayload = visualization.value;
+  const event = item?.event;
+  if (!visualizationPayload || !event) return null;
+  const sampleIndexes = visualizationPayload.sample_indexes || [];
+  const sensor = event.dominant_sensors?.[0] || visualizationPayload.sensor_columns?.[0];
+  const values = visualizationPayload.series?.[sensor] || [];
+  if (!sampleIndexes.length || !values.length || !sensor) return null;
 
-function chartPoints(values, width = 920, height = 250) {
-  const clean = finiteValues(values);
-  if (!clean.length) return "";
-  const usable = clean.filter((value) => value !== null);
-  if (!usable.length) return "";
-  const minimum = Math.min(...usable);
-  const maximum = Math.max(...usable);
-  const spread = Math.max(maximum - minimum, Math.abs(maximum) * 0.001, 1e-6);
-  return clean.map((value, index) => {
-    const fallback = index > 0 && clean[index - 1] !== null ? clean[index - 1] : usable[0];
-    const normalized = ((value ?? fallback) - minimum) / spread;
-    const x = clean.length === 1 ? width / 2 : (index / (clean.length - 1)) * width;
-    const y = height - Math.max(0, Math.min(1, normalized)) * height;
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  }).join(" ");
-}
-
-function chartY(value, values, height = 250) {
-  const clean = finiteValues(values).filter((item) => item !== null);
-  if (!clean.length || value === null || value === undefined) return height;
-  const minimum = Math.min(...clean);
-  const maximum = Math.max(...clean);
-  const spread = Math.max(maximum - minimum, Math.abs(maximum) * 0.001, 1e-6);
-  return height - Math.max(0, Math.min(1, (Number(value) - minimum) / spread)) * height;
-}
-
-function chartMin(values) {
-  const clean = finiteValues(values).filter((value) => value !== null);
-  return clean.length ? formatNumber(Math.min(...clean)) : "-";
-}
-
-function chartMax(values) {
-  const clean = finiteValues(values).filter((value) => value !== null);
-  return clean.length ? formatNumber(Math.max(...clean)) : "-";
+  // 按事件原始索引截取前后各一段上下文，让评委看到异常发生前后的变化，而不是只看结论。
+  const eventLength = Math.max(1, Number(event.end_index || 0) - Number(event.start_index || 0) + 1);
+  const context = Math.max(12, Math.min(80, eventLength * 2));
+  const lower = Math.max(0, Number(event.start_index || 0) - context);
+  const upper = Math.min(Number(event.end_index || 0) + context, sampleIndexes[sampleIndexes.length - 1]);
+  const positions = sampleIndexes
+    .map((originalIndex, position) => ({ originalIndex, position }))
+    .filter((point) => point.originalIndex >= lower && point.originalIndex <= upper);
+  if (!positions.length) return null;
+  const first = positions[0].position;
+  const last = positions[positions.length - 1].position;
+  const span = Math.max(1, sampleIndexes[last] - sampleIndexes[first]);
+  return {
+    sensor,
+    timestamps: (visualizationPayload.timestamps || []).slice(first, last + 1),
+    values: values.slice(first, last + 1),
+    bands: [{
+      start_ratio: Math.max(0, (Number(event.start_index) - sampleIndexes[first]) / span),
+      end_ratio: Math.min(1, (Number(event.end_index) - sampleIndexes[first]) / span),
+      event_number: item.index + 1,
+      severity: event.severity,
+    }],
+  };
 }
 
 function selectSensor(sensor) {
@@ -1160,6 +1313,9 @@ function contributionWidth(item) {
         <div class="sidebar-divider"></div>
         <div class="sidebar-label">数据任务</div>
         <button class="outline-button" @click="chooseFile">选择 CSV 文件</button>
+        <button class="sample-button" :disabled="sampleLoading || isAnalyzing" @click="loadDefaultSkab">
+          {{ sampleLoading ? "准备样例中..." : "加载默认 SKAB 样例" }}
+        </button>
         <input ref="fileInput" type="file" accept=".csv" hidden @change="onFileChange" />
         <div class="selected-file" v-if="selectedFile">
           <span class="file-type">CSV</span>
@@ -1245,183 +1401,69 @@ function contributionWidth(item) {
             <h2>等待一份工业时序数据</h2>
             <p>选择左侧 CSV 文件后，系统将自动完成数据画像、异常检测、趋势研判和工单生成。</p>
           </div>
-          <template v-else>
-            <div class="metric-grid">
-              <div class="metric-card accent"><span>当前风险</span><strong>{{ highestRisk }}</strong></div>
-              <div class="metric-card"><span>异常事件</span><strong>{{ events.length }}</strong></div>
-              <div class="metric-card"><span>传感器数量</span><strong>{{ analysis.data_profile?.sensor_columns?.length || 0 }}</strong></div>
-              <div class="metric-card"><span>数据点数</span><strong>{{ analysis.data_profile?.row_count || 0 }}</strong></div>
-              <div class="metric-card"><span>风险告警</span><strong>{{ riskAlertCount }}</strong></div>
-            </div>
-            <div class="process-line">
-              <span>数据接入</span><b>→</b><span>异常发现</span><b>→</b><span>证据解释</span><b>→</b><span>工单闭环</span>
-            </div>
-            <div v-if="visualization" class="panel chart-panel">
-              <div class="panel-header"><h2>设备风险曲线</h2><span>悬停查看采样点 · 红色区间为异常事件</span></div>
-              <TimeSeriesChart
-                :timestamps="visualization.timestamps"
-                :values="visualization.risk_scores"
-                :bands="visualization.event_ranges"
-                :markers="visualization.risk_scores.map((value, index) => ({ index, value })).filter((item) => visualization.anomaly_labels[item.index])"
-                line-color="#c65d59"
-                title="设备风险分数"
-                unit="风险分"
-                :threshold="visualization.threshold"
-              />
-            </div>
-            <div class="panel data-quality-panel">
-              <div class="panel-header"><h2>数据质量与分析范围</h2><span>分析前置检查结果</span></div>
-              <div class="quality-grid">
-                <div class="quality-item"><span>时间范围</span><b>{{ formatDate(analysis.data_profile?.start_time) }} - {{ formatDate(analysis.data_profile?.end_time) }}</b></div>
-                <div class="quality-item"><span>采样周期</span><b>{{ dataQuality.sampling_seconds ? `${formatNumber(dataQuality.sampling_seconds, 2)} 秒` : "未估计" }}</b></div>
-                <div class="quality-item"><span>缺失数据</span><b :class="{ 'quality-warn': dataQuality.missing_total > 0 }">{{ dataQuality.missing_total || 0 }} 个 · {{ formatNumber(Number(dataQuality.missing_rate || 0) * 100, 2) }}%</b></div>
-                <div class="quality-item"><span>标签状态</span><b>{{ dataQuality.label_columns?.length ? `含 ${dataQuality.label_columns.join("、")} 标签` : "无监督标签" }}</b></div>
-              </div>
-            </div>
-            <div class="panel closure-panel">
-              <div class="panel-header"><h2>工业分析闭环</h2><span>本次任务产出</span></div>
-              <div class="closure-flow">
-                <div class="closure-step"><strong>{{ closedLoop.dataPoints }}</strong><span>数据点</span><small>数据接入</small></div><b>→</b>
-                <div class="closure-step"><strong>{{ closedLoop.events }}</strong><span>异常事件</span><small>异常发现</small></div><b>→</b>
-                <div class="closure-step"><strong>{{ closedLoop.diagnoses }}</strong><span>诊断结果</span><small>证据解释</small></div><b>→</b>
-                <div class="closure-step"><strong>{{ closedLoop.workOrders }}</strong><span>候选工单</span><small>处置生成</small></div><b>→</b>
-                <div class="closure-step"><strong>{{ closedLoop.confirmed }}</strong><span>已确认案例</span><small>反馈沉淀</small></div>
-              </div>
-            </div>
-            <div class="two-column">
-              <div class="panel">
-                <div class="panel-header"><h2>异常事件时间线</h2><span>{{ analysis.detector }}</span></div>
-                <div v-if="events.length" class="event-list">
-                  <button v-for="(event, index) in events" :key="index" class="event-row" @click="changeTab('evidence')">
-                    <span class="event-number">{{ String(index + 1).padStart(2, '0') }}</span>
-                    <span class="event-body"><b>{{ event.severity }} · {{ event.duration_points }} 个采样点</b><small>{{ formatDate(event.start_time) }} - {{ formatDate(event.end_time) }}</small></span>
-                    <span class="event-score">{{ formatNumber(event.peak_score) }}</span>
-                  </button>
-                </div>
-                <div v-else class="panel-empty">当前未形成持续异常事件</div>
-              </div>
-              <div class="panel evidence-panel">
-                <div class="panel-header"><h2>运维建议</h2><span>结构化输出</span></div>
-                <ol v-if="analysis.recommendations?.length">
-                  <li v-for="recommendation in analysis.recommendations.slice(0, 5)" :key="recommendation">{{ recommendation }}</li>
-                </ol>
-                <div v-else class="panel-empty">暂无额外处置建议</div>
-              </div>
-            </div>
-            <div class="two-column">
-              <div class="panel">
-                <div class="panel-header"><h2>工况上下文</h2><span>{{ regimes?.state_count || 1 }} 个状态</span></div>
-                <div v-if="regimes?.segments?.length" class="regime-list">
-                  <div v-for="segment in regimes.segments.slice(0, 6)" :key="`${segment['开始时间']}-${segment['结束时间']}`" class="regime-row">
-                    <b>{{ segment["工况编号"] ? `工况 ${segment["工况编号"]}` : "工况" }}</b>
-                    <span>{{ formatDate(segment["开始时间"]) }} - {{ formatDate(segment["结束时间"]) }}</span>
-                    <small>{{ segment["持续点数"] }} 点 · 过渡占比 {{ formatNumber(Number(segment["过渡点占比"] || 0) * 100, 1) }}%</small>
-                  </div>
-                </div>
-                <div v-else class="panel-empty">暂无稳定工况分段</div>
-              </div>
-              <div class="panel">
-                <div class="panel-header"><h2>预测风险摘要</h2><span>{{ forecastEntries().length }} 个测点</span></div>
-                <div v-if="forecastEntries().length" class="forecast-list">
-                  <div v-for="item in forecastEntries().slice(0, 6)" :key="item[0]" class="forecast-row">
-                    <b>{{ item[0] }}</b><span>{{ forecastDirection(item) }}</span><strong>{{ forecastRisk(item) }}</strong>
-                  </div>
-                </div>
-                <div v-else class="panel-empty">暂无可用预测结果</div>
-              </div>
-            </div>
-            <div v-if="visualization && chartSensors.length" class="two-column">
-              <div class="panel chart-panel">
-                <div class="panel-header"><h2>重点传感器趋势</h2><span>{{ selectedSensor }}</span></div>
-                <div class="sensor-toolbar"><button v-for="sensor in chartSensors" :key="sensor" class="sensor-chip" :class="{ active: selectedSensor === sensor }" @click="selectSensor(sensor)">{{ sensor }}</button></div>
-                <TimeSeriesChart
-                  :timestamps="visualization.timestamps"
-                  :values="selectedSensorValues"
-                  :bands="visualization.event_ranges"
-                  :markers="visualization.risk_scores.map((value, index) => ({ index })).filter((item) => visualization.anomaly_labels[item.index])"
-                  line-color="#1d8583"
-                  :title="`${selectedSensor} 时序曲线`"
-                  :unit="selectedSensor"
-                />
-              </div>
-              <div class="panel">
-                <div class="panel-header"><h2>传感器贡献排序</h2><span>累计异常贡献</span></div>
-                <div v-if="visualization.sensor_contributions?.length" class="contribution-list">
-                  <div v-for="item in visualization.sensor_contributions" :key="item.sensor" class="contribution-row">
-                    <div class="contribution-name"><b>{{ item.sensor }}</b><span>{{ formatNumber(item.score) }}</span></div>
-                    <div class="contribution-track"><span :style="{ width: contributionWidth(item) }"></span></div>
-                  </div>
-                </div>
-                <div v-else class="panel-empty">暂无传感器贡献数据</div>
-              </div>
-            </div>
-          </template>
+          <OverviewPanel
+            v-else
+            :analysis="analysis"
+            :events="events"
+            :visualization="visualization"
+            :chart-sensors="chartSensors"
+            :selected-sensor="selectedSensor"
+            :selected-sensor-values="selectedSensorValues"
+            :highest-risk="highestRisk"
+            :risk-alert-count="riskAlertCount"
+            :analysis-scope="analysisScope"
+            :highest-risk-event="highestRiskEvent"
+            :overview-diagnosis="overviewDiagnosis"
+            :overview-work-order="overviewWorkOrder"
+            :overview-action="overviewAction"
+            :data-quality="dataQuality"
+            :closed-loop="closedLoop"
+            :regimes="regimes"
+            :forecast-entries="forecastEntries()"
+            :format-date="formatDate"
+            :format-number="formatNumber"
+            :contribution-width="contributionWidth"
+            @open-evidence="openEvidenceEvent"
+            @select-sensor="selectSensor"
+          />
         </section>
 
         <section v-else-if="activeTab === 'evidence'" class="content-stack">
           <div v-if="!analysis" class="empty-panel compact"><h2>尚未生成分析结果</h2><p>先选择 CSV 并开始智能分析。</p></div>
-          <template v-else>
-            <div class="panel">
-              <div class="panel-header"><h2>异常事件证据</h2><span>{{ events.length }} 个事件</span></div>
-              <div v-for="(event, index) in events" :key="index" class="evidence-card">
-                <div class="evidence-title"><span class="event-number">事件 {{ index + 1 }}</span><b :class="`risk-${event.severity}`">{{ event.severity }}</b><span class="event-score">峰值 {{ formatNumber(event.peak_score) }}</span></div>
-                <div class="evidence-grid"><div><label>时间范围</label><p>{{ formatDate(event.start_time) }} - {{ formatDate(event.end_time) }}</p></div><div><label>主导传感器</label><p>{{ event.dominant_sensors?.join('、') || '待识别' }}</p></div><div><label>候选根因</label><p>{{ diagnosisForEvent(index + 1)?.primary_candidate?.name || '待现场确认' }}</p></div></div>
-                <div v-if="diagnosisForEvent(index + 1)?.primary_candidate" class="evidence-columns"><div><label>支持证据</label><ul><li v-for="item in diagnosisForEvent(index + 1).primary_candidate.supporting_evidence" :key="item">{{ item }}</li></ul></div><div><label>证据缺口</label><ul><li v-for="item in diagnosisForEvent(index + 1).primary_candidate.missing_evidence" :key="item">{{ item }}</li></ul></div></div>
-                <div v-if="relationshipForEvent(index + 1)" class="relationship-box">
-                  <label>多传感器关系</label>
-                  <p>{{ relationshipForEvent(index + 1)["关系结论"] }}</p>
-                  <small>{{ relationshipForEvent(index + 1)["使用边界"] }}</small>
-                </div>
-              </div>
-              <div v-if="!events.length" class="panel-empty">未发现持续异常事件</div>
-            </div>
-          </template>
+          <EvidencePanel
+            v-else
+            :analysis="analysis"
+            :events="events"
+            :visible-evidence-events="visibleEvidenceEvents"
+            :evidence-risk-filter="evidenceRiskFilter"
+            :expanded-evidence-event="expandedEvidenceEvent"
+            :evidence-charts="evidenceCharts"
+            :format-date="formatDate"
+            :format-number="formatNumber"
+            :diagnosis-for-event="diagnosisForEvent"
+            :relationship-for-event="relationshipForEvent"
+            @filter-risk="evidenceRiskFilter = $event"
+            @toggle-event="toggleEvidenceEvent"
+            @open-work-order="openRelatedWorkOrder"
+          />
         </section>
 
         <section v-else-if="activeTab === 'forecast'" class="content-stack">
           <div v-if="!analysis" class="empty-panel compact"><h2>尚未生成趋势研判</h2><p>先选择 CSV 并开始智能分析。</p></div>
-          <template v-else>
-            <div class="panel">
-              <div class="panel-header"><h2>传感器未来趋势</h2><span>选择测点查看历史与预测区间</span></div>
-              <div v-if="forecastSensors.length" class="sensor-toolbar forecast-sensor-toolbar"><button v-for="sensor in forecastSensors" :key="sensor" class="sensor-chip" :class="{ active: selectedForecastSensor === sensor }" @click="selectForecastSensor(sensor)">{{ sensor }}</button></div>
-              <ForecastChart
-                v-if="selectedForecast && visualization?.series?.[selectedForecastSensor]"
-                :history-timestamps="visualization.timestamps"
-                :history-values="visualization.series[selectedForecastSensor]"
-                :future-timestamps="selectedForecast['预测时间'] || []"
-                :predictions="selectedForecast['预测值'] || []"
-                :lower="selectedForecast['下界'] || []"
-                :upper="selectedForecast['上界'] || []"
-                :title="`${selectedForecastSensor} 预测趋势`"
-              />
-              <div v-if="forecastEntries().length" class="forecast-detail-list">
-                <div v-for="item in forecastEntries()" :key="item[0]" class="forecast-detail">
-                  <div class="forecast-detail-header"><div><b>{{ item[0] }}</b><small>{{ item[1].模型名称 }} · {{ item[1].选择依据 }}</small></div><span :class="`forecast-risk-${item[1].风险}`">{{ item[1].风险 }}</span></div>
-                  <div class="forecast-stats"><span>当前值 <b>{{ item[1].当前值 }}</b></span><span>预测末值 <b>{{ item[1].预测末值 }}</b></span><span>方向 <b>{{ item[1].方向 }}</b></span><span>末值偏移 <b>{{ item[1].预测末值偏移标准差 }}σ</b></span><span>回测 RMSE <b>{{ item[1].回测?.RMSE ?? '-' }}</b></span></div>
-                  <div class="forecast-bar"><span :style="{ width: `${Math.min(100, Math.max(4, Math.abs(Number(item[1].预测末值偏移标准差 || 0)) * 10))}%` }"></span></div>
-                </div>
-              </div>
-              <div v-else class="panel-empty">数据长度不足，暂未生成预测</div>
-            </div>
-            <div class="two-column">
-              <div class="panel">
-                <div class="panel-header"><h2>工况分段</h2><span>识别结果</span></div>
-                <div v-if="regimes?.segments?.length" class="regime-list detailed">
-                  <div v-for="segment in regimes.segments" :key="`${segment['开始时间']}-${segment['结束时间']}`" class="regime-row">
-                    <b>工况 {{ segment["工况编号"] }}</b><span>{{ formatDate(segment["开始时间"]) }} - {{ formatDate(segment["结束时间"]) }}</span><small>{{ segment["持续点数"] }} 点</small>
-                  </div>
-                </div>
-                <div v-else class="panel-empty">暂无工况分段</div>
-              </div>
-              <div class="panel">
-                <div class="panel-header"><h2>关联诊断</h2><span>{{ relationships.length }} 个事件</span></div>
-                <div v-if="relationships.length" class="relationship-list">
-                  <div v-for="item in relationships" :key="item['事件编号']" class="relationship-row"><b>事件 {{ item["事件编号"] }}</b><span>{{ item["关系结论"] }}</span></div>
-                </div>
-                <div v-else class="panel-empty">暂无足够的多传感器关系证据</div>
-              </div>
-            </div>
-          </template>
+          <ForecastPanel
+            v-else
+            :analysis="analysis"
+            :forecast-sensors="forecastSensors"
+            :selected-forecast-sensor="selectedForecastSensor"
+            :selected-forecast="selectedForecast"
+            :visualization="visualization"
+            :forecast-entries="forecastEntries()"
+            :regimes="regimes"
+            :relationships="relationships"
+            :format-date="formatDate"
+            :format-number="formatNumber"
+            @select-sensor="selectForecastSensor"
+          />
         </section>
 
         <WorkOrderPanel
@@ -1458,24 +1500,6 @@ function contributionWidth(item) {
           @save-feedback="saveFeedback"
           @archive-order="archiveSelectedWorkOrder"
         />
-        <section v-else-if="false && activeTab === 'work-orders'" class="content-stack">
-          <div v-if="selectedWorkOrder" class="work-order-live-status">
-            <span>当前编辑工单状态</span>
-            <b :class="`status-${feedback.status}`">{{ feedback.status }}</b>
-          </div>
-          <div v-if="feedbackNotice" class="feedback-notice" :class="feedbackNotice.type">
-            <strong>{{ feedbackNotice.title }}</strong>
-            <span>{{ feedbackNotice.detail }}</span>
-          </div>
-             <div class="work-export-toolbar">
-              <span>当前筛选结果：{{ workOrderTotal }} 条 · 第 {{ workOrderPage }} / {{ workOrderPageCount }} 页</span>
-              <div class="work-toolbar-actions"><button class="secondary-button" :disabled="workOrdersLoading" @click="refreshWorkOrders">{{ workOrdersLoading ? '刷新中...' : '刷新工单' }}</button><button v-if="filteredWorkOrders.length" class="secondary-button" @click="exportWorkOrdersCsv">导出当前页 CSV</button></div>
-          </div>
-          <div class="two-column work-layout">
-            <div class="panel"><div class="panel-header"><h2>{{ showArchived ? '归档工单' : '工单队列' }}</h2><span>{{ workOrdersLoading ? '加载中...' : `${filteredWorkOrders.length} / ${workOrderTotal} 条` }}</span></div><div class="work-order-filters sticky-filters"><input v-model="workOrderSearch" class="control-input" placeholder="搜索工单编号、标题或责任角色" /><select v-model="workOrderStatusFilter" class="control-input"><option value="">全部状态</option><option>待确认</option><option>处理中</option><option>已确认</option><option>已完成</option><option>已关闭</option></select><select v-model="workOrderPriorityFilter" class="control-input"><option value="">全部优先级</option><option>P1</option><option>P2</option><option>P3</option></select><button class="filter-clear" @click="clearWorkOrderFilters">清除</button></div><div v-if="workOrdersLoading" class="panel-loading compact-loading">正在加载工单...</div><template v-else><div v-for="order in filteredWorkOrders" :key="order.record_id" class="work-order-row" :class="{ selected: selectedWorkOrder?.record_id === order.record_id }" @click="selectWorkOrder(order)"><span class="priority">{{ order.priority }}</span><span><b>{{ order.title }}</b><small>{{ order.status }} · {{ order.assigned_role }}</small></span><button v-if="showArchived" class="row-action" title="恢复工单" @click.stop="restoreSelectedWorkOrder(order)">恢复</button></div><div v-if="!filteredWorkOrders.length" class="panel-empty">{{ workOrderTotal ? '没有符合条件的工单' : (showArchived ? '暂无归档工单' : '暂无工单') }}</div></template><div class="pagination-bar"><button class="filter-clear" :disabled="workOrderPage <= 1 || workOrdersLoading" @click="changeWorkOrderPage(workOrderPage - 1)">上一页</button><span>第 {{ workOrderPage }} / {{ workOrderPageCount }} 页</span><button class="filter-clear" :disabled="workOrderPage >= workOrderPageCount || workOrdersLoading" @click="changeWorkOrderPage(workOrderPage + 1)">下一页</button></div></div>
-            <div class="panel"><div v-if="selectedWorkOrder"><div class="panel-header"><h2>工单详情与现场反馈</h2><span>{{ selectedWorkOrder.record_id }}</span></div><div v-if="workOrderLoading" class="panel-loading">正在加载所属任务的异常证据...</div><div v-else class="work-order-detail"><div class="work-order-summary"><span class="priority large">{{ selectedWorkOrder.priority }}</span><div><h3>{{ selectedWorkOrder.title }}</h3><p>{{ selectedWorkOrder.assigned_role }} · 所属任务 {{ selectedWorkOrder.run_id }}</p></div></div><div class="detail-grid"><div><label>异常时间</label><b>{{ selectedWorkOrderEvent ? `${formatDate(selectedWorkOrderEvent.start_time)} - ${formatDate(selectedWorkOrderEvent.end_time)}` : '暂无' }}</b></div><div><label>风险峰值</label><b>{{ selectedWorkOrderEvent ? formatNumber(selectedWorkOrderEvent.peak_score) : '暂无' }}</b></div><div><label>主导传感器</label><b>{{ selectedWorkOrderEvent?.dominant_sensors?.join('、') || '暂无' }}</b></div></div><div class="evidence-box"><div><label>算法证据</label><ul><li v-for="item in selectedWorkOrder.evidence_summary" :key="item">{{ item }}</li><li v-if="!selectedWorkOrder.evidence_summary?.length">暂无结构化证据</li></ul></div><div><label>建议处置</label><ul><li v-for="item in selectedWorkOrder.actions" :key="item">{{ item }}</li><li v-if="!selectedWorkOrder.actions?.length">暂无处置动作</li></ul></div></div><div v-if="selectedWorkOrderDiagnosis?.primary_candidate" class="diagnosis-strip"><label>候选根因</label><b>{{ selectedWorkOrderDiagnosis.primary_candidate.name }}</b><span>{{ selectedWorkOrderDiagnosis.primary_candidate.confidence || '待现场确认' }}</span></div><div class="form-stack"><label>状态<select v-model="feedback.status" class="control-input" :disabled="showArchived"><option>待确认</option><option>已确认</option><option>处理中</option><option>已完成</option><option>已关闭</option></select></label><label>确认根因<input v-model="feedback.confirmed_cause" class="control-input" :disabled="showArchived" placeholder="填写现场确认结果" /></label><label>处置与复测<textarea v-model="feedback.feedback_note" class="control-input" rows="5" :disabled="showArchived" placeholder="填写处理动作和复测结果"></textarea></label><label>处理人员<input v-model="feedback.handled_by" class="control-input" :disabled="showArchived" /></label><div class="form-actions"><button v-if="!showArchived" class="primary-button" :disabled="savingFeedback || !feedbackDirty" @click="saveFeedback">{{ savingFeedback ? '保存中...' : feedbackDirty ? '保存反馈' : '已保存' }}</button><button v-if="!showArchived" class="archive-button" :disabled="![ '已完成', '已关闭' ].includes(selectedWorkOrder.status) || savingFeedback" @click="archiveSelectedWorkOrder">归档工单</button></div></div></div></div><div v-else class="panel-empty">选择一条工单查看详情</div></div>
-          </div>
-        </section>
 
         <HistoryPanel
           v-else

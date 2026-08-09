@@ -7,9 +7,10 @@
 前端负责专业工业应用界面，不直接访问数据库，也不直接调用比赛方大模型：
 
 - 上传并预检工业 CSV；
+- 一键加载后端配置的默认 SKAB 样例，适合校赛演示和联调；
 - 展示风险总览、异常事件、传感器曲线和预测趋势；
 - 展示异常证据、候选根因和证据缺口；
-- 管理运维工单、现场确认、处置和复测反馈；
+- 管理运维工单、现场确认、处置和复测反馈，工单状态包含“待验证”环节；
 - 展示历史任务、归档记录和已确认案例。
 
 完整系统的接口、算法、数据库和万悟适配均在项目根目录的 FastAPI 后端中。
@@ -23,6 +24,9 @@ src/
 ├─ components/
 │  ├─ AnalysisProgressPanel.vue    # 异步分析进度和取消排队
 │  ├─ PreflightModal.vue            # CSV 分析前预检
+│  ├─ OverviewPanel.vue             # 风险总览、数据质量和分析闭环
+│  ├─ EvidencePanel.vue             # 异常证据、候选根因和关联工单
+│  ├─ ForecastPanel.vue             # 趋势预测、工况分段和关联诊断
 │  ├─ WorkOrderPanel.vue            # 工单列表、详情和现场反馈
 │  ├─ HistoryPanel.vue              # 历史任务和已确认案例
 │  ├─ CaseDrawer.vue                # 案例详情抽屉
@@ -32,6 +36,8 @@ src/
 ├─ styles.css                      # 全局样式与响应式布局
 └─ main.js                         # Vue 应用入口
 ```
+
+`App.vue` 负责全局状态、异步任务轮询、接口调用和页面协调；三个业务面板只负责对应页面的展示，并通过事件请求父组件执行动作。这样后续替换企业数据源、调整图表或增加业务页面时，不需要继续扩大 `App.vue`。
 
 ## 运行前提
 
@@ -67,6 +73,8 @@ cd "E:\大学课程\竞赛\shichi_qianji_agent\frontend"
 & "E:\Tools\nodejs\npm.cmd" install
 & "E:\Tools\nodejs\npm.cmd" run dev
 ```
+
+页面流程：加载默认 SKAB 样例或选择 CSV -> 文件预检 -> 开始智能分析 -> 查看风险与证据 -> 处理运维工单 -> 保存现场反馈 -> 查看历史案例。
 
 浏览器访问：
 

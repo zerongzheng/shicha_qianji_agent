@@ -4,15 +4,24 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+.pycache-local/
 
 # uv / Python 虚拟环境
 .venv/
 .uv-cache/
+.uv-cache-local/
 
 # 本地密钥与环境配置
 .env
 .env.*
 !.env.example
+*.local
+*.secret
+*.secrets
+*.key
+*.pem
+*.p12
+*.crt
 
 # PyCharm、VS Code 与系统文件
 .idea/
@@ -27,15 +36,34 @@ frontend/node_modules/
 .pytest_cache/
 .ruff_cache/
 .runtime-temp/
+.mypy_cache/
+.tox/
+.nox/
 .coverage
 *.log
 
 # 运行输出。保留目录本身，不提交分析报告和临时上传文件
-outputs/*
+outputs/**
 !outputs/.gitkeep
 
 # 外部工业数据集不进入代码仓库
 data/raw/
+data/processed/
 *.csv
 *.parquet
 *.xlsx
+
+# 本地数据库、缓存索引和训练/推理模型
+*.db
+*.sqlite
+*.sqlite3
+*.pkl
+*.pickle
+*.joblib
+*.onnx
+*.pt
+*.pth
+*.npz
+
+# 知识库整理过程稿。正式运行知识库放在 resources/knowledge/。
+resources/knowledge_drafts/

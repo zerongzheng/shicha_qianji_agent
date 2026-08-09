@@ -80,6 +80,8 @@ def test_api_module_is_importable() -> None:
     assert "/health" in paths
     assert "/api/v1/models" in paths
     assert "/api/v1/files" in paths
+    assert "/api/v1/files/{file_id}/preflight" in paths
+    assert "/api/v1/samples/skab/default" in paths
     assert "/api/v1/analyze" in paths
     assert "/api/v1/diagnose" in paths
     assert "/api/v1/jobs" in paths

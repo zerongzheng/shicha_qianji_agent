@@ -23,6 +23,7 @@ from app.api.schemas import (
     AnalysisResponse,
     ArchiveRequest,
     ErrorResponse,
+    FilePreflightResponse,
     FileUploadResponse,
     ForecastCompareRequest,
     JobAcceptedResponse,
@@ -43,7 +44,7 @@ from app.api.schemas import (
 )
 from app.api.wanwu_openapi import build_wanwu_openapi
 from app.config import get_settings
-from app.data.loader import load_time_series
+from app.data.loader import _detect_delimiter, load_time_series
 from app.diagnosis import AutomaticDiagnosisService, diagnosis_to_dict
 from app.integrations import receive_wanwu_csv
 from app.model_store import list_autoencoder_models
@@ -388,6 +389,15 @@ def _find_uploaded_file(file_id: str) -> Path:
 
     if not file_id or Path(file_id).name != file_id:
         raise HTTPException(status_code=400, detail="必须提供合法 file_id")
+    # 默认 SKAB 样例不复制到上传目录，只允许解析这一枚由样例接口签发的固定 ID。
+    sample_file_id = f"sample_{settings.default_skab_file.stem}"
+    if file_id == sample_file_id and settings.default_skab_file.exists():
+        get_repository().register_file(
+            file_id,
+            settings.default_skab_file.name,
+            settings.default_skab_file,
+        )
+        return settings.default_skab_file
     matches = list((UPLOAD_DIR / file_id).glob("*.csv"))
     if len(matches) != 1:
         raise HTTPException(status_code=404, detail="找不到对应上传文件")
@@ -415,6 +425,53 @@ def _store_uploaded_csv(file_name: str, content: bytes) -> tuple[str, Path, dict
     target_path.write_bytes(content)
     metadata = get_repository().register_file(file_id, safe_name, target_path)
     return file_id, target_path, metadata
+
+
+def _register_sample_file(source_path: Path) -> dict[str, Any]:
+    """登记项目内置样例并返回与上传接口一致的文件元数据。"""
+
+    if not source_path.exists() or source_path.suffix.lower() != ".csv":
+        raise HTTPException(status_code=404, detail="找不到默认 SKAB 样例文件")
+    file_id = f"sample_{source_path.stem}"
+    metadata = get_repository().register_file(file_id, source_path.name, source_path)
+    return {
+        "file_id": file_id,
+        "file_name": source_path.name,
+        "sha256": metadata["sha256"],
+        "size_bytes": metadata["size_bytes"],
+    }
+
+
+def _build_file_preflight(file_id: str, source_path: Path) -> dict[str, Any]:
+    """读取受控 CSV 的真实画像，统一服务于默认样例和已上传文件。"""
+
+    try:
+        dataframe = load_time_series(source_path)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    profile = build_profile(dataframe, source_path.name)
+    missing_rate = profile.missing_total / max(profile.row_count * len(profile.sensor_columns), 1)
+    warnings: list[str] = []
+    if len(profile.sensor_columns) < 2:
+        warnings.append("可识别的传感器列少于 2 列，多变量关系诊断能力会受限。")
+    if missing_rate > 0.1:
+        warnings.append(f"缺失率约 {missing_rate * 100:.1f}%，建议先检查数据完整性。")
+    if profile.row_count < 100:
+        warnings.append("数据行数少于 100，趋势预测和工况分段结果可能不稳定。")
+    return {
+        "file_id": file_id,
+        "file_name": source_path.name,
+        "size_bytes": source_path.stat().st_size,
+        "row_count": profile.row_count,
+        "sample_count": min(profile.row_count, 2000),
+        "delimiter": _detect_delimiter(source_path),
+        "columns": ["datetime", *profile.sensor_columns, *profile.label_columns],
+        "datetime_column": "datetime",
+        "sensor_count": len(profile.sensor_columns),
+        "missing_rate": round(missing_rate, 6),
+        "warnings": warnings,
+    }
 
 
 def _submit_analysis_job(
@@ -805,6 +862,34 @@ if app:
             "sha256": metadata["sha256"],
             "size_bytes": metadata["size_bytes"],
         }
+
+    @app.post(
+        "/api/v1/samples/skab/default",
+        response_model=FileUploadResponse,
+        responses={404: {"model": ErrorResponse}},
+    )
+    def register_default_skab_sample(
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """登记默认 SKAB 样例，便于校赛演示时一键开始分析。"""
+
+        _check_api_key(x_api_key)
+        return _register_sample_file(settings.default_skab_file)
+
+    @app.get(
+        "/api/v1/files/{file_id}/preflight",
+        response_model=FilePreflightResponse,
+        responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+    )
+    def preflight_file(
+        file_id: str,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """返回指定受控文件的真实结构画像，不暴露服务器本地路径。"""
+
+        _check_api_key(x_api_key)
+        source_path = _find_uploaded_file(file_id)
+        return _build_file_preflight(file_id, source_path)
 
     @app.post(
         "/api/v1/analyze",

@@ -36,6 +36,7 @@
 - 支持异步分析任务、任务状态轮询、取消排队任务和历史任务归档；
 - 支持运维工单状态流转、现场反馈、归档和历史案例沉淀；
 - 支持 Vue3 工业运维工作台和 Streamlit 备用调试页面；
+- 支持一键登记默认 SKAB 样例，便于没有企业数据时完成完整演示；
 - 支持为元景万悟提供专用 OpenAPI 和工作流工具接口。
 
 当前结果只能作为 SKAB 校赛阶段验证，不应包装为企业现场成效。企业数据和企业设备知识库接入后，还需要重新标定阈值、模型和根因规则。
@@ -252,11 +253,13 @@ http://host.docker.internal:8000/integrations/wanwu/quick-openapi.json
 | 接口 | 用途 |
 | --- | --- |
 | `POST /api/v1/files` | 上传 CSV 并返回 `file_id` |
+| `POST /api/v1/samples/skab/default` | 登记默认 SKAB 样例并返回可分析的 `file_id` |
+| `GET /api/v1/files/{file_id}/preflight` | 返回受控 CSV 的真实行数、列名、测点数和缺失率 |
 | `POST /api/v1/jobs` | 创建异步分析任务 |
 | `GET /api/v1/jobs/{run_id}` | 查询任务状态 |
 | `GET /api/v1/jobs/{run_id}/result` | 获取分析结果 |
 | `GET /api/v1/runs` | 查询历史分析任务 |
-| `GET /api/v1/work-orders` | 查询运维工单 |
+| `GET /api/v1/work-orders` | 查询运维工单，可按 `run_id`、状态和优先级筛选 |
 | `PATCH /api/v1/work-orders/{record_id}` | 保存现场反馈 |
 | `GET /api/v1/cases` | 查询历史确认案例 |
 | `POST /api/v1/wanwu/quick-diagnosis` | 万悟快速诊断入口 |

@@ -31,6 +31,15 @@ export function uploadCsv(file) {
   return request("/api/v1/files", { method: "POST", body: formData });
 }
 
+// 登记项目内置 SKAB 样例；文件仍由后端统一管理，浏览器不直接访问本地路径。
+export function registerDefaultSkabSample() {
+  return request("/api/v1/samples/skab/default", { method: "POST" });
+}
+
+export function getFilePreflight(fileId) {
+  return request(`/api/v1/files/${encodeURIComponent(fileId)}/preflight`);
+}
+
 export function createJob(fileId, config = {}) {
   return request("/api/v1/jobs", {
     method: "POST",
@@ -72,6 +81,8 @@ export function listWorkOrders(includeArchived = false, archivedOnly = false, op
   });
   if (options.status) params.set("status", options.status);
   if (options.priority) params.set("priority", options.priority);
+  // 事件与工单联动时必须限定所属分析任务，避免不同任务中相同事件编号串线。
+  if (options.run_id) params.set("run_id", options.run_id);
   if (options.search?.trim()) params.set("search", options.search.trim());
   if (includeArchived) params.set("include_archived", "true");
   if (archivedOnly) params.set("archived_only", "true");
