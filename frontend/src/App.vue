@@ -1,5 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { inspectCsvText, formatFileSize } from "./utils/csv";
+import { useAnalysisJob } from "./composables/useAnalysisJob";
 import {
   createJob,
   archiveRun,
@@ -43,18 +45,9 @@ const fileInput = ref(null);
 const filePreflight = ref(null);
 const showPreflight = ref(false);
 const preflightAccepted = ref(false);
-const isAnalyzing = ref(false);
-const jobStatus = ref("");
-const progressStage = ref("idle");
-const progressPercent = ref(0);
-const progressDetail = ref("等待提交任务");
-const analysisElapsed = ref(0);
-const progressTimer = ref(null);
 const apiStatus = ref("检查中");
 const errorMessage = ref("");
 const successMessage = ref("");
-const runId = ref("");
-const analysis = ref(null);
 const runs = ref([]);
 const workOrders = ref([]);
 const cases = ref([]);
@@ -86,13 +79,9 @@ const lastDataSyncAt = ref(null);
 const autoRefreshTimer = ref(null);
 const selectedSensor = ref("");
 const selectedForecastSensor = ref("");
-const activeJobId = ref("");
-const cancellingJob = ref(false);
-const cancelRequested = ref(false);
 const retryingRunId = ref("");
 const sampleLoading = ref(false);
 const selectedSampleFileId = ref("");
-const activeJobStorageKey = "shichi_qianji_active_job";
 // 证据页使用筛选和折叠，事件较多时仍然可以按风险快速定位。
 const evidenceRiskFilter = ref("");
 const expandedEvidenceEvent = ref(0);
@@ -119,6 +108,45 @@ const confirmDialog = ref(null);
 let confirmResolver = null;
 let workOrderDetailRequestToken = 0;
 let caseDetailRequestToken = 0;
+
+// 分析任务的状态机独立管理，App.vue 只负责把它接入当前页面状态。
+const {
+  isAnalyzing,
+  jobStatus,
+  progressStage,
+  progressPercent,
+  progressDetail,
+  analysisElapsed,
+  runId,
+  analysis,
+  activeJobId,
+  cancellingJob,
+  cancelRequested,
+  progressSteps,
+  setProgress,
+  startProgressTimer,
+  stopProgressTimer,
+  persistActiveJob,
+  pollJob,
+  loadAnalysisResult,
+  startAnalysis: runAnalysisJob,
+  cancelActiveJob: cancelAnalysisJob,
+  resumeActiveJob,
+} = useAnalysisJob({
+  api: { uploadCsv, createJob, getJobStatus, getJobResult, cancelJob },
+  config,
+  selectedFile,
+  selectedSampleFileId,
+  filePreflight,
+  preflightAccepted,
+  showPreflight,
+  inspectCsvFile: async (file) => inspectCsvFile(file),
+  confirmDiscardChanges,
+  refreshHistory: async () => refreshHistory(),
+  activeTab,
+  successMessage,
+  errorMessage,
+});
 
 const events = computed(() => analysis.value?.anomaly_events || []);
 const diagnoses = computed(() => analysis.value?.root_cause_diagnoses || []);
@@ -231,13 +259,6 @@ const analysisScope = computed(() => {
   };
 });
 
-const progressSteps = computed(() => [
-  { id: "uploading", label: "接收数据", detail: "校验 CSV 并登记文件" },
-  { id: "queued", label: "任务排队", detail: "建立可追溯分析任务" },
-  { id: "running", label: "智能分析", detail: "检测、预测与根因研判" },
-  { id: "finalizing", label: "整理结果", detail: "生成证据和运维工单" },
-]);
-
 onMounted(async () => {
   await refreshHistory();
   try {
@@ -304,6 +325,13 @@ function feedbackSnapshot() {
     feedback_note: feedback.feedback_note,
     handled_by: feedback.handled_by,
   });
+
+watch(analysis, (result) => {
+  if (!result) return;
+  // 每次载入新任务或历史结果时，默认选中第一条可视化测点。
+  selectedSensor.value = result.visualization?.sensor_columns?.[0] || "";
+  selectedForecastSensor.value = Object.keys(result.forecast_results || {})[0] || "";
+});
 }
 
 function handleBeforeUnload(event) {
@@ -451,107 +479,12 @@ async function inspectCsvFile(file) {
   }
   try {
     const text = await file.text();
-    const lines = text.split(/\r?\n/).filter((line) => line.trim());
-    const sampleLines = lines.slice(0, 2001);
-    const header = parseCsvLine(sampleLines[0] || "");
-    const delimiter = detectDelimiter(sampleLines[0] || "");
-    const columns = header.map((item) => item.trim().replace(/^\"|\"$/g, ""));
-    const datetimeColumn = columns.find((column) => /time|date|datetime|timestamp|时间|日期/i.test(column)) || "";
-    const sensorColumns = columns.filter((column) => column && column !== datetimeColumn && !/label|target|class|状态|标签/i.test(column));
-    const numericRows = sampleLines.slice(1).map((line) => parseCsvLine(line, delimiter));
-    let missingCells = 0;
-    let observedCells = 0;
-    numericRows.forEach((row) => sensorColumns.forEach((column) => {
-      const index = columns.indexOf(column);
-      const value = row[index];
-      observedCells += 1;
-      if (value === undefined || value.trim() === "" || ["nan", "null", "none"].includes(value.trim().toLowerCase())) missingCells += 1;
-    }));
-    const sampledDataRows = Math.max(lines.length - 1, 0);
-    const missingRate = observedCells ? missingCells / observedCells : 0;
-    filePreflight.value = {
-      fileName: file.name,
-      sizeLabel: formatFileSize(file.size),
-      rowCount: sampledDataRows,
-      sampleCount: numericRows.length,
-      delimiter: delimiter === "\t" ? "制表符" : delimiter,
-      columns,
-      datetimeColumn,
-      sensorCount: sensorColumns.length,
-      missingRate,
-      warnings: [
-        !datetimeColumn ? "未识别到时间列，后端将按数据行顺序处理。" : "",
-        sensorColumns.length < 2 ? "可识别的传感器列少于 2 列，多变量关系诊断能力会受限。" : "",
-        missingRate > 0.1 ? `抽样缺失率约 ${(missingRate * 100).toFixed(1)}%，建议先检查数据完整性。` : "",
-        sampledDataRows < 100 ? "数据行数较少，趋势预测和工况分段结果可能不稳定。" : "",
-      ].filter(Boolean),
-    };
+    filePreflight.value = inspectCsvText(text, file.name, file.size);
     showPreflight.value = true;
   } catch (error) {
     filePreflight.value = null;
     errorMessage.value = `CSV 预检失败：${error.message}`;
   }
-}
-
-function detectDelimiter(line) {
-  const candidates = [",", ";", "\t"];
-  return candidates.sort((a, b) => countDelimiter(line, b) - countDelimiter(line, a))[0];
-}
-
-function countDelimiter(line, delimiter) {
-  return line.split(delimiter).length - 1;
-}
-
-function parseCsvLine(line, delimiter = detectDelimiter(line)) {
-  const values = [];
-  let current = "";
-  let quoted = false;
-  for (let index = 0; index < line.length; index += 1) {
-    const char = line[index];
-    if (char === '"') {
-      if (quoted && line[index + 1] === '"') {
-        current += '"';
-        index += 1;
-      } else {
-        quoted = !quoted;
-      }
-    } else if (char === delimiter && !quoted) {
-      values.push(current);
-      current = "";
-    } else {
-      current += char;
-    }
-  }
-  values.push(current);
-  return values;
-}
-
-function formatFileSize(bytes) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
-  return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
-}
-
-function startProgressTimer() {
-  stopProgressTimer();
-  const startedAt = Date.now();
-  analysisElapsed.value = 0;
-  progressTimer.value = window.setInterval(() => {
-    analysisElapsed.value = Math.floor((Date.now() - startedAt) / 1000);
-    // 后端没有把算法内部阶段伪装成精确百分比，前端只做有上限的执行进度提示。
-    if (progressStage.value === "running") {
-      progressPercent.value = Math.min(88, Math.max(progressPercent.value, 38 + Math.floor(analysisElapsed.value / 3)));
-    }
-  }, 1000);
-}
-
-function loadAnalysisResult(result, sourceRunId = "") {
-  if (!result) return;
-  analysis.value = result;
-  runId.value = sourceRunId || result.run_id || "";
-  selectedSensor.value = result.visualization?.sensor_columns?.[0] || "";
-  selectedForecastSensor.value = Object.keys(result.forecast_results || {})[0] || "";
 }
 
 function normalizePreflight(payload) {
@@ -563,115 +496,11 @@ function normalizePreflight(payload) {
   };
 }
 
-function persistActiveJob(jobId) {
-  if (jobId) window.localStorage.setItem(activeJobStorageKey, jobId);
-  else window.localStorage.removeItem(activeJobStorageKey);
-}
-
-async function resumeActiveJob() {
-  const savedJobId = window.localStorage.getItem(activeJobStorageKey);
-  if (!savedJobId || isAnalyzing.value) return;
-  try {
-    const status = await getJobStatus(savedJobId);
-    if (["success", "failed", "cancelled"].includes(status.job_status)) {
-      persistActiveJob("");
-      return;
-    }
-    runId.value = savedJobId;
-    activeJobId.value = savedJobId;
-    isAnalyzing.value = true;
-    cancelRequested.value = false;
-    jobStatus.value = status.job_status === "queued" ? "排队中" : "执行中";
-    setProgress(status.job_status === "queued" ? "queued" : "running", status.job_status === "queued" ? 20 : 38, "检测到未完成任务，正在恢复分析进度...");
-    startProgressTimer();
-    await pollJob(savedJobId);
-    await refreshHistory();
-    activeTab.value = "overview";
-    setProgress("success", 100, "分析完成，结果已恢复");
-    jobStatus.value = "已完成";
-    successMessage.value = "已恢复上次未完成的分析任务。";
-  } catch (error) {
-    setProgress("failed", progressPercent.value, "任务恢复失败，请到历史记录查看任务状态。");
-    errorMessage.value = error.message;
-  } finally {
-    isAnalyzing.value = false;
-    activeJobId.value = "";
-    persistActiveJob("");
-    stopProgressTimer();
-  }
-}
-
-function stopProgressTimer() {
-  if (progressTimer.value !== null) {
-    window.clearInterval(progressTimer.value);
-    progressTimer.value = null;
-  }
-}
-
-function setProgress(stage, percent, detail) {
-  progressStage.value = stage;
-  progressPercent.value = percent;
-  progressDetail.value = detail;
-}
-
 async function startAnalysis() {
-  if (feedbackDirty.value && !(await confirmDiscardChanges())) return;
-  if (!selectedFile.value) {
-    errorMessage.value = "请先选择一份 CSV 文件。";
-    return;
-  }
-  if (!filePreflight.value) {
-    await inspectCsvFile(selectedFile.value);
-  }
-  if (!filePreflight.value) return;
-  if (!preflightAccepted.value) {
-    showPreflight.value = true;
-    return;
-  }
-  showPreflight.value = false;
-  preflightAccepted.value = false;
-  isAnalyzing.value = true;
-  cancelRequested.value = false;
-  jobStatus.value = "准备中";
-  setProgress("uploading", 8, "正在接收并校验 CSV 文件...");
-  startProgressTimer();
-  errorMessage.value = "";
-  successMessage.value = "";
-  analysis.value = null;
   try {
-    await new Promise((resolve) => requestAnimationFrame(resolve));
-    const uploaded = selectedSampleFileId.value
-      ? { file_id: selectedSampleFileId.value }
-      : await uploadCsv(selectedFile.value);
-    setProgress("queued", 20, "文件已接收，正在建立分析任务...");
-    jobStatus.value = "已提交";
-    const accepted = await createJob(uploaded.file_id, { ...config });
-    runId.value = accepted.run_id;
-    activeJobId.value = accepted.run_id;
-    persistActiveJob(accepted.run_id);
-    await pollJob(accepted.run_id);
-    setProgress("finalizing", 94, "分析完成，正在整理风险证据和工单...");
-    await new Promise((resolve) => setTimeout(resolve, 350));
-    await refreshHistory();
-    activeTab.value = "overview";
-    setProgress("success", 100, "分析完成，结果已加载");
-    jobStatus.value = "已完成";
-    successMessage.value = "分析完成，已生成风险事件和运维工单。";
+    await runAnalysisJob();
   } catch (error) {
-    if (cancelRequested.value) {
-      setProgress("failed", progressPercent.value, "任务已取消，原始文件和任务记录仍保留。");
-      jobStatus.value = "已取消";
-      successMessage.value = "分析任务已取消。";
-    } else {
-      setProgress("failed", progressPercent.value, "任务未完成，请查看下方错误信息");
-      jobStatus.value = "失败";
-      errorMessage.value = error.message;
-    }
-  } finally {
-    isAnalyzing.value = false;
-    activeJobId.value = "";
-    persistActiveJob("");
-    stopProgressTimer();
+    errorMessage.value = error.message;
   }
 }
 
@@ -681,64 +510,12 @@ function confirmPreflightAndStart() {
 }
 
 async function cancelActiveJob() {
-  if (!activeJobId.value || cancellingJob.value) return;
-  if (!(await requestConfirmation({
+  await cancelAnalysisJob(() => requestConfirmation({
     title: "取消排队中的分析任务？",
     detail: "已上传文件和任务记录仍会保留，但本次分析不会继续执行。",
     confirmText: "确认取消",
     tone: "warning",
-  }))) return;
-  cancellingJob.value = true;
-  cancelRequested.value = true;
-  let cancelled = false;
-  try {
-    await cancelJob(activeJobId.value);
-    cancelled = true;
-    setProgress("failed", progressPercent.value, "任务已取消，原始文件和任务记录仍保留。");
-    jobStatus.value = "已取消";
-    successMessage.value = "分析任务已取消。";
-  } catch (error) {
-    cancelRequested.value = false;
-    errorMessage.value = error.message;
-  } finally {
-    cancellingJob.value = false;
-    if (cancelled) {
-      isAnalyzing.value = false;
-      activeJobId.value = "";
-      stopProgressTimer();
-    }
-  }
-}
-
-async function pollJob(id) {
-  const timeoutAt = Date.now() + 120000;
-  while (Date.now() < timeoutAt) {
-    if (cancelRequested.value) {
-      throw new Error("任务已取消");
-    }
-    const status = await getJobStatus(id);
-    // 取消请求可能与本次轮询同时返回，取消后不再继续处理任何成功结果。
-    if (cancelRequested.value) {
-      throw new Error("任务已取消");
-    }
-    jobStatus.value = status.job_status === "queued" ? "排队中" : status.job_status === "running" ? "执行中" : status.job_status;
-    if (status.job_status === "queued") {
-      setProgress("queued", Math.max(progressPercent.value, 20), "任务已进入队列，等待分析引擎调度...");
-    } else if (status.job_status === "running") {
-      setProgress("running", Math.max(progressPercent.value, 38), "正在执行异常检测、趋势预测和根因研判...");
-    }
-    if (status.job_status === "success") {
-      const result = await getJobResult(id);
-      loadAnalysisResult(result.result, id);
-      setProgress("finalizing", 94, "分析结果已生成，正在加载到工作台...");
-      return;
-    }
-    if (["failed", "cancelled"].includes(status.job_status)) {
-      throw new Error(status.error || `任务${status.job_status}`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 1200));
-  }
-  throw new Error("分析任务等待超时，请到历史记录查看任务状态。" );
+  }));
 }
 
 async function refreshHistory() {

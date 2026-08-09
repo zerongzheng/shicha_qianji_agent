@@ -33,6 +33,13 @@ src/
 │  ├─ TimeSeriesChart.vue           # 时序风险曲线
 │  ├─ ForecastChart.vue             # 预测区间图
 │  └─ ConfirmDialog.vue             # 统一确认弹窗
+├─ composables/
+│  ├─ useAnalysisJob.js             # 上传、轮询、取消和任务恢复
+│  └─ useAnalysisJob.test.js        # 分析任务状态测试
+├─ utils/
+│  ├─ csv.js                        # CSV 预检和解析工具
+│  └─ csv.test.js                   # CSV 预检测试
+├─ components/AnalysisProgressPanel.test.js # 进度组件测试
 ├─ styles.css                      # 全局样式与响应式布局
 └─ main.js                         # Vue 应用入口
 ```
@@ -83,6 +90,26 @@ http://127.0.0.1:5173
 ```
 
 修改 Vue 文件后，Vite 会自动热更新。后端必须保持运行，否则页面会显示 API 离线。
+
+## 前端测试
+
+```powershell
+cd "E:\大学课程\竞赛\shichi_qianji_agent\frontend"
+& "E:\Tools\nodejs\npm.cmd" run test
+```
+
+测试目前覆盖：
+
+- CSV 分隔符识别、引号字段解析和上传前数据预检；
+- 分析任务从排队、运行到完成的轮询流程；
+- 后端失败状态的错误提示；
+- 分析进度面板的进度值、失败状态和取消按钮。
+
+开发过程中可以使用持续监听模式：
+
+```powershell
+& "E:\Tools\nodejs\npm.cmd" run test:watch
+```
 
 ## 生产构建
 
