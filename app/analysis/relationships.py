@@ -24,7 +24,9 @@ def analyze_event_relationships(
     """
 
     diagnostics: list[dict[str, Any]] = []
-    for event_index, event in enumerate(events[:8], start=1):
+    # 关系证据是本地分析结果的一部分，不能因为页面展示数量限制而丢掉后续事件。
+    # 前端和 HTTP 可视化层仍会按需截取，避免一次响应过大。
+    for event_index, event in enumerate(events, start=1):
         selected = [name for name in event.dominant_sensors if name in sensor_columns]
         if len(selected) < 2:
             selected = _expand_event_sensors(dataframe, sensor_columns, event, selected)

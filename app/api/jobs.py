@@ -26,6 +26,7 @@ class BackgroundJobManager:
     def __init__(self, max_workers: int, max_queue_size: int) -> None:
         if max_workers < 1 or max_queue_size < 0:
             raise ValueError("异步任务并发数至少为 1，队列长度不能为负数")
+        self._max_workers = max_workers
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="shichi-job",
@@ -73,6 +74,16 @@ class BackgroundJobManager:
         ]
         self._executor.shutdown(wait=True, cancel_futures=True)
         return cancelled_run_ids
+
+    def diagnostics(self) -> dict[str, int]:
+        """返回不包含任务内容的队列运行指标，供健康诊断接口使用。"""
+
+        with self._lock:
+            tracked_jobs = len(self._futures)
+        return {
+            "max_workers": self._max_workers,
+            "tracked_jobs": tracked_jobs,
+        }
 
     def _release(self, run_id: str, _future: Future[Any]) -> None:
         """任务结束后释放容量，并移除仅用于进程内管理的 Future。"""

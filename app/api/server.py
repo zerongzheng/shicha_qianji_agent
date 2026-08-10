@@ -10,6 +10,7 @@ import secrets
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from math import isfinite
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -44,7 +45,12 @@ from app.api.schemas import (
 )
 from app.api.wanwu_openapi import build_wanwu_openapi
 from app.config import get_settings
-from app.data.loader import _detect_delimiter, load_time_series
+from app.data.device_profiles import load_device_profiles
+from app.data.loader import (
+    _detect_delimiter,
+    load_time_series,
+    load_time_series_with_context,
+)
 from app.diagnosis import AutomaticDiagnosisService, diagnosis_to_dict
 from app.integrations import receive_wanwu_csv
 from app.model_store import list_autoencoder_models
@@ -137,6 +143,11 @@ def _parse_config(payload: dict[str, Any] | None) -> AnalysisConfig:
         settings.anomaly_threshold,
     )
     return AnalysisConfig(
+        device_profile_id=(
+            None
+            if not str(payload.get("device_profile_id", "")).strip()
+            else str(payload["device_profile_id"]).strip()
+        ),
         detector=detector,
         threshold=float(payload.get("threshold", default_threshold)),
         rolling_window=max(5, int(payload.get("rolling_window", settings.rolling_window))),
@@ -213,6 +224,7 @@ def _result_payload(run_id: str, result: Any) -> dict[str, Any]:
     return {
         "run_id": run_id,
         "status": "success",
+        "device_profile": result.device_context,
         "data_profile": {
             "source_name": result.profile.source_name,
             "row_count": result.profile.row_count,
@@ -278,6 +290,7 @@ def _result_payload(run_id: str, result: Any) -> dict[str, Any]:
         "forecast_results": result.forecast_results,
         "risk_alerts": result.risk_alerts,
         "recommendations": result.recommendations,
+        "execution_trace": [asdict(item) for item in result.execution_trace],
         "summary": summary,
         "limitations": [
             "预测模型由滚动回测自动选择，仍需结合现场工况、设备边界和人工复核确认。",
@@ -329,7 +342,7 @@ def _visualization_payload(
             number = float(value)
         except (TypeError, ValueError):
             return None
-        return round(number, 6) if number == number and abs(number) != float("inf") else None
+        return round(number, 6) if isfinite(number) else None
 
     timestamps = [
         item.isoformat() if hasattr(item, "isoformat") else str(item)
@@ -446,7 +459,8 @@ def _build_file_preflight(file_id: str, source_path: Path) -> dict[str, Any]:
     """读取受控 CSV 的真实画像，统一服务于默认样例和已上传文件。"""
 
     try:
-        dataframe = load_time_series(source_path)
+        loaded = load_time_series_with_context(source_path)
+        dataframe = loaded.dataframe
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -459,6 +473,8 @@ def _build_file_preflight(file_id: str, source_path: Path) -> dict[str, Any]:
         warnings.append(f"缺失率约 {missing_rate * 100:.1f}%，建议先检查数据完整性。")
     if profile.row_count < 100:
         warnings.append("数据行数少于 100，趋势预测和工况分段结果可能不稳定。")
+    if loaded.profile is None:
+        warnings.append("未匹配设备专属配置，当前将按通用工业时序数据进行分析。")
     return {
         "file_id": file_id,
         "file_name": source_path.name,
@@ -470,6 +486,7 @@ def _build_file_preflight(file_id: str, source_path: Path) -> dict[str, Any]:
         "datetime_column": "datetime",
         "sensor_count": len(profile.sensor_columns),
         "missing_rate": round(missing_rate, 6),
+        "device_profile": loaded.context,
         "warnings": warnings,
     }
 
@@ -825,6 +842,111 @@ if app:
 
         get_repository()
         return {"status": "ok", "service": "shichi-qianji", "database": "sqlite"}
+
+    @app.get("/api/v1/system/diagnostics")
+    def system_diagnostics() -> dict[str, Any]:
+        """返回部署自检摘要，不暴露密钥、绝对路径和业务数据。"""
+
+        knowledge_files = sorted(
+            path
+            for path in settings.knowledge_dir.glob("*")
+            if path.is_file() and path.suffix.lower() in {".md", ".txt"}
+        )
+        database_ready = False
+        device_profiles = {}
+        device_profile_error: str | None = None
+        try:
+            device_profiles = load_device_profiles(settings.device_profiles_dir)
+        except ValueError as exc:
+            device_profile_error = str(exc)
+        try:
+            get_repository()
+            database_ready = settings.database_path.parent.exists()
+        except (OSError, RuntimeError):
+            pass
+
+        checks = {
+            "database": "ok" if database_ready else "error",
+            "knowledge_base": "ok" if knowledge_files else "warning",
+            "default_skab": "ok" if settings.default_skab_file.exists() else "warning",
+            "healthy_baseline": "ok" if settings.healthy_baseline_file.exists() else "warning",
+            "device_profiles": (
+                "ok"
+                if any(profile.enabled for profile in device_profiles.values())
+                else "warning"
+            ),
+        }
+        warnings = []
+        if not knowledge_files:
+            warnings.append("未找到可检索的工业知识库文档")
+        if not settings.default_skab_file.exists():
+            warnings.append("默认 SKAB 样例不可用，仍可通过上传接口分析 CSV")
+        if not settings.healthy_baseline_file.exists():
+            warnings.append("健康基线不可用，部分 AutoEncoder 健康模型能力将降级")
+        if not settings.llm_enabled:
+            warnings.append("未配置大模型密钥，确定性工业分析仍可运行")
+        if device_profile_error:
+            warnings.append(f"设备配置读取失败：{device_profile_error}")
+        elif not any(profile.enabled for profile in device_profiles.values()):
+            warnings.append("未找到可启用的设备配置，上传数据将使用通用模式")
+
+        return {
+            "status": "ready" if checks["database"] == "ok" and not warnings else "degraded",
+            "service": "shichi-qianji",
+            "version": app.version,
+            "database": {"engine": "sqlite", "ready": database_ready},
+            "knowledge_base": {"ready": bool(knowledge_files), "document_count": len(knowledge_files)},
+            "data_sources": {
+                "default_skab_ready": settings.default_skab_file.exists(),
+                "healthy_baseline_ready": settings.healthy_baseline_file.exists(),
+            },
+            "device_profiles": {
+                "ready": bool(device_profiles) and device_profile_error is None,
+                "profile_count": len(device_profiles),
+                "enabled_count": sum(
+                    profile.enabled for profile in device_profiles.values()
+                ),
+                "profiles": [
+                    profile.public_summary() for profile in device_profiles.values()
+                ],
+            },
+            "model": {
+                "llm_enabled": settings.llm_enabled,
+                "embedding_enabled": settings.embedding_enabled,
+                "provider": settings.llm_provider,
+                "chat_model": settings.llm_chat_model,
+            },
+            "rate_limits": {
+                "chat_requests_per_minute": settings.llm_requests_per_minute,
+                "embedding_requests_per_minute": settings.embedding_requests_per_minute,
+            },
+            "job_queue": get_job_manager().diagnostics(),
+            "checks": checks,
+            "warnings": warnings,
+        }
+
+    @app.get("/api/v1/device-profiles")
+    def list_device_profiles(
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """返回可供前端或万悟选择的设备配置摘要，不返回本地路径。"""
+
+        _check_api_key(x_api_key)
+        try:
+            profiles = load_device_profiles(settings.device_profiles_dir)
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail=f"设备配置不可用：{exc}") from exc
+        selectable = [
+            profile.public_summary()
+            for profile in profiles.values()
+            if profile.enabled
+        ]
+        return {
+            "status": "success",
+            "profiles": selectable,
+            "count": len(selectable),
+            "generic_mode_available": True,
+        }
 
     @app.get("/api/v1/models")
     def list_models(
@@ -1509,14 +1631,14 @@ if app:
     @app.post("/api/v1/runs/{run_id}/archive")
     def archive_run(
         run_id: str,
-        payload: ArchiveRequest = ArchiveRequest(),
+        payload: ArchiveRequest | None = None,
         x_api_key: Annotated[str | None, Header()] = None,
     ) -> dict[str, Any]:
         """归档已结束的分析任务；归档只改变展示状态，不删除分析结果。"""
 
         _check_api_key(x_api_key)
         try:
-            run = get_repository().archive_run(run_id, payload.reason)
+            run = get_repository().archive_run(run_id, (payload or ArchiveRequest()).reason)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except LookupError as exc:
@@ -1540,14 +1662,17 @@ if app:
     @app.post("/api/v1/work-orders/{record_id}/archive")
     def archive_work_order(
         record_id: str,
-        payload: ArchiveRequest = ArchiveRequest(),
+        payload: ArchiveRequest | None = None,
         x_api_key: Annotated[str | None, Header()] = None,
     ) -> dict[str, Any]:
         """归档已完成或已关闭工单，并同步隐藏由它生成的历史案例。"""
 
         _check_api_key(x_api_key)
         try:
-            work_order = get_repository().archive_work_order(record_id, payload.reason)
+            work_order = get_repository().archive_work_order(
+                record_id,
+                (payload or ArchiveRequest()).reason,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except LookupError as exc:

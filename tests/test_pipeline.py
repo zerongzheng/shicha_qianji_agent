@@ -81,11 +81,51 @@ def test_pipeline_can_detect_injected_event(tmp_path, detector: str) -> None:
     assert result.operating_regimes.state_count >= 1
     assert not result.operating_regimes.suppression_applied
     assert result.detector_name
-    assert len(result.event_diagnoses) == len(result.events[:8])
+    assert len(result.event_diagnoses) == len(result.events)
     assert len(result.work_order_drafts) == len(result.event_diagnoses)
     assert "候选根因诊断" in result.to_summary()
     assert isinstance(result.to_summary()["评估指标"], dict)
     assert "工业时序诊断报告" in result.report_text
+
+
+def test_execution_trace_records_stable_automatic_chain(tmp_path) -> None:
+    """执行轨迹应记录真实步骤顺序，并明确标记被关闭的可选模块。"""
+
+    dataframe = pd.DataFrame(
+        {
+            "datetime": pd.date_range("2026-01-01", periods=100, freq="s"),
+            "Pressure": np.ones(100),
+            "Current": np.ones(100),
+        }
+    )
+    csv_path = tmp_path / "trace_sample.csv"
+    dataframe.to_csv(csv_path, sep=";", index=False)
+
+    result = analyze_file(
+        csv_path,
+        config=AnalysisConfig(detector="mad", threshold=8.0),
+        write_report=False,
+        run_forecast=False,
+        run_regime=False,
+    )
+
+    step_ids = [step.step_id for step in result.execution_trace]
+    assert step_ids == [
+        "data_ingestion",
+        "device_profile_match",
+        "data_profile",
+        "anomaly_detection",
+        "operating_regime",
+        "relationship_evidence",
+        "forecast_analysis",
+        "root_cause_diagnosis",
+        "work_order_generation",
+    ]
+    assert result.execution_trace[4].status == "skipped"
+    assert result.execution_trace[6].status == "skipped"
+    assert result.execution_trace[3].output_summary["event_count"] == 0
+    assert "智能体执行摘要" in result.to_summary()
+    assert "智能体执行链" in result.report_text
 
 
 def test_anomaly_free_file_receives_perfect_event_score() -> None:

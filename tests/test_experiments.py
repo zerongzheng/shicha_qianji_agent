@@ -9,6 +9,7 @@ import pandas as pd
 
 from app.analysis.detection import DETECTOR_RECOMMENDED_THRESHOLDS, apply_detection_threshold
 from app.api.server import _parse_config
+from app.experiments.protocol import build_protocol_manifest, write_protocol_artifacts
 from app.experiments.split import build_skab_split
 from app.experiments.tfr_ablation import TfrAblationRecord, select_tfr_candidate
 from app.experiments.tuning import ThresholdTrial, select_best_trial
@@ -163,3 +164,32 @@ def test_tfr_candidate_selection_rejects_low_recall_shortcut() -> None:
     )
 
     assert select_tfr_candidate([silent, reliable]) == reliable
+
+
+def test_protocol_manifest_records_disjoint_files_and_hashes(tmp_path: Path) -> None:
+    """实验协议应记录固定划分和文件指纹，确保后续结果可追溯。"""
+
+    for scenario, names in {
+        "anomaly-free": ["anomaly-free.csv"],
+        "valve1": ["0.csv", "1.csv"],
+    }.items():
+        scenario_dir = tmp_path / scenario
+        scenario_dir.mkdir()
+        for name in names:
+            (scenario_dir / name).write_text("datetime;anomaly\n2026-01-01;0\n", encoding="utf-8")
+
+    split = build_skab_split(tmp_path)
+    manifest = build_protocol_manifest(
+        tmp_path,
+        split,
+        selected_thresholds={"mad": 5.5},
+        detectors=("mad",),
+    )
+    assert manifest["counts"] == {"healthy": 1, "validation": 1, "test": 1, "total": 3}
+    assert len(manifest["files"][0]["sha256"]) == 64
+    assert manifest["frozen_thresholds"]["mad"] == 5.5
+
+    json_path, markdown_path = write_protocol_artifacts(manifest, tmp_path / "out")
+    assert json_path.exists()
+    assert markdown_path.exists()
+    assert "文件校验清单" in markdown_path.read_text(encoding="utf-8")

@@ -14,7 +14,7 @@ from statistics import mean
 from zoneinfo import ZoneInfo
 
 from app.config import get_settings
-from app.experiments.benchmark import run_skab_benchmark
+from app.experiments.protocol import build_protocol_manifest, write_protocol_artifacts
 from app.experiments.split import build_skab_split
 from app.experiments.tuning import tune_and_evaluate
 
@@ -27,6 +27,9 @@ class CompetitionReport:
     csv_path: Path
     benchmark_path: Path
     split_path: Path
+    protocol_json_path: Path
+    protocol_markdown_path: Path
+    effectiveness_csv_path: Path
 
 
 def build_competition_report(
@@ -51,16 +54,13 @@ def build_competition_report(
     target_dir.mkdir(parents=True, exist_ok=True)
 
     split = build_skab_split(root)
+    selected_thresholds: dict[str, float] = {}
     if rerun_experiments:
         tuning = tune_and_evaluate(root, output_dir=target_dir)
-        benchmark = run_skab_benchmark(
-            root,
-            files=split.test_files,
-            thresholds=tuning.selected_thresholds,
-            output_dir=target_dir,
-            report_prefix="competition_independent_test",
-        )
-        benchmark_path = benchmark.report_path
+        selected_thresholds = tuning.selected_thresholds
+        # 阈值调优函数已经使用冻结参数完成独立测试，这里直接复用结果，
+        # 避免生成竞赛汇总时把同一套模型重复运行一遍。
+        benchmark_path = tuning.test_benchmark.report_path
         split_path = tuning.split_csv_path
     else:
         # 成果包和普通 competition-report 可能使用不同的文件前缀；先复用已有
@@ -73,6 +73,7 @@ def build_competition_report(
         split_path = _latest_file(target_dir, "data_split_*.csv")
         if benchmark_path is None or split_path is None:
             tuning = tune_and_evaluate(root, output_dir=target_dir)
+            selected_thresholds = tuning.selected_thresholds
             benchmark_path = tuning.test_benchmark.report_path
             split_path = tuning.split_csv_path
 
@@ -83,6 +84,21 @@ def build_competition_report(
     evaluation_path = target_dir / "FINAL_EVALUATION.md"
     comparison_path = target_dir / "CAPABILITY_COMPARISON.md"
     summary_rows = _summarize(records)
+    if not selected_thresholds:
+        selected_thresholds = _thresholds_from_records(records)
+    protocol = build_protocol_manifest(
+        root,
+        split,
+        selected_thresholds=selected_thresholds,
+        detectors=tuple(sorted({record["detector"] for record in records})),
+    )
+    protocol_json_path, protocol_markdown_path = write_protocol_artifacts(
+        protocol,
+        target_dir,
+    )
+    effectiveness_rows = _build_effectiveness_rows(summary_rows)
+    effectiveness_csv_path = target_dir / "skab_competition_effectiveness.csv"
+    _write_effectiveness_csv(effectiveness_csv_path, effectiveness_rows)
     _write_csv(csv_path, summary_rows)
     _write_final_evaluation(
         evaluation_path,
@@ -98,10 +114,28 @@ def build_competition_report(
         encoding="utf-8",
     )
     report_path.write_text(
-        _build_report(root, split, records, summary_rows, benchmark_path, split_path),
+        _build_report(
+            root,
+            split,
+            records,
+            summary_rows,
+            benchmark_path,
+            split_path,
+            effectiveness_rows,
+            protocol_json_path,
+            protocol_markdown_path,
+        ),
         encoding="utf-8",
     )
-    return CompetitionReport(report_path, csv_path, benchmark_path, split_path)
+    return CompetitionReport(
+        report_path,
+        csv_path,
+        benchmark_path,
+        split_path,
+        protocol_json_path,
+        protocol_markdown_path,
+        effectiveness_csv_path,
+    )
 
 
 def _write_final_evaluation(
@@ -301,6 +335,9 @@ def _build_report(
     rows: list[dict[str, object]],
     benchmark_path: Path,
     split_path: Path,
+    effectiveness_rows: list[dict[str, object]],
+    protocol_json_path: Path,
+    protocol_markdown_path: Path,
 ) -> str:
     """生成中文校赛报告，明确实验边界，避免夸大为企业实测成效。"""
 
@@ -323,6 +360,7 @@ def _build_report(
         f"- 健康文件数：{len(getattr(split, 'healthy_files', []))}",
         f"- 验证文件数：{len(getattr(split, 'validation_files', []))}",
         f"- 独立测试文件数：{len(getattr(split, 'test_files', []))}",
+        f"- 实验协议：`{protocol_markdown_path}`",
         "",
         "## 二、独立测试模型对比",
         "",
@@ -336,26 +374,129 @@ def _build_report(
             f"{row['false_positive_events']:.2f} | {row['inference_seconds']:.4f} |"
         )
 
-    best_event = max(model_rows, key=lambda row: (row["event_f1"], row["event_recall"]))
     lines.extend(
         [
             "",
-            "## 三、校赛阶段结论",
+            "## 三、相对基线的成效",
             "",
-            f"- 按事件级 F1 排名，当前综合推荐检测器为：**{best_event['detector_name']}**。",
+            "> 这里的“提升”是相对 SKAB 独立测试中的 MAD 基线计算，不是企业现场提升率。",
+            "",
+            "| 模型 | 事件级 F1 | 相对 MAD | 事件召回 | 点级 F1 | 平均误报事件 | 单文件耗时/秒 |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for row in effectiveness_rows:
+        lines.append(
+            f"| {row['detector_name']} | {row['event_f1']:.4f} | "
+            f"{_format_delta(row['event_f1_delta_vs_mad'])} | {row['event_recall']:.4f} | "
+            f"{row['point_f1']:.4f} | {row['false_positive_events']:.2f} | "
+            f"{row['inference_seconds']:.4f} |"
+        )
+    best_event = max(model_rows, key=lambda row: (row["event_f1"], row["event_recall"]))
+    main_model = next(
+        (
+            row
+            for row in model_rows
+            if str(row["detector"]) == "time_frequency_relation"
+        ),
+        best_event,
+    )
+    lines.extend(
+        [
+            "",
+            "## 四、校赛阶段结论",
+            "",
+            f"- 按事件级 F1 单指标，当前测试集最高的是：**{best_event['detector_name']}**（{best_event['event_f1']:.4f}）。",
+            (
+                f"- 竞赛演示主模型采用{main_model['detector_name']}：它在当前测试集的事件召回为 "
+                f"{main_model['event_recall']:.4f}，并同时输出时域偏离、频域变化和测点关系证据；"
+                "MAD 作为稳定告警基线保留。"
+            ),
             "- 评价重点应放在完整异常事件是否被发现、误报事件数量和检测延迟，而不能只看点级准确率。",
             "- 当前结果证明时察千机已经具备从原始时序到风险事件和运维建议的可运行流程。",
             "- 当前结果不代表联通企业设备现场效果；企业数据到位后仍需重新建立健康基线、校准阈值并做独立验证。",
             "",
-            "## 四、下一步校赛工作",
+            "## 五、下一步校赛工作",
             "",
             "1. 选取 2 至 3 个典型 SKAB 异常文件，制作原始曲线、异常分数、事件区间和传感器贡献图。",
             "2. 固定推荐检测器和参数，页面、命令行、API 使用同一份配置。",
             "3. 完成 Streamlit 的设备健康总览和一键报告演示。",
             "4. 整理设备数据协议、知识库资料模板和现场反馈字段，为后续企业数据接入预留接口。",
+            "",
+            "## 六、复现文件",
+            "",
+            f"- 机器可读实验协议：`{protocol_json_path}`",
+            f"- 中文实验协议：`{protocol_markdown_path}`",
+            "- 逐文件独立测试结果和汇总 CSV 与本报告位于同一目录。",
         ]
     )
     return "\n".join(lines) + "\n"
+
+
+def _thresholds_from_records(records: list[dict[str, str]]) -> dict[str, float]:
+    """从独立测试明细中恢复冻结阈值，兼容历史实验产物。"""
+
+    thresholds: dict[str, float] = {}
+    for record in records:
+        detector = record["detector"]
+        if detector not in thresholds and record.get("threshold") not in {None, ""}:
+            thresholds[detector] = float(record["threshold"])
+    return thresholds
+
+
+def _build_effectiveness_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    """生成可直接放进竞赛 PPT 的模型成效表。"""
+
+    model_rows = _summarize_by_model(rows)
+    baseline = next(
+        (row for row in model_rows if str(row["detector"]) == "mad"),
+        None,
+    )
+    baseline_event_f1 = float(baseline["event_f1"]) if baseline else 0.0
+    output: list[dict[str, object]] = []
+    for row in model_rows:
+        event_f1 = float(row["event_f1"])
+        output.append(
+            {
+                "detector": row["detector"],
+                "detector_name": row["detector_name"],
+                "file_count": row["file_count"],
+                "event_f1": event_f1,
+                # 保留 6 位小数，避免浮点误差污染 CSV、报告和测试断言。
+                "event_f1_delta_vs_mad": round(event_f1 - baseline_event_f1, 6),
+                "event_recall": row["event_recall"],
+                "point_f1": row["point_f1"],
+                "false_positive_events": row["false_positive_events"],
+                "inference_seconds": row["inference_seconds"],
+            }
+        )
+    return output
+
+
+def _write_effectiveness_csv(path: Path, rows: list[dict[str, object]]) -> None:
+    """保存竞赛成效表，使用 UTF-8 BOM 方便直接用 Excel 打开。"""
+
+    fields = [
+        "detector",
+        "detector_name",
+        "file_count",
+        "event_f1",
+        "event_f1_delta_vs_mad",
+        "event_recall",
+        "point_f1",
+        "false_positive_events",
+        "inference_seconds",
+    ]
+    with path.open("w", encoding="utf-8-sig", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _format_delta(value: object) -> str:
+    """将相对基线差值格式化为百分数文本。"""
+
+    return f"{float(value):+.2%}"
 
 
 def _summarize_by_model(rows: list[dict[str, object]]) -> list[dict[str, object]]:

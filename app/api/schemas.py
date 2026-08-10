@@ -32,6 +32,13 @@ class StrictApiModel(BaseModel):
 class AnalysisConfigRequest(StrictApiModel):
     """一次分析可覆盖的算法参数；空值继续使用服务端推荐配置。"""
 
+    device_profile_id: str | None = Field(
+        default=None,
+        min_length=2,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9_-]+$",
+        description="可选设备配置编号；不填写时根据 CSV 表头自动匹配",
+    )
     detector: DetectorName | None = None
     threshold: float | None = Field(default=None, gt=0, le=100)
     rolling_window: int | None = Field(default=None, ge=5, le=2001)
@@ -80,6 +87,8 @@ class AnalysisResponse(StrictApiModel):
 
     run_id: str
     status: Literal["success"]
+    # 旧数据库中的历史结果没有设备配置字段，默认空对象保证升级后仍可查看。
+    device_profile: dict[str, Any] = Field(default_factory=dict)
     data_profile: dict[str, Any]
     data_quality: dict[str, Any] | None = None
     detector: str
@@ -93,6 +102,8 @@ class AnalysisResponse(StrictApiModel):
     forecast_results: dict[str, Any]
     risk_alerts: list[dict[str, Any]]
     recommendations: list[str]
+    # 旧数据库结果没有执行轨迹，默认空列表保证历史任务仍能正常打开。
+    execution_trace: list[dict[str, Any]] = Field(default_factory=list)
     summary: dict[str, Any]
     limitations: list[str]
     automatic_diagnosis: dict[str, Any] | None = None
@@ -120,6 +131,7 @@ class FilePreflightResponse(StrictApiModel):
     datetime_column: str
     sensor_count: int
     missing_rate: float
+    device_profile: dict[str, Any]
     warnings: list[str]
 
 

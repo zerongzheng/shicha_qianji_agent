@@ -17,8 +17,8 @@ import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime
 from dataclasses import asdict
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -449,7 +449,14 @@ class IndustrialRepository:
             include_archived=include_archived,
             archived_only=archived_only,
         )
-        query = "SELECT w.* FROM work_orders AS w JOIN analysis_runs AS r ON r.run_id = w.run_id"
+        # 同时取出分析任务文件名，让前端能区分同标题但来自不同数据文件的工单。
+        query = (
+            "SELECT w.*, f.file_name AS source_file_name, "
+            "r.started_at AS source_run_started_at "
+            "FROM work_orders AS w "
+            "JOIN analysis_runs AS r ON r.run_id = w.run_id "
+            "JOIN uploaded_files AS f ON f.file_id = r.file_id"
+        )
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
         query += (
@@ -943,9 +950,17 @@ def _analysis_result_record(run_id: str, result: Any) -> dict[str, Any]:
 def _work_order_record(row: sqlite3.Row) -> dict[str, Any]:
     """反序列化工单中的列表字段。"""
 
+    # 列表查询会联表返回来源信息；更新单条工单的旧查询只返回 work_orders 本身，
+    # 因此这里用兼容读取，避免为了展示字段破坏已有的更新、归档和恢复逻辑。
+    row_keys = set(row.keys())
+
     return {
         "record_id": row["record_id"],
         "run_id": row["run_id"],
+        "source_file_name": row["source_file_name"] if "source_file_name" in row_keys else None,
+        "source_run_started_at": (
+            row["source_run_started_at"] if "source_run_started_at" in row_keys else None
+        ),
         "work_order_id": row["source_work_order_id"],
         "event_number": row["event_number"],
         "priority": row["priority"],

@@ -7,22 +7,114 @@
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
 const API_KEY = import.meta.env.VITE_API_KEY || "";
+const REQUEST_TIMEOUT_MS = Number(import.meta.env.VITE_API_TIMEOUT_MS || 30000);
+const MAX_GET_RETRIES = 2;
 
-async function request(path, options = {}) {
-  const headers = new Headers(options.headers || {});
-  if (API_KEY) headers.set("X-API-Key", API_KEY);
-  const response = await fetch(`${API_BASE_URL}${path}`, { ...options, headers });
-  const contentType = response.headers.get("content-type") || "";
-  const payload = contentType.includes("application/json") ? await response.json() : await response.text();
-  if (!response.ok) {
-    const detail = typeof payload === "object" ? payload.detail || payload.message : payload;
-    throw new Error(detail || `请求失败：${response.status}`);
-  }
-  return payload;
+function isRetryableStatus(status) {
+  return [408, 425, 429].includes(status) || status >= 500;
 }
 
-export function health() {
-  return request("/health");
+function retryDelay(response, retryIndex) {
+  const retryAfter = Number(response?.headers?.get("Retry-After"));
+  if (Number.isFinite(retryAfter) && retryAfter >= 0) {
+    return Math.min(retryAfter * 1000, 5000);
+  }
+  return Math.min(600 * (2 ** retryIndex), 3000);
+}
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+async function request(path, options = {}) {
+  const method = String(options.method || "GET").toUpperCase();
+  const canRetry = ["GET", "HEAD"].includes(method);
+  const timeoutMs = Number(options.timeoutMs || REQUEST_TIMEOUT_MS);
+  const { timeoutMs: _timeoutOption, ...fetchOptions } = options;
+
+  for (let retryIndex = 0; retryIndex <= (canRetry ? MAX_GET_RETRIES : 0); retryIndex += 1) {
+    const headers = new Headers(fetchOptions.headers || {});
+    if (API_KEY) headers.set("X-API-Key", API_KEY);
+    const controller = new AbortController();
+    let timedOut = false;
+    let timeoutId = null;
+    let externalAbortHandler = null;
+
+    if (fetchOptions.signal) {
+      if (fetchOptions.signal.aborted) controller.abort(fetchOptions.signal.reason);
+      externalAbortHandler = () => controller.abort(fetchOptions.signal.reason);
+      fetchOptions.signal.addEventListener("abort", externalAbortHandler, { once: true });
+    }
+
+    if (timeoutMs > 0) {
+      timeoutId = window.setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, timeoutMs);
+    }
+
+    try {
+      const response = await fetch(`${API_BASE_URL}${path}`, {
+        ...fetchOptions,
+        method,
+        headers,
+        signal: controller.signal,
+      });
+
+      if (!response.ok && canRetry && retryIndex < MAX_GET_RETRIES && isRetryableStatus(response.status)) {
+        await sleep(retryDelay(response, retryIndex));
+        continue;
+      }
+
+      const contentType = response.headers.get("content-type") || "";
+      let payload;
+      try {
+        payload = contentType.includes("application/json")
+          ? await response.json()
+          : await response.text();
+      } catch {
+        payload = "服务端返回了无法解析的响应";
+      }
+      if (!response.ok) {
+        const detail = typeof payload === "object" ? payload.detail || payload.message : payload;
+        if (response.status === 429) {
+          throw new Error(detail || "请求过于频繁，请稍后再试。系统会自动控制请求频率。");
+        }
+        throw new Error(detail || `请求失败：${response.status}`);
+      }
+      return payload;
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        if (timedOut) {
+          const seconds = Math.max(1, Math.ceil(timeoutMs / 1000));
+          throw new Error(`请求超时（${seconds} 秒），请检查后端服务或网络连接。`);
+        }
+        throw new Error("请求已取消。");
+      }
+      const shouldRetry = canRetry && retryIndex < MAX_GET_RETRIES && (
+        error instanceof TypeError || /网络|超时|连接/i.test(error?.message || "")
+      );
+      if (shouldRetry) {
+        await sleep(Math.min(600 * (2 ** retryIndex), 3000));
+        continue;
+      }
+      throw error;
+    } finally {
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+      if (externalAbortHandler && fetchOptions.signal) {
+        fetchOptions.signal.removeEventListener("abort", externalAbortHandler);
+      }
+    }
+  }
+}
+
+export function health(options = {}) {
+  return request("/health", options);
+}
+
+// 获取后端已启用的设备配置，供分析前选择；接口不返回企业文件和本地路径。
+export function listDeviceProfiles() {
+  return request("/api/v1/device-profiles");
 }
 
 export function uploadCsv(file) {

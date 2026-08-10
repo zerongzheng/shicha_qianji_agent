@@ -78,6 +78,7 @@ def test_api_module_is_importable() -> None:
         pytest.skip("当前环境未安装 FastAPI")
     paths = {route.path for route in server.app.routes}
     assert "/health" in paths
+    assert "/api/v1/system/diagnostics" in paths
     assert "/api/v1/models" in paths
     assert "/api/v1/files" in paths
     assert "/api/v1/files/{file_id}/preflight" in paths
@@ -93,6 +94,40 @@ def test_api_module_is_importable() -> None:
     assert "/api/v1/work-orders/{record_id}" in paths
     assert "/api/v1/model-compare" in paths
     assert "/api/v1/forecast-compare" in paths
+
+
+def test_system_diagnostics_does_not_expose_local_paths() -> None:
+    """系统诊断应能用于部署检查，但不能泄露本机路径或密钥。"""
+
+    server = pytest.importorskip("app.api.server")
+    if server.app is None:
+        pytest.skip("当前环境未安装 FastAPI")
+    from fastapi.testclient import TestClient
+
+    response = TestClient(server.app).get("/api/v1/system/diagnostics")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["service"] == "shichi-qianji"
+    assert "checks" in payload
+    assert "warnings" in payload
+    assert "project_root" not in str(payload)
+    assert "api_key" not in str(payload).lower()
+    assert "device_profiles" in payload
+
+
+def test_device_profile_endpoint_exposes_only_enabled_profiles() -> None:
+    """前端选择器只能看到可用配置，企业模板不会被误选。"""
+
+    server = pytest.importorskip("app.api.server")
+    if server.app is None:
+        pytest.skip("当前环境未安装 FastAPI")
+    from fastapi.testclient import TestClient
+
+    response = TestClient(server.app).get("/api/v1/device-profiles")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["generic_mode_available"] is True
+    assert {item["profile_id"] for item in payload["profiles"]} == {"skab_valve"}
 
 
 def test_api_payload_exposes_root_causes_and_work_orders(tmp_path) -> None:
@@ -129,6 +164,8 @@ def test_api_payload_exposes_root_causes_and_work_orders(tmp_path) -> None:
     assert payload["root_cause_diagnoses"]
     assert payload["work_order_drafts"]
     assert payload["work_order_drafts"][0]["record_id"].startswith("run_test:")
+    assert payload["execution_trace"]
+    assert payload["execution_trace"][0]["step_id"] == "data_ingestion"
 
 
 def test_openapi_exposes_wanwu_job_contract() -> None:

@@ -55,7 +55,9 @@ def diagnose_root_causes(
     diagnoses: list[EventDiagnosis] = []
     work_orders: list[WorkOrderDraft] = []
     historical_matches: dict[int, list[HistoricalCaseMatch]] = {}
-    for event_number, event in enumerate(events[:8], start=1):
+    # 本地诊断和工单属于确定性业务结果，应覆盖全部异常事件。
+    # 面向大模型的摘要会在 AnalysisResult.to_summary() 中单独限量，避免把两个边界混在一起。
+    for event_number, event in enumerate(events, start=1):
         sensor_changes = _event_sensor_changes(dataframe, sensor_columns, event)
         regime_context = str(
             regime_map.get(event_number, {}).get("工况判断", "未执行工况归因")

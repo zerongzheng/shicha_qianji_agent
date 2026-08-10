@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -94,6 +95,8 @@ def test_repository_archives_run_and_creates_work_order(tmp_path: Path) -> None:
     work_orders = repository.list_work_orders(run_id=run_id)
     assert len(work_orders) == 1
     assert work_orders[0]["record_id"] == f"{run_id}:WO-E001-000010"
+    assert work_orders[0]["source_file_name"] == "sample.csv"
+    assert work_orders[0]["source_run_started_at"]
     assert work_orders[0]["actions"] == ["核对阀门开度", "复测压力与流量"]
 
     reused = repository.find_successful_run(
@@ -336,7 +339,7 @@ def test_repository_records_local_analysis_result(tmp_path: Path) -> None:
     class Profile:
         source_name = "local.csv"
         row_count = 1
-        sensor_columns = ["Pressure"]
+        sensor_columns: ClassVar[list[str]] = ["Pressure"]
         missing_total = 0
         start_time = "2026-01-01"
         end_time = "2026-01-01"
@@ -348,14 +351,14 @@ def test_repository_records_local_analysis_result(tmp_path: Path) -> None:
         source_path = csv_path
         detector_name = "mad"
         profile = Profile()
-        events = []
+        events: ClassVar[list[object]] = []
         operating_regimes = None
-        relationship_diagnostics = []
-        event_diagnoses = []
-        work_order_drafts = []
-        forecast_results = {}
-        risk_alerts = []
-        recommendations = []
+        relationship_diagnostics: ClassVar[list[object]] = []
+        event_diagnoses: ClassVar[list[object]] = []
+        work_order_drafts: ClassVar[list[object]] = []
+        forecast_results: ClassVar[dict[str, object]] = {}
+        risk_alerts: ClassVar[list[object]] = []
+        recommendations: ClassVar[list[str]] = []
 
         @staticmethod
         def to_summary() -> dict[str, object]:

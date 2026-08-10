@@ -21,6 +21,8 @@ TFR_RECOMMENDED_RELATION_WEIGHT = 0.33
 class AnalysisConfig:
     """一次分析任务使用的算法参数。"""
 
+    # 为空时根据 CSV 表头自动匹配；显式指定时严格执行对应字段契约。
+    device_profile_id: str | None = None
     detector: str = "time_frequency_relation"
     threshold: float = 4.5
     rolling_window: int = 61
@@ -199,6 +201,25 @@ class HistoricalCaseMatch:
     closed_at: str
 
 
+@dataclass(frozen=True)
+class ExecutionTraceStep:
+    """智能体一次确定性分析步骤的可审计记录。
+
+    这里只保存模块调用事实、输入输出摘要和使用边界，不记录大模型思维过程，也不复制
+    原始工业数据。这样既能向前端和报告说明系统自动完成了什么，也便于后续定位问题。
+    """
+
+    step_id: str
+    title: str
+    module: str
+    status: str
+    input_summary: dict[str, Any]
+    output_summary: dict[str, Any]
+    automatic: bool = True
+    duration_seconds: float | None = None
+    limitation: str = ""
+
+
 @dataclass
 class AnalysisResult:
     """完整分析任务的输出，也是页面、报告和 Agent 的共同数据源。"""
@@ -214,6 +235,7 @@ class AnalysisResult:
     metrics: EvaluationMetrics | None
     trend_summary: dict[str, dict[str, Any]]
     recommendations: list[str]
+    device_context: dict[str, Any] = field(default_factory=dict)
     operating_regimes: OperatingRegimeResult | None = None
     relationship_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     forecast_results: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -223,6 +245,7 @@ class AnalysisResult:
     historical_case_matches: dict[int, list[HistoricalCaseMatch]] = field(
         default_factory=dict
     )
+    execution_trace: list[ExecutionTraceStep] = field(default_factory=list)
     report_text: str = ""
 
     def to_summary(self) -> dict[str, Any]:
@@ -230,11 +253,15 @@ class AnalysisResult:
 
         return {
             "数据文件": self.profile.source_name,
+            "设备配置": self.device_context,
             "检测器": self.detector_name,
             "数据点数": self.profile.row_count,
             "传感器数量": len(self.profile.sensor_columns),
             "时间范围": f"{self.profile.start_time} 至 {self.profile.end_time}",
             "异常事件数": len(self.events),
+            "候选根因诊断数": len(self.event_diagnoses),
+            "处置工单草案数": len(self.work_order_drafts),
+            "智能体执行摘要": _execution_trace_summary(self.execution_trace),
             "最高风险等级": self.events[0].severity if self.events else "未发现明显异常",
             "重点异常传感器": _top_sensors(self.events),
             "评估指标": (
@@ -262,11 +289,38 @@ class AnalysisResult:
                 str(event_number): [asdict(item) for item in matches[:3]]
                 for event_number, matches in self.historical_case_matches.items()
             },
+            # 工单完整结果仍由 API 和数据库保存；摘要只取前 8 条，避免大模型提示词过长。
             "处置工单草案": [asdict(item) for item in self.work_order_drafts[:8]],
+            "摘要截取说明": (
+                f"处置工单草案展示前 {min(8, len(self.work_order_drafts))} 条，"
+                f"完整总数为 {len(self.work_order_drafts)} 条。"
+            ),
             "预测结果": _forecast_overview(self.forecast_results),
             "风险预警": self.risk_alerts,
             "运维建议": self.recommendations,
         }
+
+
+def _execution_trace_summary(
+    execution_trace: list[ExecutionTraceStep],
+) -> dict[str, Any]:
+    """只向大模型提供步骤状态和核心产出，避免扩大提示词或泄露原始输入。"""
+
+    completed = [step for step in execution_trace if step.status == "completed"]
+    skipped = [step.title for step in execution_trace if step.status == "skipped"]
+    return {
+        "步骤总数": len(execution_trace),
+        "自动完成数": len(completed),
+        "跳过步骤": skipped,
+        "执行结果": [
+            {
+                "步骤": step.title,
+                "状态": step.status,
+                "核心输出": step.output_summary,
+            }
+            for step in execution_trace
+        ],
+    }
 
 
 def _event_diagnosis_summary(diagnosis: EventDiagnosis) -> dict[str, Any]:

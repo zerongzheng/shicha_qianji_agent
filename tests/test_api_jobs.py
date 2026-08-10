@@ -33,6 +33,26 @@ def test_job_request_rejects_unknown_fields_and_invalid_threshold() -> None:
         )
 
 
+def test_job_request_accepts_explicit_device_profile() -> None:
+    """设备配置编号属于分析配置的一部分，能够随任务一起传递。"""
+
+    request = JobCreateRequest.model_validate(
+        {
+            "file_id": "file_12345678",
+            "config": {"device_profile_id": "skab_valve"},
+        }
+    )
+    assert request.config.device_profile_id == "skab_valve"
+
+    generic_request = JobCreateRequest.model_validate(
+        {
+            "file_id": "file_12345678",
+            "config": {"device_profile_id": "generic"},
+        }
+    )
+    assert generic_request.config.device_profile_id == "generic"
+
+
 def test_background_job_manager_rejects_when_capacity_is_full() -> None:
     """并发槽位和排队容量占满后，新任务应立即失败而不是无限堆积。"""
 

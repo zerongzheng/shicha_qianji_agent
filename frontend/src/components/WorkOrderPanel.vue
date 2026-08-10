@@ -20,6 +20,9 @@ defineProps({
   workOrderSearch: { type: String, default: "" },
   workOrderStatusFilter: { type: String, default: "" },
   workOrderPriorityFilter: { type: String, default: "" },
+  currentWorkOrderOnly: { type: Boolean, default: false },
+  currentRunId: { type: String, default: "" },
+  currentSourceFile: { type: String, default: "" },
   feedback: { type: Object, required: true },
   feedbackNotice: { type: Object, default: null },
   savingFeedback: { type: Boolean, default: false },
@@ -36,6 +39,7 @@ const emit = defineEmits([
   "update:workOrderSearch",
   "update:workOrderStatusFilter",
   "update:workOrderPriorityFilter",
+  "toggle-current-scope",
   "select-order",
   "restore-order",
   "change-page",
@@ -59,7 +63,7 @@ const emit = defineEmits([
     </div>
 
     <div class="work-export-toolbar">
-      <span>当前筛选结果：{{ workOrderTotal }} 条 · 第 {{ workOrderPage }} / {{ workOrderPageCount }} 页</span>
+      <span>{{ currentWorkOrderOnly ? "本次分析工单" : "全部历史工单" }}：{{ workOrderTotal }} 条 · 第 {{ workOrderPage }} / {{ workOrderPageCount }} 页</span>
       <div class="work-toolbar-actions">
         <button class="secondary-button" :disabled="workOrdersLoading" @click="emit('refresh')">
           {{ workOrdersLoading ? "刷新中..." : "刷新工单" }}
@@ -70,7 +74,28 @@ const emit = defineEmits([
 
     <div class="two-column work-layout">
       <div class="panel">
-        <div class="panel-header"><h2>{{ showArchived ? "归档工单" : "工单队列" }}</h2><span>{{ workOrdersLoading ? "加载中..." : `${workOrders.length} / ${workOrderTotal} 条` }}</span></div>
+        <div class="panel-header work-list-header"><div><h2>{{ showArchived ? "归档工单" : "工单队列" }}</h2><span>{{ workOrdersLoading ? "加载中..." : `${workOrders.length} / ${workOrderTotal} 条` }}</span></div></div>
+        <div class="work-order-scope-bar">
+          <div class="scope-copy">
+            <strong>工单范围</strong>
+            <span v-if="currentWorkOrderOnly">当前数据：{{ currentSourceFile || "本次上传数据" }}</span>
+            <span v-else>包含此前分析任务产生的历史工单</span>
+          </div>
+          <div class="scope-switch" role="group" aria-label="工单范围">
+            <button
+              class="scope-option"
+              :class="{ active: !currentWorkOrderOnly }"
+              @click="currentWorkOrderOnly && emit('toggle-current-scope')"
+            >全部工单</button>
+            <button
+              class="scope-option current"
+              :class="{ active: currentWorkOrderOnly }"
+              :disabled="!currentRunId"
+              :title="currentRunId ? `仅显示任务 ${currentRunId} 的工单` : '请先完成一次分析'"
+              @click="!currentWorkOrderOnly && currentRunId && emit('toggle-current-scope')"
+            >仅看本次分析</button>
+          </div>
+        </div>
         <div class="work-order-filters sticky-filters">
           <input :value="workOrderSearch" class="control-input" placeholder="搜索工单编号、标题或责任角色" @input="emit('update:workOrderSearch', $event.target.value)" />
           <select :value="workOrderStatusFilter" class="control-input" @change="emit('update:workOrderStatusFilter', $event.target.value)"><option value="">全部状态</option><option>待确认</option><option>已确认</option><option>处理中</option><option>待验证</option><option>已完成</option><option>已关闭</option></select>
@@ -80,7 +105,12 @@ const emit = defineEmits([
         <div v-if="workOrdersLoading" class="panel-loading compact-loading">正在加载工单...</div>
         <template v-else>
           <div v-for="order in workOrders" :key="order.record_id" class="work-order-row" :class="{ selected: selectedWorkOrder?.record_id === order.record_id }" tabindex="0" role="button" @click="emit('select-order', order)" @keydown.enter="emit('select-order', order)">
-            <span class="priority">{{ order.priority }}</span><span><b>{{ order.title }}</b><small>{{ order.status }} · {{ order.assigned_role }}</small></span>
+            <span class="priority">{{ order.priority }}</span>
+            <span class="work-order-row-main">
+              <b>{{ order.title }}</b>
+              <small>{{ order.status }} · {{ order.assigned_role }}</small>
+              <em :title="order.run_id">来源：{{ order.source_file_name || "历史分析任务" }}</em>
+            </span>
             <button v-if="showArchived" class="row-action" title="恢复工单" @click.stop="emit('restore-order', order)">恢复</button>
           </div>
           <div v-if="!workOrders.length" class="panel-empty">{{ workOrderTotal ? "没有符合条件的工单" : (showArchived ? "暂无归档工单" : "暂无工单") }}</div>
@@ -93,7 +123,7 @@ const emit = defineEmits([
           <div class="panel-header"><h2>工单详情与现场反馈</h2><span>{{ selectedWorkOrder.record_id }}</span></div>
           <div v-if="workOrderLoading" class="panel-loading">正在加载所属任务的异常证据...</div>
           <div v-else class="work-order-detail">
-            <div class="work-order-summary"><span class="priority large">{{ selectedWorkOrder.priority }}</span><div><h3>{{ selectedWorkOrder.title }}</h3><p>{{ selectedWorkOrder.assigned_role }} · 所属任务 {{ selectedWorkOrder.run_id }}</p></div></div>
+            <div class="work-order-summary"><span class="priority large">{{ selectedWorkOrder.priority }}</span><div><h3>{{ selectedWorkOrder.title }}</h3><p>{{ selectedWorkOrder.assigned_role }} · 来源文件 {{ selectedWorkOrder.source_file_name || "历史分析任务" }}</p><small class="source-run-detail">分析任务：{{ selectedWorkOrder.run_id }}</small></div></div>
             <div class="status-timeline" aria-label="工单处理进度">
               <div v-for="(step, index) in statusSteps" :key="step" class="status-step" :class="{ current: selectedWorkOrder.status === step, complete: statusSteps.indexOf(selectedWorkOrder.status) > index }">
                 <span class="status-step-marker">{{ statusSteps.indexOf(selectedWorkOrder.status) > index ? "✓" : index + 1 }}</span>

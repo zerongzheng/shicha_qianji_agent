@@ -13,17 +13,41 @@ from typing import BinaryIO
 
 import pandas as pd
 
+from app.data.device_profiles import (
+    LoadedTimeSeries,
+    apply_device_profile,
+    build_device_context,
+    select_device_profile,
+)
+
 TIME_COLUMN_CANDIDATES = ("datetime", "timestamp", "time", "date")
 LABEL_COLUMNS = {"anomaly", "changepoint", "label", "target"}
 
 
-def load_time_series(file_path: str | Path) -> pd.DataFrame:
+def load_time_series(
+    file_path: str | Path,
+    device_profile_id: str | None = None,
+) -> pd.DataFrame:
     """读取并标准化一份工业时序 CSV。
 
     返回的数据满足三个约定：
     1. 时间列统一命名为 `datetime`，并按时间升序排列；
     2. 传感器和标签列尽量转换为数值；
     3. 重复时间点只保留最后一条，防止评估和画图出现位置错乱。
+    """
+
+    return load_time_series_with_context(file_path, device_profile_id).dataframe
+
+
+def load_time_series_with_context(
+    file_path: str | Path,
+    device_profile_id: str | None = None,
+) -> LoadedTimeSeries:
+    """读取工业时序 CSV，并返回设备配置匹配与字段映射上下文。
+
+    显式传入 `device_profile_id` 时严格按该配置校验；未传入时先自动匹配，匹配失败则
+    延续通用 CSV 模式。这个接口供分析主流程使用，原有 `load_time_series()` 继续只返回
+    DataFrame，避免破坏实验脚本和预测接口。
     """
 
     path = Path(file_path).expanduser().resolve()
@@ -39,6 +63,11 @@ def load_time_series(file_path: str | Path) -> pd.DataFrame:
 
     # 去掉列名前后的空格，避免企业导出文件中出现难以察觉的字段不一致。
     dataframe.columns = [str(column).strip() for column in dataframe.columns]
+    selection = select_device_profile(dataframe.columns, device_profile_id)
+    renamed_columns: dict[str, str] = {}
+    if selection.profile is not None:
+        dataframe, renamed_columns = apply_device_profile(dataframe, selection.profile)
+
     time_column = _find_time_column(dataframe.columns)
     if time_column != "datetime":
         dataframe = dataframe.rename(columns={time_column: "datetime"})
@@ -59,7 +88,16 @@ def load_time_series(file_path: str | Path) -> pd.DataFrame:
     )
     if not get_sensor_columns(dataframe):
         raise ValueError("没有找到可用于分析的数值传感器列。")
-    return dataframe
+    return LoadedTimeSeries(
+        dataframe=dataframe,
+        profile=selection.profile,
+        context=build_device_context(
+            selection.profile,
+            selection.match_mode,
+            selection.match_score,
+            renamed_columns,
+        ),
+    )
 
 
 def get_sensor_columns(dataframe: pd.DataFrame) -> list[str]:

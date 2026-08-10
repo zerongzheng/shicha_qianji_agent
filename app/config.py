@@ -26,6 +26,7 @@ class Settings:
     output_dir: Path
     database_path: Path
     knowledge_dir: Path
+    device_profiles_dir: Path
     default_skab_file: Path
     default_skab_dir: Path
     healthy_baseline_file: Path
@@ -88,6 +89,9 @@ def get_settings() -> Settings:
             os.getenv("DATABASE_PATH", "outputs/shichi_qianji.db")
         ),
         knowledge_dir=PROJECT_ROOT / "resources" / "knowledge",
+        device_profiles_dir=_resolve_path(
+            os.getenv("DEVICE_PROFILES_DIR", "resources/device_profiles")
+        ),
         default_skab_file=_resolve_path(
             os.getenv("SKAB_DEFAULT_FILE", "../SKAB/data/valve1/0.csv")
         ),

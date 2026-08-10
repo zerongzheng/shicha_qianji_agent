@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app.reporting.evidence_pack import build_evidence_pack
-
 
 def test_evidence_pack_selects_cases_and_writes_index(tmp_path: Path) -> None:
     """成果包应生成实验目录、典型案例目录和答辩索引。"""

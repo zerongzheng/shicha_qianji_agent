@@ -22,11 +22,15 @@
 
 工业数值计算由 Python 算法完成；大模型只用于受控的知识检索、结果解释和自然语言交互，不直接读取整份原始 CSV 猜测故障。这样可以保留算法可复现性、证据链和工程边界，也能降低比赛接口限流对核心分析的影响。
 
+每次分析还会生成一条“自动分析链路”，记录文件接入、设备匹配、数据画像、异常检测、工况识别、
+证据提取、趋势预测、根因排序和工单草案生成的执行状态、模块、核心输出与耗时。它记录的是系统
+实际调用过的工具事实，不记录大模型隐式思维过程；前端总览和 Markdown 报告均可查看这条链路。
+
 ## 当前版本
 
 当前代码已经形成可运行的校赛验证版本：
 
-- 支持 SKAB 及通用多变量 CSV 数据上传；
+- 支持 SKAB 及通用多变量 CSV 数据上传，并可自动匹配设备数据契约；
 - 支持数据画像、缺失值检查和浏览器端文件预检；
 - 支持 MAD、Isolation Forest、PCA 重构、滑动窗口 AutoEncoder、Hybrid 和时频关系多路径检测；
 - 支持异常事件合并、风险分级、主导传感器归因；
@@ -61,6 +65,9 @@ flowchart LR
 | Vue3 前端 | 图表、风险总览、异常证据、预测、工单和历史案例 | 正式产品界面和竞赛演示主界面 |
 | FastAPI 后端 | 文件接收、异步任务、算法调用、数据库读写、万悟接口 | 前后端和平台之间的业务服务层 |
 | 万悟平台 | 用户登录、智能体、工作流、知识库和模型编排 | 后续平台化展示与智能交互 |
+
+风险总览中的“自动分析链路”来自后端 `execution_trace` 字段。标准分析接口和本地历史任务返回完整步骤；
+万悟快速诊断接口只返回紧凑摘要，以控制上下文长度和模型调用额度。
 
 Vue3 不会因为导入 OpenAPI 自动出现在万悟网页内部。OpenAPI 只让万悟能够调用 FastAPI 接口。后续若万悟支持外部应用嵌入，才可以把部署后的 Vue 页面作为独立工作台嵌入；在校赛阶段采用“万悟智能体入口 + Vue3 专业看板”的双界面方式更稳妥。
 
@@ -119,7 +126,17 @@ SKAB_DEFAULT_DIR=../SKAB/data/valve1
 HEALTHY_BASELINE_FILE=../SKAB/data/anomaly-free/anomaly-free.csv
 ```
 
-项目不把完整 SKAB 数据集提交到 GitHub。后续企业数据也建议放在项目外部，通过前端上传或 `.env` 指向数据目录。不同设备字段格式由 `app/data/loader.py` 适配。
+项目不把完整 SKAB 数据集提交到 GitHub。后续企业数据也建议放在项目外部，通过前端上传或 `.env` 指向数据目录。不同设备字段、单位、采样约定和健康基线通过 `resources/device_profiles/` 下的 JSON 配置适配，分析算法继续使用统一标准字段。
+
+设备配置采用“显式指定、自动匹配、通用回退”三层机制：
+
+```text
+resources/device_profiles/
+├─ skab_valve.json          # 已启用的 SKAB 阀门测试台配置
+└─ enterprise_template.json # 企业设备模板，信息未确认前保持停用
+```
+
+接入一类企业设备时，复制模板并完成以下内容：设备编号与版本、时间列和字段别名、必需与可选测点、单位与测点类别、采样周期、经企业确认的安全范围、健康基线路径、推荐检测参数和适用边界。不能确认的单位或阈值应保留为 `null`，不得为了页面完整而编造。
 
 知识库文档放在：
 
@@ -203,6 +220,16 @@ http://127.0.0.1:8000/docs
 http://127.0.0.1:8000/openapi.json
 ```
 
+服务自检摘要：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/system/diagnostics | ConvertTo-Json -Depth 6
+```
+
+该接口只返回数据库、知识库、SKAB 样例、模型配置、限流参数和任务队列是否就绪，
+不返回 API Key、服务器绝对路径、原始 CSV 或数据库内容。`status=ready` 表示当前环境可直接演示；
+`status=degraded` 表示基础服务仍可运行，但有需要关注的配置提醒。
+
 ### C. 运行 Streamlit 备用页面
 
 Streamlit 仍保留用于算法调试、离线验证和没有 Node 环境时的备用演示，不是 Vue3 的替代启动方式：
@@ -254,7 +281,8 @@ http://host.docker.internal:8000/integrations/wanwu/quick-openapi.json
 | --- | --- |
 | `POST /api/v1/files` | 上传 CSV 并返回 `file_id` |
 | `POST /api/v1/samples/skab/default` | 登记默认 SKAB 样例并返回可分析的 `file_id` |
-| `GET /api/v1/files/{file_id}/preflight` | 返回受控 CSV 的真实行数、列名、测点数和缺失率 |
+| `GET /api/v1/files/{file_id}/preflight` | 返回受控 CSV 的真实行数、列名、测点数、缺失率和设备配置匹配结果 |
+| `GET /api/v1/device-profiles` | 返回可选择的设备配置摘要 |
 | `POST /api/v1/jobs` | 创建异步分析任务 |
 | `GET /api/v1/jobs/{run_id}` | 查询任务状态 |
 | `GET /api/v1/jobs/{run_id}/result` | 获取分析结果 |
@@ -303,6 +331,30 @@ outputs/shichi_qianji.db
 & "E:\Tools\uv\uv.exe" run python main.py --evidence-pack --case-count 3
 ```
 
+`--evidence-pack` 会在同一目录生成实验汇总、`other` 场景误报审计、三类典型案例和答辩索引：
+
+```text
+outputs/evidence_pack/
+├─ EVIDENCE_PACK_INDEX.md
+├─ experiments/
+│  ├─ skab_competition_summary.md
+│  ├─ time_frequency_relation_false_positive_analysis.md
+│  ├─ time_frequency_relation_false_positive_events.csv
+│  └─ time_frequency_relation_system_effectiveness.md
+└─ cases/
+   ├─ other/1/
+   ├─ valve1/0/
+   └─ valve2/0/
+```
+
+误报审计将独立测试集中的未匹配告警按“工况变点附近、工况切换期、传感器质量风险、待解释误报”分类，
+用于解释 `other` 场景的告警来源。分类结果是公开数据实验线索，不等于企业现场故障结论；正式接入企业日志后仍需人工复核。
+
+系统成效报告统计异常事件证据、候选根因诊断和工单草案的覆盖率。它只衡量公开数据上的系统输出完整性，
+不代表诊断正确率或企业现场处置效率。也可以单独运行：
+
+    uv run python main.py --system-effectiveness --data-root ..\SKAB\data
+
 输出目录主要包括：
 
 ```text
@@ -335,14 +387,22 @@ cd "E:\大学课程\竞赛\shichi_qianji_agent\frontend"
 
 当前项目处于“校赛可演示、企业数据待接入”的阶段。现有 SKAB 结果用于验证算法流程和工程闭环，不代表联通企业现场成效。
 
+当前已经完成：
+
+1. 固定 SKAB 文件划分、阈值调优、独立测试和消融实验；
+2. 生成实验协议、模型横向对比和相对 MAD 基线的竞赛成效表；
+3. 完成 Vue3 + FastAPI 的上传、分析、证据查看、工单确认和历史案例闭环；
+4. 建立小而可靠的通用工业知识库，并保留后续企业文档替换入口；
+5. 完成独立测试集误报审计，并将 `other → valve1 → valve2` 三类案例纳入成果包。
+
 下一步按优先级推进：
 
-1. 整理小而可靠的工业知识库文档并保留来源；
-2. 在固定 SKAB 划分上完成模型、阈值和消融实验记录；
-3. 获取企业时序数据后重新标定阈值、模型和设备专属根因规则；
-4. 继续完善 Vue3 图表、异常证据和工单交互；
-5. 根据比赛方万悟配置确定公网部署和工作流发布方式；
-6. 企业部署阶段再迁移 PostgreSQL，并增加用户身份、组织隔离、权限和审计日志。
+1. 获取企业时序数据后，按设备配置重新标定阈值、模型和设备专属根因规则；
+2. 用企业时序数据和运行日志复核误报分类，形成可引用的企业案例证据；
+3. 根据比赛方万悟配置确定公网部署和工作流发布方式；
+4. 企业部署阶段再迁移 PostgreSQL，并增加用户身份、组织隔离、权限和审计日志。
+
+稳定的 GitHub 可公开实验摘要见 [`docs/competition/SKAB_RESULTS.md`](docs/competition/SKAB_RESULTS.md)。
 
 ## GitHub 提交边界
 

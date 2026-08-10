@@ -10,6 +10,7 @@ from app.analysis import analyze_file, analyze_folder
 from app.analysis.detection import DETECTOR_RECOMMENDED_THRESHOLDS
 from app.config import get_settings
 from app.experiments import (
+    analyze_skab_system_effectiveness,
     build_competition_report,
     evaluate_regime_strategy,
     run_hybrid_weight_ablation,
@@ -102,6 +103,11 @@ def main() -> None:
         help="生成校赛成果包：固定实验汇总、典型案例和答辩索引",
     )
     parser.add_argument(
+        "--system-effectiveness",
+        action="store_true",
+        help="统计 SKAB 独立测试集上的证据、诊断和工单覆盖率",
+    )
+    parser.add_argument(
         "--case-count",
         type=int,
         default=3,
@@ -133,7 +139,24 @@ def main() -> None:
         contamination=args.contamination,
     )
 
-    if args.evidence_pack:
+    if args.system_effectiveness:
+        effectiveness = analyze_skab_system_effectiveness(args.data_root)
+        summary = {
+            "detector": effectiveness.detector,
+            "detector_name": effectiveness.detector_name,
+            "file_count": effectiveness.file_count,
+            "analyzed_file_count": effectiveness.analyzed_file_count,
+            "total_rows": effectiveness.total_rows,
+            "total_events": effectiveness.total_events,
+            "evidence_coverage": effectiveness.evidence_coverage,
+            "diagnosis_coverage": effectiveness.diagnosis_coverage,
+            "work_order_coverage": effectiveness.work_order_coverage,
+            "average_inference_seconds": effectiveness.average_inference_seconds,
+            "csv_path": str(effectiveness.csv_path),
+            "report_path": str(effectiveness.report_path),
+            "failed_files": effectiveness.failed_files,
+        }
+    elif args.evidence_pack:
         pack = build_evidence_pack(
             args.data_root,
             case_count=max(1, min(10, args.case_count)),
@@ -143,6 +166,10 @@ def main() -> None:
             "evidence_pack_dir": str(pack.output_dir),
             "index_path": str(pack.index_path),
             "experiment_report_path": str(pack.competition_report.report_path),
+            "false_positive_report_path": str(pack.false_positive_analysis.report_path),
+            "false_positive_csv_path": str(pack.false_positive_analysis.csv_path),
+            "system_effectiveness_report_path": str(pack.system_effectiveness.report_path),
+            "system_effectiveness_csv_path": str(pack.system_effectiveness.csv_path),
             "case_count": len(pack.cases),
             "case_dirs": [str(item.case_dir) for item in pack.cases],
         }
@@ -168,6 +195,9 @@ def main() -> None:
             "summary_csv_path": str(report.csv_path),
             "benchmark_path": str(report.benchmark_path),
             "split_path": str(report.split_path),
+            "protocol_json_path": str(report.protocol_json_path),
+            "protocol_markdown_path": str(report.protocol_markdown_path),
+            "effectiveness_csv_path": str(report.effectiveness_csv_path),
         }
     elif args.evaluate_regimes:
         evaluation = evaluate_regime_strategy(args.data_root)

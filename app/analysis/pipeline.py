@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 from app.analysis.advice import generate_recommendations
@@ -21,9 +22,14 @@ from app.analysis.relationships import analyze_event_relationships
 from app.analysis.trend import analyze_recent_trends
 from app.analysis.warning import build_risk_alerts
 from app.config import get_settings
-from app.data.loader import load_time_series
+from app.data.loader import load_time_series, load_time_series_with_context
 from app.diagnosis import diagnose_root_causes
-from app.models import AnalysisConfig, AnalysisResult, HistoricalCaseMatch
+from app.models import (
+    AnalysisConfig,
+    AnalysisResult,
+    ExecutionTraceStep,
+    HistoricalCaseMatch,
+)
 from app.reporting import build_markdown_report, save_report
 
 
@@ -84,27 +90,92 @@ def analyze_file(
         contamination=settings.contamination,
     )
     source_path = Path(file_path).expanduser().resolve()
-    dataframe = load_time_series(source_path)
+    execution_trace: list[ExecutionTraceStep] = []
+
+    # 数据接入层负责格式识别、时间排序、字段标准化和设备配置匹配，是后续算法的统一入口。
+    started_at = perf_counter()
+    loaded = load_time_series_with_context(source_path, config.device_profile_id)
+    dataframe = loaded.dataframe
     # SKAB 的 anomaly-free 文件没有显式标签，但目录语义明确表示全程正常。
     # 仅在该标准场景中补全 0 标签，企业无标签数据仍保持“不可监督评估”。
     if source_path.parent.name.lower() == "anomaly-free" and "anomaly" not in dataframe:
         dataframe["anomaly"] = 0
         dataframe["changepoint"] = 0
+
+    execution_trace.append(
+        ExecutionTraceStep(
+            step_id="data_ingestion",
+            title="文件接入与预检",
+            module="app.data.loader.load_time_series_with_context",
+            status="completed",
+            input_summary={"file_name": source_path.name, "file_type": source_path.suffix.lower()},
+            output_summary={
+                "row_count": len(dataframe),
+                "column_count": len(dataframe.columns),
+                "time_column": "datetime",
+            },
+            duration_seconds=_elapsed_seconds(started_at),
+            limitation="当前接入层支持 CSV；企业数据库、消息队列和实时流需要通过适配器接入。",
+        )
+    )
+    execution_trace.append(
+        ExecutionTraceStep(
+            step_id="device_profile_match",
+            title="设备配置匹配",
+            module="app.data.device_profiles.select_device_profile",
+            status="completed",
+            input_summary={"requested_profile_id": config.device_profile_id or "automatic"},
+            output_summary={
+                "profile_id": loaded.context.get("profile_id") or "generic",
+                "display_name": loaded.context.get("display_name") or "通用工业时序数据",
+                "match_mode": loaded.context.get("match_mode", "generic"),
+                "match_score": loaded.context.get("match_score", 0.0),
+            },
+            limitation="设备配置匹配只确认字段契约和适用范围，不等同于设备身份认证。",
+        )
+    )
+
+    started_at = perf_counter()
     profile = build_profile(dataframe, source_path.name)
+    execution_trace.append(
+        ExecutionTraceStep(
+            step_id="data_profile",
+            title="数据画像与质量检查",
+            module="app.analysis.profiling.build_profile",
+            status="completed",
+            input_summary={"row_count": len(dataframe)},
+            output_summary={
+                "sensor_count": len(profile.sensor_columns),
+                "missing_total": profile.missing_total,
+                "sampling_seconds": profile.sampling_seconds,
+            },
+            duration_seconds=_elapsed_seconds(started_at),
+            limitation="数据画像反映当前文件质量，不代表设备长期健康状态。",
+        )
+    )
 
     healthy_reference = None
-    if config.use_healthy_baseline and settings.healthy_baseline_file.exists():
-        candidate = load_time_series(settings.healthy_baseline_file)
+    baseline_path = settings.healthy_baseline_file
+    if loaded.profile is not None:
+        profile_baseline = loaded.profile.resolve_healthy_baseline(settings.project_root)
+        if profile_baseline is not None:
+            baseline_path = profile_baseline
+    if config.use_healthy_baseline and baseline_path.exists():
+        # 基线沿用同一设备配置，确保企业字段别名与当前分析数据保持一致。
+        candidate = load_time_series(baseline_path, config.device_profile_id)
         if set(profile.sensor_columns).issubset(candidate.columns):
             healthy_reference = candidate[profile.sensor_columns]
 
+    started_at = perf_counter()
     detection = detect_anomalies(
         dataframe=dataframe,
         sensor_columns=profile.sensor_columns,
         config=config,
         healthy_reference=healthy_reference,
     )
+    detection_duration = _elapsed_seconds(started_at)
     if run_regime:
+        started_at = perf_counter()
         operating_regimes = analyze_operating_regimes(
             dataframe,
             profile.sensor_columns,
@@ -117,10 +188,52 @@ def analyze_file(
             detection.predicted_labels,
             config,
         )
+        regime_duration = _elapsed_seconds(started_at)
     else:
         operating_regimes = None
         predicted_labels = detection.predicted_labels
         events = detection.events
+        regime_duration = None
+    execution_trace.append(
+        ExecutionTraceStep(
+            step_id="anomaly_detection",
+            title="时频关系异常检测",
+            module="app.analysis.detection.detect_anomalies",
+            status="completed",
+            input_summary={
+                "sensor_count": len(profile.sensor_columns),
+                "detector": config.detector,
+                "healthy_baseline_used": healthy_reference is not None,
+            },
+            output_summary={
+                "detector": detection.detector_name,
+                "anomaly_point_count": int(predicted_labels.sum()),
+                "event_count": len(events),
+            },
+            duration_seconds=detection_duration,
+            limitation="异常分数用于发现偏离模式，不能单独证明设备已经发生物理故障。",
+        )
+    )
+    execution_trace.append(
+        ExecutionTraceStep(
+            step_id="operating_regime",
+            title="工况识别与切换分析",
+            module="app.analysis.regime.analyze_operating_regimes",
+            status="completed" if run_regime else "skipped",
+            input_summary={"sensor_count": len(profile.sensor_columns)},
+            output_summary=(
+                {
+                    "state_count": operating_regimes.state_count,
+                    "transition_point_count": int(operating_regimes.transition_mask.sum()),
+                    "suppressed_event_count": operating_regimes.suppressed_event_count,
+                }
+                if operating_regimes
+                else {"reason": "run_regime=False"}
+            ),
+            duration_seconds=regime_duration,
+            limitation="无监督工况编号只表示数据模式分组，需要结合控制指令赋予现场语义。",
+        )
+    )
     metrics = evaluate_predictions(
         dataframe,
         predicted_labels,
@@ -128,22 +241,53 @@ def analyze_file(
         merge_gap=config.merge_gap,
     )
     trends = analyze_recent_trends(dataframe, profile.sensor_columns)
+    started_at = perf_counter()
     relationship_diagnostics = analyze_event_relationships(
         dataframe,
         profile.sensor_columns,
         events,
     )
+    execution_trace.append(
+        ExecutionTraceStep(
+            step_id="relationship_evidence",
+            title="多传感器证据提取",
+            module="app.analysis.relationships.analyze_event_relationships",
+            status="completed",
+            input_summary={"event_count": len(events), "sensor_count": len(profile.sensor_columns)},
+            output_summary={"event_evidence_count": len(relationship_diagnostics)},
+            duration_seconds=_elapsed_seconds(started_at),
+            limitation="相关性和时滞用于缩小排查范围，不能替代设备机理和现场复测。",
+        )
+    )
     recommendations = generate_recommendations(profile, events, trends, metrics)
-    forecasts = (
-        forecast_sensors(
+    if run_forecast:
+        started_at = perf_counter()
+        forecasts = forecast_sensors(
             dataframe,
             profile.sensor_columns,
             horizon=settings.forecast_horizon,
             lookback=settings.forecast_lookback,
             holdout=settings.forecast_holdout,
         )
-        if run_forecast
-        else {}
+        forecast_duration = _elapsed_seconds(started_at)
+    else:
+        forecasts = {}
+        forecast_duration = None
+    execution_trace.append(
+        ExecutionTraceStep(
+            step_id="forecast_analysis",
+            title="趋势预测与风险外推",
+            module="app.analysis.forecast.forecast_sensors",
+            status="completed" if run_forecast else "skipped",
+            input_summary={"sensor_count": len(profile.sensor_columns)},
+            output_summary=(
+                {"forecast_sensor_count": len(forecasts)}
+                if run_forecast
+                else {"reason": "run_forecast=False"}
+            ),
+            duration_seconds=forecast_duration,
+            limitation="预测反映短期统计趋势，不承诺故障发生时间或剩余寿命。",
+        )
     )
     risk_alerts = build_risk_alerts(
         forecasts,
@@ -152,6 +296,7 @@ def analyze_file(
         operating_regimes,
     )
     historical_case_matches: dict[int, list[HistoricalCaseMatch]] = {}
+    started_at = perf_counter()
     event_diagnoses, work_order_drafts = diagnose_root_causes(
         dataframe=dataframe,
         sensor_columns=profile.sensor_columns,
@@ -162,6 +307,40 @@ def analyze_file(
         forecast_results=forecasts,
         case_matcher=case_matcher,
         historical_matches_output=historical_case_matches,
+    )
+    diagnosis_duration = _elapsed_seconds(started_at)
+    execution_trace.append(
+        ExecutionTraceStep(
+            step_id="root_cause_diagnosis",
+            title="候选根因诊断",
+            module="app.diagnosis.root_cause.diagnose_root_causes",
+            status="completed",
+            input_summary={
+                "event_count": len(events),
+                "relationship_evidence_count": len(relationship_diagnostics),
+                "historical_case_matching": case_matcher is not None,
+            },
+            output_summary={
+                "diagnosis_count": len(event_diagnoses),
+                "candidate_count": sum(len(item.candidates) for item in event_diagnoses),
+                "historical_case_match_count": sum(
+                    len(items) for items in historical_case_matches.values()
+                ),
+            },
+            duration_seconds=diagnosis_duration,
+            limitation="根因结果是待验证候选排序，必须结合设备拓扑、控制记录和现场复测确认。",
+        )
+    )
+    execution_trace.append(
+        ExecutionTraceStep(
+            step_id="work_order_generation",
+            title="运维工单草案生成",
+            module="app.diagnosis.root_cause.diagnose_root_causes",
+            status="completed",
+            input_summary={"diagnosis_count": len(event_diagnoses)},
+            output_summary={"work_order_draft_count": len(work_order_drafts)},
+            limitation="系统只生成待确认草案，派单、执行、验收和根因回写仍由运维人员负责。",
+        )
     )
 
     result = AnalysisResult(
@@ -176,6 +355,7 @@ def analyze_file(
         metrics=metrics,
         trend_summary=trends,
         recommendations=recommendations,
+        device_context=loaded.context,
         operating_regimes=operating_regimes,
         relationship_diagnostics=relationship_diagnostics,
         forecast_results=forecasts,
@@ -183,6 +363,7 @@ def analyze_file(
         event_diagnoses=event_diagnoses,
         work_order_drafts=work_order_drafts,
         historical_case_matches=historical_case_matches,
+        execution_trace=execution_trace,
     )
     result.report_text = build_markdown_report(result, config)
 
@@ -230,3 +411,9 @@ def _natural_sort_key(path: Path) -> tuple[int, str]:
     """让 2.csv 排在 10.csv 前面，同时兼容非数字文件名。"""
 
     return (int(path.stem), path.name) if path.stem.isdigit() else (10**9, path.name)
+
+
+def _elapsed_seconds(started_at: float) -> float:
+    """统一保留四位小数，兼顾短步骤展示和实验可复现性。"""
+
+    return round(perf_counter() - started_at, 4)

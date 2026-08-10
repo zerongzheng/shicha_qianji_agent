@@ -13,6 +13,7 @@ import {
   getRun,
   health,
   listCases,
+  listDeviceProfiles,
   listRuns,
   listWorkOrders,
   registerDefaultSkabSample,
@@ -61,6 +62,8 @@ const caseLoading = ref(false);
 const workOrderSearch = ref("");
 const workOrderStatusFilter = ref("");
 const workOrderPriorityFilter = ref("");
+// 默认保留全部历史工单；打开该开关后只显示当前分析任务产生的工单。
+const currentWorkOrderOnly = ref(false);
 const workOrderPage = ref(1);
 const workOrderPageSize = 10;
 const workOrderTotal = ref(0);
@@ -82,11 +85,15 @@ const selectedForecastSensor = ref("");
 const retryingRunId = ref("");
 const sampleLoading = ref(false);
 const selectedSampleFileId = ref("");
+const deviceProfiles = ref([]);
+const deviceProfilesLoading = ref(false);
 // 证据页使用筛选和折叠，事件较多时仍然可以按风险快速定位。
 const evidenceRiskFilter = ref("");
 const expandedEvidenceEvent = ref(0);
 
 const config = reactive({
+  // null 表示自动识别；空字符串表示强制使用通用模式。
+  device_profile_id: null,
   detector: "time_frequency_relation",
   threshold: 4.5,
   rolling_window: 61,
@@ -176,6 +183,7 @@ const selectedWorkOrderDiagnosis = computed(() => {
 const filteredWorkOrders = computed(() => {
   return workOrders.value;
 });
+const currentAnalysisRunId = computed(() => analysis.value?.run_id || runId.value || "");
 const workOrderPageCount = computed(() => Math.max(1, Math.ceil(workOrderTotal.value / workOrderPageSize)));
 const filteredHistoryRuns = computed(() => {
   const keyword = historySearch.value.trim().toLowerCase();
@@ -261,6 +269,7 @@ const analysisScope = computed(() => {
 
 onMounted(async () => {
   await refreshHistory();
+  await loadDeviceProfiles();
   try {
     await health();
     apiStatus.value = "在线";
@@ -354,14 +363,31 @@ function resolveConfirmation(result) {
   confirmDialog.value = null;
 }
 
-function confirmDiscardChanges() {
+function restoreFeedbackDraft() {
+  // 放弃修改后恢复到当前工单最后一次从后端加载或保存的值，并同步快照。
+  // 只关闭弹窗而不恢复这四个字段，会让下一次切换仍被判断为“有未保存修改”。
+  if (!selectedWorkOrder.value) {
+    feedbackDraftSnapshot.value = feedbackSnapshot();
+    return;
+  }
+  feedback.status = selectedWorkOrder.value.status || "待确认";
+  feedback.confirmed_cause = selectedWorkOrder.value.confirmed_cause || "";
+  feedback.feedback_note = selectedWorkOrder.value.feedback_note || "";
+  feedback.handled_by = selectedWorkOrder.value.handled_by || "";
+  feedbackDraftSnapshot.value = feedbackSnapshot();
+  feedbackNotice.value = null;
+}
+
+async function confirmDiscardChanges() {
   if (!feedbackDirty.value) return true;
-  return requestConfirmation({
+  const discarded = await requestConfirmation({
     title: "当前工单有未保存修改",
     detail: "继续操作会丢失尚未保存的现场反馈，请确认是否放弃这些修改。",
     confirmText: "放弃修改",
     tone: "warning",
   });
+  if (discarded) restoreFeedbackDraft();
+  return discarded;
 }
 
 async function changeTab(tabId) {
@@ -496,6 +522,20 @@ function normalizePreflight(payload) {
   };
 }
 
+async function loadDeviceProfiles() {
+  deviceProfilesLoading.value = true;
+  try {
+    const response = await listDeviceProfiles();
+    deviceProfiles.value = response.profiles || [];
+  } catch (error) {
+    // 配置接口不可用时不阻塞通用 CSV 分析，后端仍会按通用模式运行。
+    deviceProfiles.value = [];
+    errorMessage.value = `设备配置读取失败，将使用自动通用模式：${error.message}`;
+  } finally {
+    deviceProfilesLoading.value = false;
+  }
+}
+
 async function startAnalysis() {
   try {
     await runAnalysisJob();
@@ -525,7 +565,11 @@ async function refreshHistory() {
     const [runResponse, caseResponse, workOrderSummary] = await Promise.all([
       listRuns(historyStatus.value, showArchived.value, showArchived.value),
       listCases(showArchived.value, showArchived.value),
-      listWorkOrders(showArchived.value, showArchived.value, { limit: 1, offset: 0 }),
+      listWorkOrders(showArchived.value, showArchived.value, {
+        limit: 1,
+        offset: 0,
+        run_id: currentWorkOrderOnly.value ? currentAnalysisRunId.value : "",
+      }),
     ]);
     runs.value = runResponse.runs || [];
     if (historyPage.value > historyPageCount.value) historyPage.value = historyPageCount.value;
@@ -546,7 +590,11 @@ async function refreshOperationalData() {
     const [runResponse, caseResponse, workOrderSummary] = await Promise.all([
       listRuns(historyStatus.value, showArchived.value, showArchived.value),
       listCases(showArchived.value, showArchived.value),
-      listWorkOrders(showArchived.value, showArchived.value, { limit: 1, offset: 0 }),
+      listWorkOrders(showArchived.value, showArchived.value, {
+        limit: 1,
+        offset: 0,
+        run_id: currentWorkOrderOnly.value ? currentAnalysisRunId.value : "",
+      }),
     ]);
     runs.value = runResponse.runs || [];
     cases.value = caseResponse.cases || [];
@@ -575,6 +623,7 @@ async function refreshWorkOrders() {
       search: workOrderSearch.value,
       status: workOrderStatusFilter.value,
       priority: workOrderPriorityFilter.value,
+      run_id: currentWorkOrderOnly.value ? currentAnalysisRunId.value : "",
     });
     if (token !== workOrderRequestToken) return;
     workOrders.value = response.work_orders || [];
@@ -607,6 +656,17 @@ async function changeWorkOrderPage(page) {
   selectedWorkOrder.value = null;
   feedbackNotice.value = null;
   await refreshWorkOrders();
+}
+
+async function toggleCurrentWorkOrderScope() {
+  if (feedbackDirty.value && !(await confirmDiscardChanges())) return;
+  currentWorkOrderOnly.value = !currentWorkOrderOnly.value;
+  workOrderPage.value = 1;
+  selectedWorkOrder.value = null;
+  selectedWorkOrderAnalysis.value = null;
+  feedbackDraftSnapshot.value = "";
+  feedbackNotice.value = null;
+  await refreshHistory();
 }
 
 async function viewHistoryRun(run) {
@@ -1100,6 +1160,31 @@ function contributionWidth(item) {
         </div>
         <div class="file-placeholder" v-else>尚未选择数据文件</div>
 
+        <label class="field-label" for="device-profile">设备数据配置</label>
+        <select
+          id="device-profile"
+          v-model="config.device_profile_id"
+          class="control-input"
+          :disabled="deviceProfilesLoading || isAnalyzing"
+        >
+          <option :value="null">自动识别</option>
+          <option value="generic">通用模式</option>
+          <option v-for="profile in deviceProfiles" :key="profile.profile_id" :value="profile.profile_id">
+            {{ profile.display_name }} · {{ profile.profile_id }}
+          </option>
+        </select>
+        <p class="device-profile-hint" :class="{ loading: deviceProfilesLoading }" v-if="deviceProfilesLoading">
+          正在读取可用设备配置...
+        </p>
+        <p
+          class="device-profile-hint matched"
+          v-else-if="filePreflight?.device_profile?.profile_id"
+        >
+          <span class="device-profile-hint-label">预检匹配</span>
+          <span class="device-profile-hint-name">{{ filePreflight.device_profile.display_name }}</span>
+        </p>
+        <p class="device-profile-hint" v-else>未知 CSV 会保留原字段并按通用模式分析。</p>
+
         <label class="field-label" for="detector">检测器</label>
         <select id="detector" v-model="config.detector" class="control-input">
           <option value="time_frequency_relation">时频关系多路径</option>
@@ -1259,6 +1344,9 @@ function contributionWidth(item) {
           :work-order-search="workOrderSearch"
           :work-order-status-filter="workOrderStatusFilter"
           :work-order-priority-filter="workOrderPriorityFilter"
+          :current-work-order-only="currentWorkOrderOnly"
+          :current-run-id="currentAnalysisRunId"
+          :current-source-file="analysis?.data_profile?.source_name || selectedFile?.name || ''"
           :feedback="feedback"
           :feedback-notice="feedbackNotice"
           :saving-feedback="savingFeedback"
@@ -1268,6 +1356,7 @@ function contributionWidth(item) {
           @update:work-order-search="workOrderSearch = $event"
           @update:work-order-status-filter="workOrderStatusFilter = $event"
           @update:work-order-priority-filter="workOrderPriorityFilter = $event"
+          @toggle-current-scope="toggleCurrentWorkOrderScope"
           @select-order="selectWorkOrder"
           @restore-order="restoreSelectedWorkOrder"
           @change-page="changeWorkOrderPage"

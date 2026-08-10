@@ -11,6 +11,14 @@ from pathlib import Path
 
 from app.config import get_settings
 from app.experiments.competition_report import CompetitionReport, build_competition_report
+from app.experiments.false_positive_analysis import (
+    FalsePositiveAnalysis,
+    analyze_skab_false_positives,
+)
+from app.experiments.system_effectiveness import (
+    SystemEffectiveness,
+    analyze_skab_system_effectiveness,
+)
 from app.reporting.case_package import CasePackage, build_case_package
 
 
@@ -21,6 +29,8 @@ class EvidencePack:
     output_dir: Path
     index_path: Path
     competition_report: CompetitionReport
+    false_positive_analysis: FalsePositiveAnalysis
+    system_effectiveness: SystemEffectiveness
     cases: tuple[CasePackage, ...]
 
 
@@ -45,17 +55,41 @@ def build_evidence_pack(
         output_dir=target / "experiments",
         rerun_experiments=rerun_experiments,
     )
-    case_files = _select_case_files(Path(data_root).expanduser().resolve(), case_count)
+    resolved_data_root = Path(data_root).expanduser().resolve()
+    false_positive_analysis = analyze_skab_false_positives(
+        resolved_data_root,
+        output_dir=target / "experiments",
+        detector="time_frequency_relation",
+    )
+    system_effectiveness = analyze_skab_system_effectiveness(
+        resolved_data_root,
+        output_dir=target / "experiments",
+        detector="time_frequency_relation",
+    )
+    case_files = _select_case_files(resolved_data_root, case_count)
     cases = tuple(
         build_case_package(file_path, output_dir=target / "cases")
         for file_path in case_files
     )
     index_path = target / "EVIDENCE_PACK_INDEX.md"
     index_path.write_text(
-        _build_index(Path(data_root).expanduser().resolve(), competition, cases),
+        _build_index(
+            resolved_data_root,
+            competition,
+            false_positive_analysis,
+            system_effectiveness,
+            cases,
+        ),
         encoding="utf-8",
     )
-    return EvidencePack(target, index_path, competition, cases)
+    return EvidencePack(
+        target,
+        index_path,
+        competition,
+        false_positive_analysis,
+        system_effectiveness,
+        cases,
+    )
 
 
 def _select_case_files(data_root: Path, count: int) -> list[Path]:
@@ -69,16 +103,30 @@ def _select_case_files(data_root: Path, count: int) -> list[Path]:
     if not candidates:
         raise FileNotFoundError(f"在 SKAB 数据目录中没有找到异常样例：{data_root}")
     selected: list[Path] = []
-    seen_parents: set[str] = set()
+    selected_set: set[Path] = set()
+    scenario_order = ("other", "valve1", "valve2")
+    # 典型案例优先覆盖混合场景和两类阀门场景，便于答辩展示模型的泛化能力。
+    for scenario in scenario_order:
+        scenario_files = [path for path in candidates if path.parent.name.lower() == scenario]
+        if scenario_files:
+            selected.append(scenario_files[0])
+            selected_set.add(scenario_files[0])
+        if len(selected) >= max(1, count):
+            return selected
+
+    # 数据集目录可能只有部分场景，按父目录稳定补齐，不因为缺少某一场景而失败。
+    seen_parents = {path.parent.name for path in selected}
     for path in candidates:
         if path.parent.name not in seen_parents:
             selected.append(path)
+            selected_set.add(path)
             seen_parents.add(path.parent.name)
         if len(selected) >= max(1, count):
             return selected
     for path in candidates:
-        if path not in selected:
+        if path not in selected_set:
             selected.append(path)
+            selected_set.add(path)
         if len(selected) >= max(1, count):
             break
     return selected
@@ -87,6 +135,8 @@ def _select_case_files(data_root: Path, count: int) -> list[Path]:
 def _build_index(
     data_root: Path,
     competition: CompetitionReport,
+    false_positive_analysis: FalsePositiveAnalysis,
+    system_effectiveness: SystemEffectiveness,
     cases: tuple[CasePackage, ...],
 ) -> str:
     """将成果包内容和答辩讲解顺序写成一页索引。"""
@@ -100,9 +150,10 @@ def _build_index(
         "## 推荐讲解顺序",
         "",
         "1. 先展示 `experiments/skab_competition_summary.md`，说明数据划分和模型对比。",
-        "2. 再展示典型案例中的风险图，说明异常如何从数据中被发现。",
-        "3. 打开案例摘要，沿着“异常事件 - 主导传感器 - 候选原因 - 排查动作”讲解。",
-        "4. 回到 Streamlit 的“运维闭环”，演示工单确认、现场反馈和历史案例沉淀。",
+        "2. 展示 `experiments/time_frequency_relation_false_positive_analysis.md`，说明 other 场景的误报来源。",
+        "3. 再展示典型案例中的风险图，说明异常如何从数据中被发现。",
+        "4. 打开案例摘要，沿着“异常事件 - 主导传感器 - 候选原因 - 排查动作”讲解。",
+        "5. 回到 Vue3 的“运维闭环”，演示工单确认、现场反馈和历史案例沉淀。",
         "",
         "## 实验材料",
         "",
@@ -111,15 +162,22 @@ def _build_index(
         f"- 数据划分：`{competition.split_path}`",
         f"- 最终评估说明：`{competition.report_path.parent / 'FINAL_EVALUATION.md'}`",
         f"- 能力对比表：`{competition.report_path.parent / 'CAPABILITY_COMPARISON.md'}`",
+        f"- 误报解释报告：`{false_positive_analysis.report_path}`",
+        f"- 逐事件误报审计表：`{false_positive_analysis.csv_path}`",
+        f"- 误报事件数：{len(false_positive_analysis.events)}；成功分析文件：{false_positive_analysis.analyzed_file_count}/{false_positive_analysis.file_count}",
+        f"- 系统成效报告：`{system_effectiveness.report_path}`",
+        f"- 系统成效逐文件统计：`{system_effectiveness.csv_path}`",
+        f"- 证据覆盖率：{system_effectiveness.evidence_coverage:.2%}；诊断覆盖率：{system_effectiveness.diagnosis_coverage:.2%}；工单草案覆盖率：{system_effectiveness.work_order_coverage:.2%}",
         "",
         "## 典型案例",
         "",
-        "| 案例 | 数据文件 | 材料目录 |",
-        "| --- | --- | --- |",
+        "| 案例 | 场景 | 数据文件 | 材料目录 |",
+        "| --- | --- | --- | --- |",
     ]
     for index, package in enumerate(cases, start=1):
         lines.append(
-            f"| 案例 {index} | `{package.result.profile.source_name}` | `{package.case_dir}` |"
+            f"| 案例 {index} | {package.case_dir.parent.name} | "
+            f"`{package.result.profile.source_name}` | `{package.case_dir}` |"
         )
     lines.extend(
         [
