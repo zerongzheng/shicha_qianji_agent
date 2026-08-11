@@ -876,6 +876,12 @@ def get_repository() -> IndustrialRepository:
 def _run_record(row: sqlite3.Row, include_result: bool) -> dict[str, Any]:
     """将 SQLite 行转换为万悟可直接使用的字典。"""
 
+    result = _from_json(row["result_json"], {})
+    analysis = _result_analysis_section(result)
+    selection = analysis.get("model_selection") or {}
+    # detector 列仍保存请求配置，用于快速诊断幂等缓存；任务成功后对外展示实际路由模型，
+    # 避免“请求默认 TFR、实际因单传感器选择 MAD”时历史记录显示错误。
+    effective_detector = selection.get("selected_detector") or row["detector"]
     record = {
         "run_id": row["run_id"],
         "file_id": row["file_id"],
@@ -883,7 +889,7 @@ def _run_record(row: sqlite3.Row, include_result: bool) -> dict[str, Any]:
         "file_sha256": row["sha256"],
         "file_size_bytes": row["size_bytes"],
         "operation": row["operation"],
-        "detector": row["detector"],
+        "detector": effective_detector,
         "status": row["status"],
         "config": _from_json(row["config_json"], {}),
         "error": row["error"],
@@ -894,10 +900,8 @@ def _run_record(row: sqlite3.Row, include_result: bool) -> dict[str, Any]:
         "archive_reason": row["archive_reason"],
     }
     if include_result:
-        record["result"] = _from_json(row["result_json"], None)
+        record["result"] = result or None
     else:
-        result = _from_json(row["result_json"], {})
-        analysis = _result_analysis_section(result)
         record["summary"] = analysis.get("summary")
     return record
 
@@ -913,6 +917,10 @@ def _analysis_result_record(run_id: str, result: Any) -> dict[str, Any]:
         "file_name": result.profile.source_name,
         "size_bytes": Path(result.source_path).stat().st_size,
         "detector": result.detector_name,
+        "model_selection": result.model_selection if hasattr(result, "model_selection") else {},
+        "detector_validation": (
+            result.detector_validation if hasattr(result, "detector_validation") else {}
+        ),
         "data_profile": {
             "source_name": result.profile.source_name,
             "row_count": result.profile.row_count,

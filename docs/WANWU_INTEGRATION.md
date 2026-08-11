@@ -70,6 +70,10 @@ POST /api/v1/wanwu/quick-diagnosis
 可用的 SKAB 标签指标。当前文件标签只用于离线评价，不参与在线模型切换；主模型与阈值仍由
 冻结验证集和设备配置预先确定，避免使用测试数据挑选模型造成数据泄漏。
 
+`analysis.model_selection` 返回任务目标、候选模型适用条件、最终主模型、实际阈值和选择原因。
+万悟未指定 `detector` 时默认自动路由；显式传入 `detector` 时保持人工配置。SKAB 独立测试表明
+四模型严格多数共识会损失事件召回，因此当前只作为可信度证据，不直接抑制主模型告警。
+
 这不是删除大模型能力，而是把比赛现场的第一轮结果交给确定性算法完成；`/api/v1/diagnose`
 仍保留给 Streamlit 和需要高质量自然语言诊断的本地流程。
 
@@ -118,6 +122,7 @@ Content-Type: multipart/form-data
 
 - `data_profile`：数据规模、时间范围、传感器和缺失值；
 - `anomaly_events`：异常事件、峰值风险、主导传感器和时间范围；
+- `model_selection`：场景驱动的主模型选择、候选排序、实际阈值和标签隔离说明；
 - `detector_validation`：多模型交叉验证、共识异常点、模型一致性及失败隔离信息；
 - `operating_regimes`：稳定工况分段、过渡强度和异常事件的工况上下文；
 - `relationship_diagnostics`：异常前后相关性变化、领先与滞后测点及重点排查链路；

@@ -16,6 +16,7 @@ from app.analysis.advice import generate_recommendations
 from app.analysis.detection import detect_anomalies
 from app.analysis.evaluation import evaluate_predictions
 from app.analysis.forecast import forecast_sensors
+from app.analysis.model_selection import select_detection_model
 from app.analysis.model_validation import cross_validate_detectors
 from app.analysis.profiling import build_profile
 from app.analysis.regime import analyze_operating_regimes, suppress_transition_only_events
@@ -84,6 +85,8 @@ def analyze_file(
 
     settings = get_settings()
     config = config or AnalysisConfig(
+        detector_selection_mode="auto",
+        analysis_goal="balanced",
         detector=settings.anomaly_detector,
         threshold=settings.anomaly_threshold,
         rolling_window=settings.rolling_window,
@@ -168,6 +171,38 @@ def analyze_file(
         if set(profile.sensor_columns).issubset(candidate.columns):
             healthy_reference = candidate[profile.sensor_columns]
 
+    # 模型路由只读取任务目标、设备配置和数据条件，不使用当前文件标签。返回的新配置
+    # 是本次真正生效的模型与阈值，后续检测、交叉验证、报告和 API 必须统一使用它。
+    started_at = perf_counter()
+    config, model_selection = select_detection_model(
+        dataframe,
+        profile.sensor_columns,
+        config,
+        loaded.context,
+        healthy_baseline_available=healthy_reference is not None,
+    )
+    execution_trace.append(
+        ExecutionTraceStep(
+            step_id="model_selection",
+            title="任务场景模型选择",
+            module="app.analysis.model_selection.select_detection_model",
+            status="completed",
+            input_summary={
+                "selection_mode": config.detector_selection_mode,
+                "analysis_goal": config.analysis_goal,
+                "sensor_count": len(profile.sensor_columns),
+                "healthy_baseline_available": healthy_reference is not None,
+            },
+            output_summary={
+                "selected_detector": model_selection["selected_detector_name"],
+                "selected_threshold": model_selection["selected_threshold"],
+                "selection_source": model_selection["selection_source"],
+            },
+            duration_seconds=_elapsed_seconds(started_at),
+            limitation="选择规则来自冻结实验和设备配置，企业现场数据到位后仍需重新校准。",
+        )
+    )
+
     started_at = perf_counter()
     detection = detect_anomalies(
         dataframe=dataframe,
@@ -212,7 +247,7 @@ def analyze_file(
     execution_trace.append(
         ExecutionTraceStep(
             step_id="anomaly_detection",
-            title="时频关系异常检测",
+            title="主模型异常检测",
             module="app.analysis.detection.detect_anomalies",
             status="completed",
             input_summary={
@@ -394,6 +429,7 @@ def analyze_file(
         trend_summary=trends,
         recommendations=recommendations,
         device_context=loaded.context,
+        model_selection=model_selection,
         detector_validation=detector_validation,
         operating_regimes=operating_regimes,
         relationship_diagnostics=relationship_diagnostics,

@@ -39,6 +39,18 @@ class AnalysisConfigRequest(StrictApiModel):
         pattern=r"^[A-Za-z0-9_-]+$",
         description="可选设备配置编号；不填写时根据 CSV 表头自动匹配",
     )
+    detector_selection_mode: Literal["auto", "manual"] | None = Field(
+        default=None,
+        description="auto 按任务目标和设备配置选择主模型；manual 保持 detector 指定模型",
+    )
+    analysis_goal: Literal[
+        "balanced",
+        "high_recall",
+        "low_false_alarm",
+        "relationship_fault",
+        "nonlinear_pattern",
+        "fast_screening",
+    ] | None = "balanced"
     detector: DetectorName | None = None
     threshold: float | None = Field(default=None, gt=0, le=100)
     rolling_window: int | None = Field(default=None, ge=5, le=2001)
@@ -94,6 +106,7 @@ class AnalysisResponse(StrictApiModel):
     detector: str
     visualization: dict[str, Any] | None = None
     anomaly_events: list[dict[str, Any]]
+    model_selection: dict[str, Any] = Field(default_factory=dict)
     detector_validation: dict[str, Any] = Field(default_factory=dict)
     operating_regimes: dict[str, Any] | None
     relationship_diagnostics: list[dict[str, Any]]

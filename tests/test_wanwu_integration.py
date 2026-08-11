@@ -179,8 +179,8 @@ def test_wanwu_quick_diagnosis_returns_local_result_without_model_call(
         knowledge_dir=tmp_path,
         llm_api_key="must-not-be-used",
         llm_embedding_model="must-not-be-used",
-        anomaly_detector="mad",
-        anomaly_threshold=3.0,
+        anomaly_detector="time_frequency_relation",
+        anomaly_threshold=4.5,
         rolling_window=31,
         min_event_length=2,
     )
@@ -221,6 +221,8 @@ def test_wanwu_quick_diagnosis_returns_local_result_without_model_call(
         assert "device_profile" in payload["analysis"]
         assert "data_quality" in payload["analysis"]
         assert payload["analysis"]["execution_trace"]
+        assert payload["analysis"]["model_selection"]["mode"] == "automatic"
+        assert payload["analysis"]["model_selection"]["selected_detector"] == "mad"
         assert payload["analysis"]["detector_validation"]["model_count"] >= 3
         assert payload["analysis"]["detector_validation"]["conclusion"]
         assert payload["analysis"]["summary"]["智能体执行摘要"]["自动完成数"] > 0
@@ -228,6 +230,7 @@ def test_wanwu_quick_diagnosis_returns_local_result_without_model_call(
         assert len(
             storage_module.get_repository().list_work_orders(run_id=payload["run_id"])
         ) == len(payload["analysis"]["work_order_drafts"])
+        assert storage_module.get_repository().get_run(payload["run_id"])["detector"] == "mad"
         legacy_payload = dict(payload)
         legacy_payload.pop("analysis_version")
         assert (

@@ -23,6 +23,9 @@ class AnalysisConfig:
 
     # 为空时根据 CSV 表头自动匹配；显式指定时严格执行对应字段契约。
     device_profile_id: str | None = None
+    # manual 保持调用方指定模型，auto 根据任务目标、设备配置和数据条件选择。
+    detector_selection_mode: str = "manual"
+    analysis_goal: str = "balanced"
     detector: str = "time_frequency_relation"
     threshold: float = 4.5
     rolling_window: int = 61
@@ -236,6 +239,7 @@ class AnalysisResult:
     trend_summary: dict[str, dict[str, Any]]
     recommendations: list[str]
     device_context: dict[str, Any] = field(default_factory=dict)
+    model_selection: dict[str, Any] = field(default_factory=dict)
     detector_validation: dict[str, Any] = field(default_factory=dict)
     operating_regimes: OperatingRegimeResult | None = None
     relationship_diagnostics: list[dict[str, Any]] = field(default_factory=list)
@@ -255,6 +259,7 @@ class AnalysisResult:
         return {
             "数据文件": self.profile.source_name,
             "设备配置": self.device_context,
+            "模型选择": self.model_selection,
             "检测器": self.detector_name,
             "数据点数": self.profile.row_count,
             "传感器数量": len(self.profile.sensor_columns),

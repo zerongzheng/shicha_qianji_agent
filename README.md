@@ -33,9 +33,12 @@
 - 支持 SKAB 及通用多变量 CSV 数据上传，并可自动匹配设备数据契约；
 - 支持数据画像、缺失值检查和浏览器端文件预检；
 - 支持 MAD、Isolation Forest、PCA 重构、滑动窗口 AutoEncoder、Hybrid 和时频关系多路径检测；
+- 支持根据任务目标、设备配置、数据规模和健康基线自动选择主模型，并保留完整候选排序；
+- 支持四类互补模型交叉验证；严格多数共识经独立测试未优于主模型，当前仅用于可信度证据；
 - 支持异常事件合并、风险分级、主导传感器归因；
 - 支持工况分段、传感器关系变化和领先/滞后线索分析；
 - 支持最近值、指数平滑、局部线性、滞后岭回归和时频增强岭回归预测，并按滚动回测选择模型；
+- 支持固定时间尾段预测评估与受控退化预警实验，量化基线改善、区间覆盖、方向判断和预警提前量；
 - 支持候选根因、支持证据、证据缺口和现场验证步骤；
 - 支持异步分析任务、任务状态轮询、取消排队任务和历史任务归档；
 - 支持运维工单状态流转、现场反馈、归档和历史案例沉淀；
@@ -275,6 +278,10 @@ http://host.docker.internal:8000/integrations/wanwu/quick-openapi.json
 
 不要在快速工作流后再叠加普通智能体大模型总结，否则容易产生额外调用和限流。
 
+未显式填写 `detector` 时，产品 API 默认采用自动模型选择；显式填写模型时进入手动模式，
+用于固定实验和人工复核。可通过 `analysis_goal` 指定 `balanced`、`high_recall`、
+`low_false_alarm`、`relationship_fault`、`nonlinear_pattern` 或 `fast_screening`。
+
 ## 主要接口
 
 | 接口 | 用途 |
@@ -327,6 +334,9 @@ outputs/shichi_qianji.db
 # 生成案例材料包
 & "E:\Tools\uv\uv.exe" run python main.py --case-package --file ..\SKAB\data\valve1\0.csv
 
+# 评价趋势预测与提前预警成效
+& "E:\Tools\uv\uv.exe" run python main.py --evaluate-forecast --data-root ..\SKAB\data
+
 # 生成证据包
 & "E:\Tools\uv\uv.exe" run python main.py --evidence-pack --case-count 3
 ```
@@ -338,6 +348,9 @@ outputs/evidence_pack/
 ├─ EVIDENCE_PACK_INDEX.md
 ├─ experiments/
 │  ├─ skab_competition_summary.md
+│  ├─ forecast_effectiveness_*.md
+│  ├─ forecast_backtest_*.csv
+│  ├─ controlled_warning_*.csv
 │  ├─ time_frequency_relation_false_positive_analysis.md
 │  ├─ time_frequency_relation_false_positive_events.csv
 │  └─ time_frequency_relation_system_effectiveness.md
@@ -354,6 +367,11 @@ outputs/evidence_pack/
 不代表诊断正确率或企业现场处置效率。也可以单独运行：
 
     uv run python main.py --system-effectiveness --data-root ..\SKAB\data
+
+趋势预测实验在 17 份固定独立测试文件的 136 条传感器序列上保留最后 30 个采样点，
+仅使用此前历史滚动选模。自动策略相对最近值持续模型的标准化 RMSE 平均改善 4.75%，
+经验 95% 区间覆盖率为 95.12%。另有四类固定种子的受控退化场景用于验证提前预警机制，
+它们不是企业数据或设备工程阈值；完整口径见 `docs/competition/SKAB_RESULTS.md`。
 
 输出目录主要包括：
 
@@ -394,6 +412,7 @@ cd "E:\大学课程\竞赛\shichi_qianji_agent\frontend"
 3. 完成 Vue3 + FastAPI 的上传、分析、证据查看、工单确认和历史案例闭环；
 4. 建立小而可靠的通用工业知识库，并保留后续企业文档替换入口；
 5. 完成独立测试集误报审计，并将 `other → valve1 → valve2` 三类案例纳入成果包。
+6. 完成 SKAB 时间尾段预测评估和受控退化提前预警实验，并纳入成果包。
 
 下一步按优先级推进：
 

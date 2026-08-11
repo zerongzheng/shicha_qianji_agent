@@ -77,7 +77,7 @@ settings = get_settings()
 UPLOAD_DIR = settings.output_dir / "api_uploads"
 # 快速诊断会按文件哈希复用历史结果。每当分析管线或返回证据发生实质升级时必须递增
 # 此版本，防止同一份演示 CSV 长期命中旧结果而看不到新能力。
-QUICK_DIAGNOSIS_VERSION = "0.7.0"
+QUICK_DIAGNOSIS_VERSION = "0.8.0"
 
 
 @asynccontextmanager
@@ -141,6 +141,14 @@ def _parse_config(payload: dict[str, Any] | None) -> AnalysisConfig:
     """将万悟工作流传入的可选参数限制在项目支持范围内。"""
 
     payload = payload or {}
+    selection_mode = str(
+        payload.get(
+            "detector_selection_mode",
+            "manual" if "detector" in payload else "auto",
+        )
+    ).strip().lower()
+    if selection_mode not in {"auto", "manual"}:
+        raise ValueError("detector_selection_mode 只能是 auto 或 manual")
     detector = str(payload.get("detector", settings.anomaly_detector))
     default_threshold = DETECTOR_RECOMMENDED_THRESHOLDS.get(
         detector,
@@ -152,6 +160,8 @@ def _parse_config(payload: dict[str, Any] | None) -> AnalysisConfig:
             if not str(payload.get("device_profile_id", "")).strip()
             else str(payload["device_profile_id"]).strip()
         ),
+        detector_selection_mode=selection_mode,
+        analysis_goal=str(payload.get("analysis_goal", "balanced")),
         detector=detector,
         threshold=float(payload.get("threshold", default_threshold)),
         rolling_window=max(5, int(payload.get("rolling_window", settings.rolling_window))),
@@ -224,7 +234,12 @@ def _result_payload(run_id: str, result: Any) -> dict[str, Any]:
     summary = result.to_summary()
     stored_run = get_repository().get_run(run_id)
     stored_config = stored_run.get("config", {}) if stored_run else {}
-    threshold = float(stored_config.get("threshold", 4.5))
+    threshold = float(
+        result.model_selection.get(
+            "selected_threshold",
+            stored_config.get("threshold", 4.5),
+        )
+    )
     return {
         "run_id": run_id,
         "status": "success",
@@ -264,6 +279,7 @@ def _result_payload(run_id: str, result: Any) -> dict[str, Any]:
         "detector": result.detector_name,
         "visualization": _visualization_payload(result, threshold=threshold),
         "anomaly_events": [event.__dict__ for event in result.events],
+        "model_selection": result.model_selection,
         "detector_validation": result.detector_validation,
         "operating_regimes": (
             {
@@ -693,6 +709,14 @@ def _quick_diagnosis_presentation(response: dict[str, Any]) -> str:
     else:
         lines.append("当前配置下未形成持续异常事件。")
     validation = analysis.get("detector_validation") or {}
+    selection = analysis.get("model_selection") or {}
+    if selection:
+        lines.append(
+            "模型选择："
+            f"{selection.get('selected_detector_name', response['detector'])}；"
+            f"目标={selection.get('analysis_goal_name', '综合平衡')}；"
+            f"依据={selection.get('reason', '使用冻结设备配置')}"
+        )
     if validation:
         agreement = validation.get("agreement") or {}
         lines.append(
@@ -719,6 +743,7 @@ def _quick_analysis_payload(run_id: str, result: Any) -> dict[str, Any]:
         "data_quality": full["data_quality"],
         "visualization": full["visualization"],
         "anomaly_events": full["anomaly_events"][:10],
+        "model_selection": full["model_selection"],
         "detector_validation": full["detector_validation"],
         "operating_regimes": full["operating_regimes"],
         "relationship_diagnostics": full["relationship_diagnostics"][:10],

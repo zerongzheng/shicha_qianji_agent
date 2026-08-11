@@ -11,9 +11,17 @@ from pathlib import Path
 
 from app.config import get_settings
 from app.experiments.competition_report import CompetitionReport, build_competition_report
+from app.experiments.consensus_evaluation import (
+    ConsensusEvaluation,
+    evaluate_detector_consensus,
+)
 from app.experiments.false_positive_analysis import (
     FalsePositiveAnalysis,
     analyze_skab_false_positives,
+)
+from app.experiments.forecast_effectiveness import (
+    ForecastEffectiveness,
+    evaluate_forecast_effectiveness,
 )
 from app.experiments.system_effectiveness import (
     SystemEffectiveness,
@@ -29,6 +37,8 @@ class EvidencePack:
     output_dir: Path
     index_path: Path
     competition_report: CompetitionReport
+    consensus_evaluation: ConsensusEvaluation
+    forecast_effectiveness: ForecastEffectiveness
     false_positive_analysis: FalsePositiveAnalysis
     system_effectiveness: SystemEffectiveness
     cases: tuple[CasePackage, ...]
@@ -56,6 +66,14 @@ def build_evidence_pack(
         rerun_experiments=rerun_experiments,
     )
     resolved_data_root = Path(data_root).expanduser().resolve()
+    consensus_evaluation = evaluate_detector_consensus(
+        resolved_data_root,
+        output_dir=target / "experiments",
+    )
+    forecast_effectiveness = evaluate_forecast_effectiveness(
+        resolved_data_root,
+        output_dir=target / "experiments",
+    )
     false_positive_analysis = analyze_skab_false_positives(
         resolved_data_root,
         output_dir=target / "experiments",
@@ -76,6 +94,8 @@ def build_evidence_pack(
         _build_index(
             resolved_data_root,
             competition,
+            consensus_evaluation,
+            forecast_effectiveness,
             false_positive_analysis,
             system_effectiveness,
             cases,
@@ -86,6 +106,8 @@ def build_evidence_pack(
         target,
         index_path,
         competition,
+        consensus_evaluation,
+        forecast_effectiveness,
         false_positive_analysis,
         system_effectiveness,
         cases,
@@ -135,6 +157,8 @@ def _select_case_files(data_root: Path, count: int) -> list[Path]:
 def _build_index(
     data_root: Path,
     competition: CompetitionReport,
+    consensus_evaluation: ConsensusEvaluation,
+    forecast_effectiveness: ForecastEffectiveness,
     false_positive_analysis: FalsePositiveAnalysis,
     system_effectiveness: SystemEffectiveness,
     cases: tuple[CasePackage, ...],
@@ -150,10 +174,12 @@ def _build_index(
         "## 推荐讲解顺序",
         "",
         "1. 先展示 `experiments/skab_competition_summary.md`，说明数据划分和模型对比。",
-        "2. 展示 `experiments/time_frequency_relation_false_positive_analysis.md`，说明 other 场景的误报来源。",
-        "3. 再展示典型案例中的风险图，说明异常如何从数据中被发现。",
-        "4. 打开案例摘要，沿着“异常事件 - 主导传感器 - 候选原因 - 排查动作”讲解。",
-        "5. 回到 Vue3 的“运维闭环”，演示工单确认、现场反馈和历史案例沉淀。",
+        "2. 展示多模型共识实验，说明为什么交叉验证只增强可信度、不直接覆盖主告警。",
+        "3. 展示趋势预测与提前预警实验，区分 SKAB 时间尾段结果和受控退化模拟。",
+        "4. 展示 `experiments/time_frequency_relation_false_positive_analysis.md`，说明 other 场景的误报来源。",
+        "5. 再展示典型案例中的风险图，说明异常如何从数据中被发现。",
+        "6. 打开案例摘要，沿着“异常事件 - 主导传感器 - 候选原因 - 排查动作”讲解。",
+        "7. 回到 Vue3 的“运维闭环”，演示工单确认、现场反馈和历史案例沉淀。",
         "",
         "## 实验材料",
         "",
@@ -162,6 +188,13 @@ def _build_index(
         f"- 数据划分：`{competition.split_path}`",
         f"- 最终评估说明：`{competition.report_path.parent / 'FINAL_EVALUATION.md'}`",
         f"- 能力对比表：`{competition.report_path.parent / 'CAPABILITY_COMPARISON.md'}`",
+        f"- 多模型共识报告：`{consensus_evaluation.report_path}`",
+        f"- 多模型共识逐文件记录：`{consensus_evaluation.csv_path}`",
+        f"- 共识实验成功记录：{len(consensus_evaluation.records)}；失败文件：{len(consensus_evaluation.failed_files)}",
+        f"- 趋势预测与预警报告：`{forecast_effectiveness.report_path}`",
+        f"- SKAB 时间尾段逐序列记录：`{forecast_effectiveness.real_csv_path}`",
+        f"- 受控退化场景记录：`{forecast_effectiveness.warning_csv_path}`",
+        f"- 预测成功记录：{len(forecast_effectiveness.real_records)}；失败任务：{len(forecast_effectiveness.failed_tasks)}",
         f"- 误报解释报告：`{false_positive_analysis.report_path}`",
         f"- 逐事件误报审计表：`{false_positive_analysis.csv_path}`",
         f"- 误报事件数：{len(false_positive_analysis.events)}；成功分析文件：{false_positive_analysis.analyzed_file_count}/{false_positive_analysis.file_count}",

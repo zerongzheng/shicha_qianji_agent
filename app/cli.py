@@ -12,6 +12,8 @@ from app.config import get_settings
 from app.experiments import (
     analyze_skab_system_effectiveness,
     build_competition_report,
+    evaluate_detector_consensus,
+    evaluate_forecast_effectiveness,
     evaluate_regime_strategy,
     run_hybrid_weight_ablation,
     run_skab_benchmark,
@@ -71,6 +73,16 @@ def main() -> None:
         "--ablate-tfr",
         action="store_true",
         help="比较时域、频域和关系路径组合，并用冻结配置运行独立测试",
+    )
+    parser.add_argument(
+        "--evaluate-consensus",
+        action="store_true",
+        help="在固定独立测试集比较单模型与四模型严格多数共识",
+    )
+    parser.add_argument(
+        "--evaluate-forecast",
+        action="store_true",
+        help="评价 SKAB 时间尾段预测和受控退化场景提前预警成效",
     )
     parser.add_argument(
         "--evaluate-regimes",
@@ -139,7 +151,31 @@ def main() -> None:
         contamination=args.contamination,
     )
 
-    if args.system_effectiveness:
+    if args.evaluate_forecast:
+        evaluation = evaluate_forecast_effectiveness(
+            args.data_root,
+            max_files=args.max_files or None,
+        )
+        summary = {
+            "real_record_count": len(evaluation.real_records),
+            "warning_scenario_count": len(evaluation.warning_records),
+            "failed_tasks": evaluation.failed_tasks,
+            "real_csv_path": str(evaluation.real_csv_path),
+            "warning_csv_path": str(evaluation.warning_csv_path),
+            "report_path": str(evaluation.report_path),
+        }
+    elif args.evaluate_consensus:
+        evaluation = evaluate_detector_consensus(
+            args.data_root,
+            max_files=args.max_files or None,
+        )
+        summary = {
+            "record_count": len(evaluation.records),
+            "failed_files": evaluation.failed_files,
+            "csv_path": str(evaluation.csv_path),
+            "report_path": str(evaluation.report_path),
+        }
+    elif args.system_effectiveness:
         effectiveness = analyze_skab_system_effectiveness(args.data_root)
         summary = {
             "detector": effectiveness.detector,
@@ -166,6 +202,11 @@ def main() -> None:
             "evidence_pack_dir": str(pack.output_dir),
             "index_path": str(pack.index_path),
             "experiment_report_path": str(pack.competition_report.report_path),
+            "consensus_report_path": str(pack.consensus_evaluation.report_path),
+            "consensus_csv_path": str(pack.consensus_evaluation.csv_path),
+            "forecast_report_path": str(pack.forecast_effectiveness.report_path),
+            "forecast_csv_path": str(pack.forecast_effectiveness.real_csv_path),
+            "controlled_warning_csv_path": str(pack.forecast_effectiveness.warning_csv_path),
             "false_positive_report_path": str(pack.false_positive_analysis.report_path),
             "false_positive_csv_path": str(pack.false_positive_analysis.csv_path),
             "system_effectiveness_report_path": str(pack.system_effectiveness.report_path),
