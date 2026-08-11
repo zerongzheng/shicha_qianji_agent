@@ -79,7 +79,50 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
                 f"{', '.join(event.dominant_sensors)} |"
             )
 
-    lines.extend(["", "## 5. 标签评估", ""])
+    lines.extend(["", "## 5. 多模型交叉验证", ""])
+    validation = result.detector_validation
+    if not validation:
+        lines.append("本次未启用多模型交叉验证，主检测结果保持有效。")
+    else:
+        agreement = validation.get("agreement", {})
+        lines.extend(
+            [
+                f"- 主模型：{validation.get('primary_detector_name', '未知')}",
+                f"- 成功运行模型数：{validation.get('model_count', 0)}",
+                f"- 跨模型一致性：{agreement.get('level', '不可用')}",
+                f"- 共识异常点：{agreement.get('consensus_anomaly_points', 0)}",
+                f"- 综合判断：{validation.get('conclusion', '未形成结论')}",
+                "",
+                "| 模型 | 方法类别 | 主模型 | 阈值 | 异常点 | 事件数 | 与主模型异常集 Jaccard | 事件级 F1 |",
+                "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for model in validation.get("models", []):
+            evaluation = model.get("evaluation") or {}
+            event_f1 = evaluation.get("event_f1")
+            lines.append(
+                f"| {model.get('detector_name', model.get('detector', '未知'))} | "
+                f"{model.get('model_family', '未知')} | "
+                f"{'是' if model.get('is_primary') else '否'} | "
+                f"{_format_number(model.get('threshold'))} | "
+                f"{model.get('anomaly_point_count', 0)} | {model.get('event_count', 0)} | "
+                f"{_format_number(model.get('agreement_with_primary', {}).get('anomaly_jaccard'))} | "
+                f"{_format_number(event_f1)} |"
+            )
+        if validation.get("failed_models"):
+            failed_names = ", ".join(
+                item.get("detector", "未知") for item in validation["failed_models"]
+            )
+            lines.append(f"\n> 未成功运行的互补模型：{failed_names}；失败已隔离，不影响主分析。")
+        lines.extend(
+            [
+                "",
+                f"> 模型选择依据：{validation.get('selection_basis', '使用冻结验证集配置。')}",
+                "> 多模型一致性只增强告警可信度，不能替代设备机理分析和现场复测。",
+            ]
+        )
+
+    lines.extend(["", "## 6. 标签评估", ""])
     if result.metrics is None:
         lines.append("数据中没有 `anomaly` 标签，本次不计算监督评估指标。")
     else:
@@ -113,7 +156,7 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
             ]
         )
 
-    lines.extend(["", "## 6. 趋势与漂移", ""])
+    lines.extend(["", "## 7. 趋势与漂移", ""])
     if not result.trend_summary:
         lines.append("末段数据未出现明显趋势漂移。")
     else:
@@ -130,7 +173,7 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
                 f"{detail['均值偏移标准差']} |"
             )
 
-    lines.extend(["", "## 7. 工况识别与切换证据", ""])
+    lines.extend(["", "## 8. 工况识别与切换证据", ""])
     regimes = result.operating_regimes
     if regimes is None:
         lines.append("本次未执行无监督工况识别。")
@@ -159,7 +202,7 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
             ]
         )
 
-    lines.extend(["", "## 8. 多传感器关系证据", ""])
+    lines.extend(["", "## 9. 多传感器关系证据", ""])
     if not result.relationship_diagnostics:
         lines.append("当前异常事件不足以形成稳定的相关性或时滞判断。")
     else:
@@ -185,7 +228,7 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
                 )
             lines.append("")
 
-    lines.extend(["", "## 9. 候选根因与证据链", ""])
+    lines.extend(["", "## 10. 候选根因与证据链", ""])
     if not result.event_diagnoses:
         lines.append("当前没有异常事件需要生成候选根因。")
     else:
@@ -237,7 +280,7 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
                     ]
                 )
 
-    lines.extend(["", "## 10. 待确认工单草案", ""])
+    lines.extend(["", "## 11. 待确认工单草案", ""])
     if not result.work_order_drafts:
         lines.append("当前没有待生成的处置工单。")
     else:
@@ -260,11 +303,11 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
                 ]
             )
 
-    lines.extend(["", "## 11. 运维处置建议", ""])
+    lines.extend(["", "## 12. 运维处置建议", ""])
     for index, recommendation in enumerate(result.recommendations, start=1):
         lines.append(f"{index}. {recommendation}")
 
-    lines.extend(["", "## 12. 趋势预测与风险预警", ""])
+    lines.extend(["", "## 13. 趋势预测与风险预警", ""])
     if not result.forecast_results:
         lines.append("当前数据长度不足，未生成预测结果。")
     else:
@@ -295,10 +338,11 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
     lines.extend(
         [
             "",
-            "## 13. 方法说明",
+            "## 14. 方法说明",
             "",
             (
-                "系统先由确定性算法完成数据校验、稳健异常检测、无监督工况识别、标签评估和趋势计算，"
+                "系统先由确定性算法完成数据校验和主模型异常检测，再以稳健统计、树模型、"
+                "多变量重构及时频关系模型进行交叉核验，随后执行无监督工况识别、标签评估和趋势计算，"
                 "并比较异常事件前后的传感器相关性与差分时滞。确定性根因引擎再把事件前后"
                 "变化方向、关系证据、工况上下文和预测趋势与通用故障模式匹配，输出候选根因、"
                 "证据缺口和工单草案。"
@@ -359,6 +403,9 @@ def _format_trace_output(output_summary: dict[str, object]) -> str:
         "detector": "检测器",
         "anomaly_point_count": "异常点",
         "event_count": "异常事件",
+        "model_count": "验证模型",
+        "agreement_level": "一致性",
+        "selected_detector": "主模型",
         "state_count": "工况",
         "transition_point_count": "切换点",
         "suppressed_event_count": "抑制事件",

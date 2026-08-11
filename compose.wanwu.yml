@@ -5,6 +5,7 @@ services:
       dockerfile: Dockerfile
     container_name: shichi-qianji-api
     restart: unless-stopped
+    init: true
     env_file:
       - .env
     environment:
@@ -15,14 +16,22 @@ services:
       # 万悟与本服务加入同一个外部网络后，OpenAPI 直接使用稳定容器名。
       API_PUBLIC_BASE_URL: ${API_PUBLIC_BASE_URL:-http://shichi-qianji-api:8000}
     ports:
-      - "8000:8000"
+      # 默认只允许服务器本机和 SSH 隧道访问；万悟容器通过 wanwu-net 直接调用服务名。
+      - "${API_BIND_ADDRESS:-127.0.0.1}:${API_HOST_PORT:-8000}:8000"
     volumes:
-      - ./outputs:/app/outputs
-      - ../SKAB:/datasets/SKAB:ro
+      - ${SHICHI_OUTPUT_DIR:-./outputs}:/app/outputs
+      - ${SKAB_HOST_DIR:-../SKAB}:/datasets/SKAB:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
       - wanwu-net
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
 
 networks:
   wanwu-net:

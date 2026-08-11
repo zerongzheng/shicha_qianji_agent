@@ -56,14 +56,19 @@ http://host.docker.internal:8000/integrations/wanwu/quick-openapi.json
 POST /api/v1/wanwu/quick-diagnosis
 ```
 
-该接口接收文件 URL 或 Base64 后，由时察千机后端依次完成数据画像、异常检测、工况分析、
-根因候选排序、关键词知识检索和运维建议生成。它不会调用外部 Chat 或 Embedding 接口，
+该接口接收文件 URL 或 Base64 后，由时察千机后端依次完成数据画像、主模型异常检测、
+四类互补检测器交叉验证、工况分析、根因候选排序、关键词知识检索和运维建议生成。
+交叉验证复用主模型结果，只补跑轻量检测器，不会重复整条诊断管线。接口不会调用外部 Chat 或 Embedding 接口，
 因此 `model_call_count` 固定为 `0`，不会额外消耗比赛方大模型 QPM。返回的 `presentation` 是
 可直接展示给用户的中文摘要，`analysis` 保留结构化证据，便于万悟后续展示或生成卡片。
 `automatic_diagnosis` 只保留诊断正文、使用边界和知识来源，不重复嵌套完整算法证据，避免
 万悟结果上下文膨胀。
 接口还会按文件内容哈希和完整分析配置复用最近一次成功结果；万悟重复提交时返回
 `cache_hit=true`，不会重复计算或重复生成工单。
+
+`analysis.detector_validation` 返回各检测器的阈值、异常点数、事件数、与主模型的一致性和
+可用的 SKAB 标签指标。当前文件标签只用于离线评价，不参与在线模型切换；主模型与阈值仍由
+冻结验证集和设备配置预先确定，避免使用测试数据挑选模型造成数据泄漏。
 
 这不是删除大模型能力，而是把比赛现场的第一轮结果交给确定性算法完成；`/api/v1/diagnose`
 仍保留给 Streamlit 和需要高质量自然语言诊断的本地流程。
@@ -113,6 +118,7 @@ Content-Type: multipart/form-data
 
 - `data_profile`：数据规模、时间范围、传感器和缺失值；
 - `anomaly_events`：异常事件、峰值风险、主导传感器和时间范围；
+- `detector_validation`：多模型交叉验证、共识异常点、模型一致性及失败隔离信息；
 - `operating_regimes`：稳定工况分段、过渡强度和异常事件的工况上下文；
 - `relationship_diagnostics`：异常前后相关性变化、领先与滞后测点及重点排查链路；
 - `root_cause_diagnoses`：候选根因排序、置信度、支持证据、证据缺口和现场验证步骤；
@@ -380,6 +386,48 @@ docker compose -f compose.wanwu.yml up -d --build
 这些条件后的部署和导入工作压缩为固定命令和固定 Schema。
 
 不要将完整 CSV 直接放进大模型提示词。大模型只读取分析 API 返回的结构化摘要和知识库证据。
+
+## Ubuntu 服务器部署
+
+老师提供的 Ubuntu 服务器上，万悟和时察千机应加入同一个外部 Docker 网络：
+
+```bash
+docker network create wanwu-net 2>/dev/null || true
+```
+
+时察千机 `.env` 推荐至少确认以下配置：
+
+```dotenv
+API_PUBLIC_BASE_URL=http://shichi-qianji-api:8000
+API_BIND_ADDRESS=127.0.0.1
+API_HOST_PORT=8000
+SHICHI_OUTPUT_DIR=/data/shichi-qianji/outputs
+SKAB_HOST_DIR=/data/datasets/SKAB
+WANWU_ALLOW_PRIVATE_FILE_URLS=false
+WANWU_ALLOWED_FILE_HOSTS=
+INDUSTRIAL_API_KEY=请生成独立随机密钥
+```
+
+`API_BIND_ADDRESS=127.0.0.1` 使主机端口只允许服务器本机和 SSH 隧道访问；万悟容器仍可通过
+`http://shichi-qianji-api:8000` 调用。不要为了方便直接把 API 暴露到 `0.0.0.0`。
+
+万悟文件节点返回的临时 URL 可能指向 Docker 内部文件服务。先在工作流运行详情中确认
+`file_url` 的主机名，再把该主机名加入 `WANWU_ALLOWED_FILE_HOSTS`，例如：
+
+```dotenv
+WANWU_ALLOWED_FILE_HOSTS=nginx-wanwu,minio-wanwu
+```
+
+只填写实际出现的容器主机名，不要填写整个内网网段，也不要把 `127.0.0.1` 当成万悟容器。
+修改 `.env` 后重建时察千机 API，并执行服务器只读检查：
+
+```bash
+docker compose -f compose.wanwu.yml up -d --build
+bash scripts/check_wanwu_server.sh
+```
+
+快速诊断会先按文件内容哈希和分析参数查询缓存。万悟因网络抖动重复提交同一文件时，系统直接
+返回原成功结果，不再重复保存 CSV、执行分析或生成工单，避免服务器磁盘被演示重试持续占用。
 
 ## 比赛接口额度
 

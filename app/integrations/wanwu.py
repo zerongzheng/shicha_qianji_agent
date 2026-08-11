@@ -7,7 +7,8 @@
 2. 小文件使用 Base64 文本直接传递。
 
 URL 下载默认禁止访问本机、局域网、链路本地和保留地址，防止该接口被利用去探测部署机器
-内部网络。只有明确受控的本地联调环境才应开启 ``WANWU_ALLOW_PRIVATE_FILE_URLS``。
+内部网络。服务器部署时应使用 ``WANWU_ALLOWED_FILE_HOSTS`` 精确放行万悟文件服务，
+只有完全受控的临时联调环境才应开启 ``WANWU_ALLOW_PRIVATE_FILE_URLS``。
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ def receive_wanwu_csv(
     max_bytes: int,
     download_timeout: float,
     allow_private_urls: bool,
+    allowed_private_hosts: tuple[str, ...] = (),
 ) -> IncomingCsv:
     """读取万悟传来的唯一文件来源，并返回统一二进制结果。"""
 
@@ -49,6 +51,7 @@ def receive_wanwu_csv(
             max_bytes=max_bytes,
             timeout=download_timeout,
             allow_private_urls=allow_private_urls,
+            allowed_private_hosts=allowed_private_hosts,
         )
         file_name = _safe_csv_name(requested_file_name or url_file_name)
         return IncomingCsv(file_name=file_name, content=content, source_type="url")
@@ -85,11 +88,18 @@ def _download_file(
     max_bytes: int,
     timeout: float,
     allow_private_urls: bool,
+    allowed_private_hosts: tuple[str, ...],
 ) -> tuple[bytes, str]:
     """限制协议、目标地址、重定向和响应大小后下载文件。"""
 
-    _validate_remote_url(raw_url, allow_private_urls=allow_private_urls)
-    opener = build_opener(_SafeRedirectHandler(allow_private_urls))
+    _validate_remote_url(
+        raw_url,
+        allow_private_urls=allow_private_urls,
+        allowed_private_hosts=allowed_private_hosts,
+    )
+    opener = build_opener(
+        _SafeRedirectHandler(allow_private_urls, allowed_private_hosts)
+    )
     request = Request(
         raw_url,
         headers={"User-Agent": "shichi-qianji-wanwu-adapter/1.0"},
@@ -115,16 +125,30 @@ def _download_file(
 class _SafeRedirectHandler(HTTPRedirectHandler):
     """每次 HTTP 重定向都重新执行地址安全校验。"""
 
-    def __init__(self, allow_private_urls: bool) -> None:
+    def __init__(
+        self,
+        allow_private_urls: bool,
+        allowed_private_hosts: tuple[str, ...],
+    ) -> None:
         super().__init__()
         self.allow_private_urls = allow_private_urls
+        self.allowed_private_hosts = allowed_private_hosts
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        _validate_remote_url(newurl, allow_private_urls=self.allow_private_urls)
+        _validate_remote_url(
+            newurl,
+            allow_private_urls=self.allow_private_urls,
+            allowed_private_hosts=self.allowed_private_hosts,
+        )
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def _validate_remote_url(raw_url: str, *, allow_private_urls: bool) -> None:
+def _validate_remote_url(
+    raw_url: str,
+    *,
+    allow_private_urls: bool,
+    allowed_private_hosts: tuple[str, ...] = (),
+) -> None:
     """拒绝非 HTTP 协议以及默认不允许访问的内部网络地址。"""
 
     parsed = urlparse(raw_url)
@@ -134,6 +158,10 @@ def _validate_remote_url(raw_url: str, *, allow_private_urls: bool) -> None:
         raise ValueError("file_url 不允许携带 URL 用户名或密码")
     if allow_private_urls:
         return
+    normalized_host = parsed.hostname.casefold().rstrip(".")
+    host_is_allowed = normalized_host in {
+        host.casefold().rstrip(".") for host in allowed_private_hosts
+    }
     try:
         addresses = {
             item[4][0]
@@ -143,8 +171,11 @@ def _validate_remote_url(raw_url: str, *, allow_private_urls: bool) -> None:
         raise ValueError("file_url 域名无法解析") from exc
     for address in addresses:
         ip = ipaddress.ip_address(address)
-        if not ip.is_global:
-            raise ValueError("file_url 默认禁止访问本机、局域网或保留网络地址")
+        if not ip.is_global and not host_is_allowed:
+            raise ValueError(
+                "file_url 默认禁止访问本机、局域网或保留网络地址；"
+                "服务器联调请配置 WANWU_ALLOWED_FILE_HOSTS"
+            )
 
 
 def _safe_csv_name(raw_name: str) -> str:

@@ -236,6 +236,7 @@ class AnalysisResult:
     trend_summary: dict[str, dict[str, Any]]
     recommendations: list[str]
     device_context: dict[str, Any] = field(default_factory=dict)
+    detector_validation: dict[str, Any] = field(default_factory=dict)
     operating_regimes: OperatingRegimeResult | None = None
     relationship_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     forecast_results: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -282,6 +283,7 @@ class AnalysisResult:
                 else "当前数据没有 anomaly 标签，无法计算监督评估指标"
             ),
             "趋势判断": self.trend_summary,
+            "异常检测交叉验证": self.detector_validation,
             "工况识别": _regime_overview(self.operating_regimes),
             "多传感器关系证据": self.relationship_diagnostics,
             "候选根因诊断": [_event_diagnosis_summary(item) for item in self.event_diagnoses],

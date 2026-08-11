@@ -17,6 +17,7 @@ def build_wanwu_openapi(
     public_base_url: str,
     *,
     quick_only: bool = False,
+    api_key_required: bool = False,
 ) -> dict[str, Any]:
     """生成 OpenAPI 3.0 兼容格式，可选只暴露比赛演示工具。"""
 
@@ -58,7 +59,11 @@ def build_wanwu_openapi(
         for operation in path_item.values():
             if not isinstance(operation, dict):
                 continue
-            operation.pop("security", None)
+            if api_key_required:
+                # 服务器启用服务密钥后，让万悟导入工具时识别需要配置的鉴权字段。
+                operation["security"] = [{"IndustrialApiKey": []}]
+            else:
+                operation.pop("security", None)
             # 本地默认不启用工业 API Key。移除 FastAPI 自动生成的可空请求头参数，
             # 避免万悟工具解析器因 anyOf/null 而不展示可用 API。
             operation["parameters"] = [

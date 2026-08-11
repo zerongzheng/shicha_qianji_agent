@@ -16,6 +16,7 @@ from app.analysis.advice import generate_recommendations
 from app.analysis.detection import detect_anomalies
 from app.analysis.evaluation import evaluate_predictions
 from app.analysis.forecast import forecast_sensors
+from app.analysis.model_validation import cross_validate_detectors
 from app.analysis.profiling import build_profile
 from app.analysis.regime import analyze_operating_regimes, suppress_transition_only_events
 from app.analysis.relationships import analyze_event_relationships
@@ -68,6 +69,7 @@ def analyze_file(
     write_report: bool = True,
     run_forecast: bool = True,
     run_regime: bool = True,
+    run_detector_validation: bool = False,
     case_matcher: Callable[
         [list[dict[str, Any]], list[str], str],
         list[HistoricalCaseMatch],
@@ -174,6 +176,19 @@ def analyze_file(
         healthy_reference=healthy_reference,
     )
     detection_duration = _elapsed_seconds(started_at)
+    if run_detector_validation:
+        started_at = perf_counter()
+        detector_validation = cross_validate_detectors(
+            dataframe,
+            profile.sensor_columns,
+            config,
+            detection,
+            healthy_reference,
+        )
+        validation_duration = _elapsed_seconds(started_at)
+    else:
+        detector_validation = {}
+        validation_duration = None
     if run_regime:
         started_at = perf_counter()
         operating_regimes = analyze_operating_regimes(
@@ -212,6 +227,29 @@ def analyze_file(
             },
             duration_seconds=detection_duration,
             limitation="异常分数用于发现偏离模式，不能单独证明设备已经发生物理故障。",
+        )
+    )
+    execution_trace.append(
+        ExecutionTraceStep(
+            step_id="model_cross_validation",
+            title="异常检测多模型交叉验证",
+            module="app.analysis.model_validation.cross_validate_detectors",
+            status="completed" if run_detector_validation else "skipped",
+            input_summary={"primary_detector": config.detector},
+            output_summary=(
+                {
+                    "model_count": detector_validation.get("model_count", 0),
+                    "agreement_level": detector_validation.get("agreement", {}).get(
+                        "level",
+                        "不可用",
+                    ),
+                    "selected_detector": detector_validation.get("selected_detector"),
+                }
+                if run_detector_validation
+                else {"reason": "run_detector_validation=False"}
+            ),
+            duration_seconds=validation_duration,
+            limitation="跨模型一致性用于增强告警可信度，不能替代设备机理和现场复测。",
         )
     )
     execution_trace.append(
@@ -356,6 +394,7 @@ def analyze_file(
         trend_summary=trends,
         recommendations=recommendations,
         device_context=loaded.context,
+        detector_validation=detector_validation,
         operating_regimes=operating_regimes,
         relationship_diagnostics=relationship_diagnostics,
         forecast_results=forecasts,

@@ -6,6 +6,7 @@ Streamlit 仍然直接调用分析核心，方便开发阶段离线运行。
 
 from __future__ import annotations
 
+import hashlib
 import secrets
 import uuid
 from contextlib import asynccontextmanager
@@ -74,6 +75,9 @@ except ImportError:  # 让未安装 API 依赖时，核心分析和 Streamlit �
 
 settings = get_settings()
 UPLOAD_DIR = settings.output_dir / "api_uploads"
+# 快速诊断会按文件哈希复用历史结果。每当分析管线或返回证据发生实质升级时必须递增
+# 此版本，防止同一份演示 CSV 长期命中旧结果而看不到新能力。
+QUICK_DIAGNOSIS_VERSION = "0.7.0"
 
 
 @asynccontextmanager
@@ -260,6 +264,7 @@ def _result_payload(run_id: str, result: Any) -> dict[str, Any]:
         "detector": result.detector_name,
         "visualization": _visualization_payload(result, threshold=threshold),
         "anomaly_events": [event.__dict__ for event in result.events],
+        "detector_validation": result.detector_validation,
         "operating_regimes": (
             {
                 "state_count": result.operating_regimes.state_count,
@@ -687,6 +692,15 @@ def _quick_diagnosis_presentation(response: dict[str, Any]) -> str:
             )
     else:
         lines.append("当前配置下未形成持续异常事件。")
+    validation = analysis.get("detector_validation") or {}
+    if validation:
+        agreement = validation.get("agreement") or {}
+        lines.append(
+            "多模型验证："
+            f"{validation.get('model_count', 0)} 种检测器完成交叉核验，"
+            f"一致性={agreement.get('level', '不可用')}；"
+            f"{validation.get('conclusion', '未形成交叉验证结论')}"
+        )
     if diagnosis_text:
         lines.extend(["诊断摘要：", diagnosis_text[:4000]])
     lines.append("提示：结果用于辅助排查，故障确诊仍需结合现场工况和人工复核。")
@@ -698,9 +712,14 @@ def _quick_analysis_payload(run_id: str, result: Any) -> dict[str, Any]:
 
     full = _result_payload(run_id, result)
     return {
+        # 这些字段是后续新增的企业数据适配和智能体可解释性证据。它们体量有限，
+        # 应随快速诊断一起返回，避免后端已经执行但万悟只能看到旧版分析摘要。
+        "device_profile": full["device_profile"],
         "data_profile": full["data_profile"],
+        "data_quality": full["data_quality"],
         "visualization": full["visualization"],
         "anomaly_events": full["anomaly_events"][:10],
+        "detector_validation": full["detector_validation"],
         "operating_regimes": full["operating_regimes"],
         "relationship_diagnostics": full["relationship_diagnostics"][:10],
         "root_cause_diagnoses": full["root_cause_diagnoses"][:10],
@@ -709,6 +728,7 @@ def _quick_analysis_payload(run_id: str, result: Any) -> dict[str, Any]:
         "forecast_results": full["forecast_results"],
         "risk_alerts": full["risk_alerts"][:10],
         "recommendations": full["recommendations"][:10],
+        "execution_trace": full["execution_trace"],
         "summary": full["summary"],
         "limitations": full["limitations"],
     }
@@ -758,8 +778,11 @@ def _quick_cached_response(
         "presentation",
         "model_call_count",
         "diagnosis_mode",
+        "analysis_version",
     }
     if not required.issubset(result):
+        return None
+    if result.get("analysis_version") != QUICK_DIAGNOSIS_VERSION:
         return None
     cached = dict(result)
     # 返回本次接收方式，但任务和结果仍明确指向原始成功 run_id。
@@ -785,6 +808,7 @@ def _execute_analysis_job(
             source_path,
             config=config,
             write_report=True,
+            run_detector_validation=True,
             case_matcher=repository.find_similar_cases,
         )
         response = _result_payload(run_id, result)
@@ -824,7 +848,11 @@ if app:
     def wanwu_openapi() -> dict[str, Any]:
         """返回仅包含万悟可稳定调用工具的精简 OpenAPI。"""
 
-        return build_wanwu_openapi(app.openapi(), settings.api_public_base_url)
+        return build_wanwu_openapi(
+            app.openapi(),
+            settings.api_public_base_url,
+            api_key_required=bool(settings.industrial_api_key),
+        )
 
     @app.get("/integrations/wanwu/quick-openapi.json", include_in_schema=False)
     def wanwu_quick_openapi() -> dict[str, Any]:
@@ -834,6 +862,7 @@ if app:
             app.openapi(),
             settings.api_public_base_url,
             quick_only=True,
+            api_key_required=bool(settings.industrial_api_key),
         )
 
     @app.get("/health")
@@ -1043,6 +1072,7 @@ if app:
                 source_path,
                 config=config,
                 write_report=True,
+                run_detector_validation=True,
                 case_matcher=get_repository().find_similar_cases,
             )
             response = _result_payload(logger.run_id, result)
@@ -1094,6 +1124,7 @@ if app:
                 source_path,
                 config=config,
                 write_report=True,
+                run_detector_validation=True,
                 case_matcher=get_repository().find_similar_cases,
             )
             response = _result_payload(logger.run_id, result)
@@ -1222,6 +1253,7 @@ if app:
                 max_bytes=settings.max_upload_bytes,
                 download_timeout=settings.wanwu_download_timeout,
                 allow_private_urls=settings.wanwu_allow_private_file_urls,
+                allowed_private_hosts=settings.wanwu_allowed_file_hosts,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1270,18 +1302,18 @@ if app:
                 max_bytes=settings.max_upload_bytes,
                 download_timeout=settings.wanwu_download_timeout,
                 allow_private_urls=settings.wanwu_allow_private_file_urls,
+                allowed_private_hosts=settings.wanwu_allowed_file_hosts,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        file_id, source_path, metadata = _store_uploaded_csv(
-            incoming.file_name,
-            incoming.content,
-        )
         config = _parse_request_config(payload.config.as_overrides())
+        # 万悟可能因网络重试重复调用同一工具。先按内容哈希查找成功结果，
+        # 命中时不再写入重复 CSV，也不重复生成工单和分析报告。
+        file_sha256 = hashlib.sha256(incoming.content).hexdigest()
         cached = _quick_cached_response(
             get_repository().find_successful_run(
-                file_sha256=metadata["sha256"],
+                file_sha256=file_sha256,
                 operation="quick_diagnose",
                 detector=config.detector,
                 config=asdict(config),
@@ -1290,6 +1322,11 @@ if app:
         )
         if cached is not None:
             return cached
+
+        file_id, source_path, metadata = _store_uploaded_csv(
+            incoming.file_name,
+            incoming.content,
+        )
 
         logger = RunLogger(run_id=f"run_{uuid.uuid4().hex[:12]}")
         _start_persisted_run(
@@ -1304,6 +1341,7 @@ if app:
                 source_path,
                 config=config,
                 write_report=True,
+                run_detector_validation=True,
                 case_matcher=get_repository().find_similar_cases,
             )
             # 快速工具不向 GLM-5 发起请求，避免“外层万悟调用 + 内部诊断调用”叠加限流。
@@ -1325,6 +1363,7 @@ if app:
                 "presentation": "",
                 "model_call_count": 0,
                 "diagnosis_mode": "deterministic",
+                "analysis_version": QUICK_DIAGNOSIS_VERSION,
                 "cache_hit": False,
             }
             response["presentation"] = _quick_diagnosis_presentation(response)

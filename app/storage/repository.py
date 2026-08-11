@@ -300,10 +300,11 @@ class IndustrialRepository:
             if cursor.rowcount != 1:
                 raise LookupError(f"找不到分析任务：{run_id}")
             if status == "success" and result is not None:
+                analysis = _result_analysis_section(result)
                 self._upsert_work_orders(
                     connection,
                     run_id,
-                    result.get("work_order_drafts", []),
+                    analysis.get("work_order_drafts", []),
                 )
 
     def record_local_analysis(
@@ -896,7 +897,8 @@ def _run_record(row: sqlite3.Row, include_result: bool) -> dict[str, Any]:
         record["result"] = _from_json(row["result_json"], None)
     else:
         result = _from_json(row["result_json"], {})
-        record["summary"] = result.get("summary") if isinstance(result, dict) else None
+        analysis = _result_analysis_section(result)
+        record["summary"] = analysis.get("summary")
     return record
 
 
@@ -984,7 +986,8 @@ def _confirmed_case_record(row: sqlite3.Row) -> dict[str, Any] | None:
     """从历史任务结果中提取指定事件的稳定案例特征。"""
 
     result = _from_json(row["result_json"], {})
-    diagnoses = result.get("root_cause_diagnoses", [])
+    analysis = _result_analysis_section(result)
+    diagnoses = analysis.get("root_cause_diagnoses", [])
     event_number = int(row["event_number"])
     diagnosis = next(
         (
@@ -1000,7 +1003,7 @@ def _confirmed_case_record(row: sqlite3.Row) -> dict[str, Any] | None:
     event = next(
         (
             item
-            for index, item in enumerate(result.get("anomaly_events", []), start=1)
+            for index, item in enumerate(analysis.get("anomaly_events", []), start=1)
             if index == event_number
         ),
         {},
@@ -1023,6 +1026,21 @@ def _confirmed_case_record(row: sqlite3.Row) -> dict[str, Any] | None:
             regime_context,
         ),
     }
+
+
+def _result_analysis_section(result: Any) -> dict[str, Any]:
+    """统一读取普通分析响应和万悟快速诊断响应中的分析主体。
+
+    普通接口把 ``work_order_drafts``、``summary`` 等字段放在响应顶层；
+    ``quick_industrial_diagnosis`` 为了同时返回文件元数据和展示文本，将相同字段放在
+    ``analysis`` 下。仓储层必须兼容两种稳定协议，否则快速工作流虽然分析成功，却不会
+    生成可回写工单，也无法从现场反馈沉淀历史案例。
+    """
+
+    if not isinstance(result, dict):
+        return {}
+    nested = result.get("analysis")
+    return nested if isinstance(nested, dict) else result
 
 
 def _case_signature(

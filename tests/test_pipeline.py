@@ -115,6 +115,7 @@ def test_execution_trace_records_stable_automatic_chain(tmp_path) -> None:
         "device_profile_match",
         "data_profile",
         "anomaly_detection",
+        "model_cross_validation",
         "operating_regime",
         "relationship_evidence",
         "forecast_analysis",
@@ -122,10 +123,55 @@ def test_execution_trace_records_stable_automatic_chain(tmp_path) -> None:
         "work_order_generation",
     ]
     assert result.execution_trace[4].status == "skipped"
-    assert result.execution_trace[6].status == "skipped"
+    assert result.execution_trace[5].status == "skipped"
+    assert result.execution_trace[7].status == "skipped"
     assert result.execution_trace[3].output_summary["event_count"] == 0
     assert "智能体执行摘要" in result.to_summary()
     assert "智能体执行链" in result.report_text
+
+
+def test_pipeline_can_run_detector_cross_validation(tmp_path) -> None:
+    """完整流水线应按显式开关运行多模型验证，并写入可审计执行轨迹。"""
+
+    rows = 220
+    pressure = np.ones(rows)
+    current = np.ones(rows) * 2
+    pressure[120:145] += 3
+    current[120:145] += 0.8
+    dataframe = pd.DataFrame(
+        {
+            "datetime": pd.date_range("2026-01-01", periods=rows, freq="s"),
+            "Pressure": pressure,
+            "Current": current,
+            "anomaly": [0] * 120 + [1] * 25 + [0] * 75,
+        }
+    )
+    csv_path = tmp_path / "validation_sample.csv"
+    dataframe.to_csv(csv_path, sep=";", index=False)
+
+    result = analyze_file(
+        csv_path,
+        config=AnalysisConfig(
+            detector="mad",
+            threshold=3.0,
+            rolling_window=31,
+            min_event_length=2,
+            use_healthy_baseline=False,
+        ),
+        write_report=False,
+        run_forecast=False,
+        run_regime=False,
+        run_detector_validation=True,
+    )
+
+    validation = result.detector_validation
+    assert validation["status"] == "completed"
+    assert validation["model_count"] >= 3
+    trace = next(
+        step for step in result.execution_trace if step.step_id == "model_cross_validation"
+    )
+    assert trace.status == "completed"
+    assert trace.output_summary["model_count"] >= 3
 
 
 def test_anomaly_free_file_receives_perfect_event_score() -> None:

@@ -17,6 +17,7 @@ import app.api.jobs as jobs_module
 import app.storage.repository as storage_module
 from app.api import server
 from app.integrations import receive_wanwu_csv
+from app.integrations.wanwu import _validate_remote_url
 from app.integrations.wanwu_check import check_wanwu_integration
 
 
@@ -212,10 +213,32 @@ def test_wanwu_quick_diagnosis_returns_local_result_without_model_call(
         payload = response.json()
         assert payload["model_call_count"] == 0
         assert payload["diagnosis_mode"] == "deterministic"
+        assert payload["analysis_version"] == server.QUICK_DIAGNOSIS_VERSION
         assert payload["automatic_diagnosis"]["status"] == "deterministic"
         assert "evidence" not in payload["automatic_diagnosis"]
         assert "knowledge_sources" in payload["automatic_diagnosis"]
         assert payload["presentation"]
+        assert "device_profile" in payload["analysis"]
+        assert "data_quality" in payload["analysis"]
+        assert payload["analysis"]["execution_trace"]
+        assert payload["analysis"]["detector_validation"]["model_count"] >= 3
+        assert payload["analysis"]["detector_validation"]["conclusion"]
+        assert payload["analysis"]["summary"]["智能体执行摘要"]["自动完成数"] > 0
+        assert payload["analysis"]["work_order_drafts"]
+        assert len(
+            storage_module.get_repository().list_work_orders(run_id=payload["run_id"])
+        ) == len(payload["analysis"]["work_order_drafts"])
+        legacy_payload = dict(payload)
+        legacy_payload.pop("analysis_version")
+        assert (
+            server._quick_cached_response(
+                {"result": legacy_payload},
+                file_source="base64",
+            )
+            is None
+        )
+        uploaded_files = list((tmp_path / "uploads").glob("*/*.csv"))
+        assert len(uploaded_files) == 1
 
         repeated = client.post(
             "/api/v1/wanwu/quick-diagnosis",
@@ -228,6 +251,7 @@ def test_wanwu_quick_diagnosis_returns_local_result_without_model_call(
         repeated_payload = repeated.json()
         assert repeated_payload["cache_hit"] is True
         assert repeated_payload["run_id"] == payload["run_id"]
+        assert len(list((tmp_path / "uploads").glob("*/*.csv"))) == 1
     finally:
         storage_module.get_repository.cache_clear()
 
@@ -284,6 +308,28 @@ def test_wanwu_file_adapter_rejects_private_url_by_default() -> None:
             max_bytes=1024,
             download_timeout=1,
             allow_private_urls=False,
+        )
+
+
+def test_wanwu_file_adapter_allows_only_configured_private_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """服务器联调只能精确放行万悟文件容器，不能顺带开放整个内网。"""
+
+    monkeypatch.setattr(
+        "app.integrations.wanwu.socket.getaddrinfo",
+        lambda *_args, **_kwargs: [(2, 1, 6, "", ("172.20.0.8", 8081))],
+    )
+    _validate_remote_url(
+        "http://nginx-wanwu:8081/minio/download/api/sample.csv",
+        allow_private_urls=False,
+        allowed_private_hosts=("nginx-wanwu",),
+    )
+    with pytest.raises(ValueError, match="WANWU_ALLOWED_FILE_HOSTS"):
+        _validate_remote_url(
+            "http://other-service:8081/private.csv",
+            allow_private_urls=False,
+            allowed_private_hosts=("nginx-wanwu",),
         )
 
 
@@ -388,3 +434,18 @@ def test_wanwu_quick_schema_contains_only_one_demo_tool() -> None:
         "automatic_diagnosis",
     }.issubset(response_schema["properties"])
     assert all("const" not in item for item in response_schema["properties"].values())
+
+
+def test_wanwu_schema_declares_api_key_when_remote_auth_is_enabled() -> None:
+    """服务器启用服务密钥时，导出的工具协议必须同步声明鉴权。"""
+
+    from app.api.wanwu_openapi import build_wanwu_openapi
+
+    schema = build_wanwu_openapi(
+        server.app.openapi(),
+        "http://shichi-qianji-api:8000",
+        quick_only=True,
+        api_key_required=True,
+    )
+    operation = schema["paths"]["/api/v1/wanwu/quick-diagnosis"]["post"]
+    assert operation["security"] == [{"IndustrialApiKey": []}]

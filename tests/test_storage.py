@@ -109,6 +109,44 @@ def test_repository_archives_run_and_creates_work_order(tmp_path: Path) -> None:
     assert reused["run_id"] == run_id
 
 
+def test_repository_supports_nested_quick_diagnosis_result(tmp_path: Path) -> None:
+    """万悟快速诊断的嵌套结果也必须生成工单、任务摘要和案例记忆。"""
+
+    repository = IndustrialRepository(tmp_path / "quick_nested.db")
+    file_id = _register_sample_file(repository, tmp_path)
+    run_id = "run_quick_nested"
+    repository.start_run(run_id, file_id, "quick_diagnose", "mad", {})
+    analysis = _sample_result(run_id)
+    quick_result = {
+        "status": "success",
+        "run_id": run_id,
+        "file_id": file_id,
+        "file_name": "sample.csv",
+        "analysis": analysis,
+        "presentation": "检测到 1 个异常事件。",
+    }
+
+    repository.finish_run(run_id, "success", 30.0, result=quick_result)
+
+    assert repository.list_runs()[0]["summary"]["异常事件数"] == 1
+    work_orders = repository.list_work_orders(run_id=run_id)
+    assert len(work_orders) == 1
+    record_id = work_orders[0]["record_id"]
+    repository.update_work_order(
+        record_id,
+        {
+            "status": "已完成",
+            "confirmed_cause": "阀门执行器卡滞",
+            "feedback_note": "现场清理后复测恢复正常",
+            "handled_by": "设备运维组",
+        },
+    )
+    cases = repository.list_confirmed_cases()
+    assert len(cases) == 1
+    assert cases[0]["source_run_id"] == run_id
+    assert cases[0]["confirmed_cause"] == "阀门执行器卡滞"
+
+
 def test_repository_paginates_and_filters_work_orders(tmp_path: Path) -> None:
     """工单列表应支持后端搜索、优先级筛选和偏移分页，不能只依赖前端截取。"""
 

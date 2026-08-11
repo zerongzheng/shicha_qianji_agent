@@ -54,6 +54,7 @@ class Settings:
     max_upload_bytes: int
     wanwu_download_timeout: float
     wanwu_allow_private_file_urls: bool
+    wanwu_allowed_file_hosts: tuple[str, ...]
     api_public_base_url: str
     industrial_api_key: str
     frontend_allowed_origins: str
@@ -149,6 +150,11 @@ def get_settings() -> Settings:
             "false",
         ).strip().lower()
         in {"true", "1", "yes", "on"},
+        wanwu_allowed_file_hosts=tuple(
+            host.strip().casefold().rstrip(".")
+            for host in os.getenv("WANWU_ALLOWED_FILE_HOSTS", "").split(",")
+            if host.strip()
+        ),
         api_public_base_url=os.getenv(
             "API_PUBLIC_BASE_URL",
             "http://host.docker.internal:8000",

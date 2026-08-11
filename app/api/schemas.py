@@ -94,6 +94,7 @@ class AnalysisResponse(StrictApiModel):
     detector: str
     visualization: dict[str, Any] | None = None
     anomaly_events: list[dict[str, Any]]
+    detector_validation: dict[str, Any] = Field(default_factory=dict)
     operating_regimes: dict[str, Any] | None
     relationship_diagnostics: list[dict[str, Any]]
     root_cause_diagnoses: list[dict[str, Any]]
@@ -237,6 +238,7 @@ class WanwuQuickDiagnosisResponse(StrictApiModel):
     presentation: str
     model_call_count: int
     diagnosis_mode: Literal["deterministic"]
+    analysis_version: str
     cache_hit: bool = False
 
 
