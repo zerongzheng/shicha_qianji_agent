@@ -317,8 +317,11 @@ outputs/shichi_qianji.db
 - 工单状态、现场确认根因和复测反馈；
 - 已确认历史案例；
 - 归档时间和操作原因。
+- 脱敏的大模型/Embedding 调用元数据，包括模型、耗时、Token 用量和状态。
 
-原始 CSV 保存在 `outputs/api_uploads/`，不直接写入数据库；报告、实验结果、限流状态和模型缓存也保存在 `outputs/` 下。`outputs/` 中的运行产物不会提交 GitHub。
+模型调用审计不保存 API Key、提示词正文、模型回答或原始工业数据。原始 CSV 保存在
+`outputs/api_uploads/`，不直接写入数据库；报告、实验结果、限流状态、脱敏审计日志和模型缓存也保存在
+`outputs/` 下。`outputs/` 中的运行产物不会提交 GitHub。
 
 正式企业部署时再迁移到 PostgreSQL，并增加对象存储、用户身份、组织隔离、权限和审计日志。校赛阶段不需要先实现独立用户登录；后续接入万悟时优先复用万悟的登录体系。
 
@@ -337,6 +340,9 @@ outputs/shichi_qianji.db
 # 评价趋势预测与提前预警成效
 & "E:\Tools\uv\uv.exe" run python main.py --evaluate-forecast --data-root ..\SKAB\data
 
+# 评价受约束参数优化建议机制
+& "E:\Tools\uv\uv.exe" run python main.py --evaluate-optimization
+
 # 生成证据包
 & "E:\Tools\uv\uv.exe" run python main.py --evidence-pack --case-count 3
 ```
@@ -351,6 +357,8 @@ outputs/evidence_pack/
 │  ├─ forecast_effectiveness_*.md
 │  ├─ forecast_backtest_*.csv
 │  ├─ controlled_warning_*.csv
+│  ├─ optimization_effectiveness_*.md
+│  ├─ optimization_effectiveness_*.csv
 │  ├─ time_frequency_relation_false_positive_analysis.md
 │  ├─ time_frequency_relation_false_positive_events.csv
 │  └─ time_frequency_relation_system_effectiveness.md
@@ -372,6 +380,21 @@ outputs/evidence_pack/
 仅使用此前历史滚动选模。自动策略相对最近值持续模型的标准化 RMSE 平均改善 4.75%，
 经验 95% 区间覆盖率为 95.12%。另有四类固定种子的受控退化场景用于验证提前预警机制，
 它们不是企业数据或设备工程阈值；完整口径见 `docs/competition/SKAB_RESULTS.md`。
+
+受约束优化实验使用四类固定受控风险轨迹和一个稳定对照，验证建议执行时的单步限幅、累计限幅、
+稳定期不动作和人工回退边界。当前固定实验中风险场景平均越界暴露减少 77.11%，稳定对照干预为 0，
+全部场景约束违规为 0。该数字仅表示模拟机制验证，不是企业设备控制效果、节能率或经济收益。
+
+SKAB 实验协议当前为 `skab-competition-v6-joint-parameter-tuning`。协议固定记录时间对齐、持续状态与
+瞬时变点标签的不同补齐语义、缺失填补和模型内缩放口径，并在验证集联合选择阈值、最短事件长度与合并间隔；
+成果包发现旧协议时会自动重跑实验，
+不会静默复用旧流水线指标。
+
+当前固定独立测试集包含 17 份文件。稳健 MAD 的事件级 F1 为 `0.5647`、平均误报事件为
+`1.41/文件`；时频关系多路径模型的事件级 F1 为 `0.6196`、事件召回为 `94.12%`、点级 F1 为
+`0.3433`，平均误报事件为 `1.47/文件`。当前主模型冻结参数为阈值 `3.5`、最短事件长度 `12`、
+合并间隔 `30`。产品按任务目标区分“稳健告警基线”和“时频关系解释主模型”，不宣称单一模型全面最优。
+上述数字仅为 SKAB 公开数据实验结果，完整口径见 `docs/competition/SKAB_RESULTS.md`。
 
 输出目录主要包括：
 
@@ -413,6 +436,9 @@ cd "E:\大学课程\竞赛\shichi_qianji_agent\frontend"
 4. 建立小而可靠的通用工业知识库，并保留后续企业文档替换入口；
 5. 完成独立测试集误报审计，并将 `other → valve1 → valve2` 三类案例纳入成果包。
 6. 完成 SKAB 时间尾段预测评估和受控退化提前预警实验，并纳入成果包。
+7. 完成自适应时间对齐、缺失填补和模型缩放证据，并纳入执行链与分析报告。
+8. 完成带设备边界、观察指标、人工确认和回退条件的参数/能耗优化建议。
+9. 完成受约束优化机制实验，以及不保存提示词正文的模型调用审计。
 
 下一步按优先级推进：
 

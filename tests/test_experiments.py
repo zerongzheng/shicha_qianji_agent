@@ -9,7 +9,11 @@ import pandas as pd
 
 from app.analysis.detection import DETECTOR_RECOMMENDED_THRESHOLDS, apply_detection_threshold
 from app.api.server import _parse_config
-from app.experiments.protocol import build_protocol_manifest, write_protocol_artifacts
+from app.experiments.protocol import (
+    build_protocol_manifest,
+    read_frozen_thresholds,
+    write_protocol_artifacts,
+)
 from app.experiments.split import build_skab_split
 from app.experiments.tfr_ablation import TfrAblationRecord, select_tfr_candidate
 from app.experiments.tuning import ThresholdTrial, select_best_trial
@@ -100,6 +104,43 @@ def test_threshold_selection_rejects_low_recall_shortcut() -> None:
     assert select_best_trial([reliable, silent]) == reliable
 
 
+def test_threshold_selection_freezes_the_complete_parameter_tuple() -> None:
+    """联合调参必须选择完整组合，不能只记阈值而丢失事件后处理参数。"""
+
+    baseline = ThresholdTrial(
+        detector="time_frequency_relation",
+        threshold=4.0,
+        objective=0.20,
+        file_count=17,
+        point_f1=0.30,
+        event_f1=0.45,
+        event_recall=0.90,
+        average_false_events=3.0,
+        healthy_false_event_rate=0.0,
+        failed_files=0,
+        min_event_length=3,
+        merge_gap=5,
+    )
+    concise = ThresholdTrial(
+        detector="time_frequency_relation",
+        threshold=4.0,
+        objective=0.28,
+        file_count=17,
+        point_f1=0.30,
+        event_f1=0.56,
+        event_recall=0.90,
+        average_false_events=1.5,
+        healthy_false_event_rate=0.0,
+        failed_files=0,
+        min_event_length=5,
+        merge_gap=30,
+    )
+
+    selected = select_best_trial([baseline, concise])
+
+    assert (selected.threshold, selected.min_event_length, selected.merge_gap) == (4.0, 5, 30)
+
+
 def test_api_uses_detector_specific_frozen_threshold() -> None:
     """万悟未显式传阈值时，应使用对应检测器的验证集冻结值。"""
 
@@ -120,7 +161,24 @@ def test_api_uses_frozen_tfr_weights_by_default() -> None:
     assert config.tfr_time_weight == 0.67
     assert config.tfr_frequency_weight == 0.0
     assert config.tfr_relation_weight == 0.33
-    assert config.threshold == 4.5
+    assert config.threshold == 3.5
+    assert config.min_event_length == 12
+    assert config.merge_gap == 30
+
+
+def test_api_preserves_explicit_event_policy_overrides() -> None:
+    """企业设备已标定参数由调用方显式传入时，API 不能用 SKAB 推荐值覆盖。"""
+
+    config = _parse_config(
+        {
+            "detector": "time_frequency_relation",
+            "min_event_length": 9,
+            "merge_gap": 12,
+        }
+    )
+
+    assert config.min_event_length == 9
+    assert config.merge_gap == 12
 
 
 def test_api_parses_regime_suppression_boolean_strings() -> None:
@@ -183,6 +241,7 @@ def test_protocol_manifest_records_disjoint_files_and_hashes(tmp_path: Path) -> 
         tmp_path,
         split,
         selected_thresholds={"mad": 5.5},
+        selected_event_policies={"mad": {"min_event_length": 3, "merge_gap": 5}},
         detectors=("mad",),
     )
     assert manifest["counts"] == {"healthy": 1, "validation": 1, "test": 1, "total": 3}
@@ -193,3 +252,12 @@ def test_protocol_manifest_records_disjoint_files_and_hashes(tmp_path: Path) -> 
     assert json_path.exists()
     assert markdown_path.exists()
     assert "文件校验清单" in markdown_path.read_text(encoding="utf-8")
+    assert "持续状态标签" in manifest["preprocessing_policy"]["label_aggregation"]
+    assert "瞬时标签新增点填 0" in manifest["preprocessing_policy"]["label_aggregation"]
+    assert "验证集联合选择" in manifest["event_policy"]["selection"]
+    assert manifest["frozen_event_policies"]["mad"] == {
+        "min_event_length": 3,
+        "merge_gap": 5,
+    }
+    assert "最短事件 `3`" in markdown_path.read_text(encoding="utf-8")
+    assert read_frozen_thresholds(tmp_path / "out") == {"mad": 5.5}

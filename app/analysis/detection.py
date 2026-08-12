@@ -54,9 +54,32 @@ DETECTOR_RECOMMENDED_THRESHOLDS = {
     "isolation_forest": 5.0,
     "pca_reconstruction": 9.0,
     "window_autoencoder": 5.5,
-    "time_frequency_relation": 4.5,
+    "time_frequency_relation": 3.5,
     "hybrid": 5.0,
 }
+
+# 事件后处理参数与分数阈值承担不同职责：阈值决定哪些点进入告警，最短持续时间与
+# 合并间隔决定如何把告警点整理成可执行工单。当前时频模型的 3.5/12/30 来自 v6
+# 联合验证集选择，并在独立测试集保持事件召回、事件 F1 与误报之间的平衡；其他模型仍保留原 3/5 基线。
+DETECTOR_RECOMMENDED_EVENT_POLICIES = {
+    detector: {"min_event_length": 3, "merge_gap": 5}
+    for detector in DETECTOR_RECOMMENDED_THRESHOLDS
+}
+DETECTOR_RECOMMENDED_EVENT_POLICIES["time_frequency_relation"] = {
+    "min_event_length": 12,
+    "merge_gap": 30,
+}
+
+
+def recommended_event_policy(detector: str) -> tuple[int, int]:
+    """返回检测器经验证的最短事件长度和合并间隔。"""
+
+    policy = DETECTOR_RECOMMENDED_EVENT_POLICIES.get(
+        detector,
+        {"min_event_length": 3, "merge_gap": 5},
+    )
+    return int(policy["min_event_length"]), int(policy["merge_gap"])
+
 
 # 健康基线的高分位统一映射到固定风险标尺。用户调整 threshold 时只改变告警决策，
 # 不会反过来改变分数本身，保证不同阈值实验可以公平比较。

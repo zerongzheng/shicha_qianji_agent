@@ -114,6 +114,7 @@ def test_execution_trace_records_stable_automatic_chain(tmp_path) -> None:
         "data_ingestion",
         "device_profile_match",
         "data_profile",
+        "adaptive_preprocessing",
         "model_selection",
         "anomaly_detection",
         "model_cross_validation",
@@ -122,11 +123,13 @@ def test_execution_trace_records_stable_automatic_chain(tmp_path) -> None:
         "forecast_analysis",
         "root_cause_diagnosis",
         "work_order_generation",
+        "optimization_recommendation",
     ]
-    assert result.execution_trace[5].status == "skipped"
-    assert result.execution_trace[6].status == "skipped"
-    assert result.execution_trace[8].status == "skipped"
-    assert result.execution_trace[4].output_summary["event_count"] == 0
+    trace_by_id = {step.step_id: step for step in result.execution_trace}
+    assert trace_by_id["model_cross_validation"].status == "skipped"
+    assert trace_by_id["operating_regime"].status == "skipped"
+    assert trace_by_id["forecast_analysis"].status == "skipped"
+    assert trace_by_id["anomaly_detection"].output_summary["event_count"] == 0
     assert "智能体执行摘要" in result.to_summary()
     assert "智能体执行链" in result.report_text
 

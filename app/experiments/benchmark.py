@@ -14,7 +14,10 @@ from statistics import mean
 from time import perf_counter
 from zoneinfo import ZoneInfo
 
-from app.analysis.detection import DETECTOR_RECOMMENDED_THRESHOLDS
+from app.analysis.detection import (
+    DETECTOR_RECOMMENDED_THRESHOLDS,
+    recommended_event_policy,
+)
 from app.analysis.pipeline import analyze_file
 from app.config import get_settings
 from app.models import (
@@ -42,6 +45,8 @@ class BenchmarkRecord:
     detector: str
     detector_name: str
     threshold: float
+    min_event_length: int
+    merge_gap: int
     scenario: str
     file_name: str
     row_count: int
@@ -76,7 +81,7 @@ def run_skab_benchmark(
     output_dir: str | Path | None = None,
     files: tuple[Path, ...] | None = None,
     thresholds: dict[str, float] | None = None,
-    config_overrides: dict[str, dict[str, float]] | None = None,
+    config_overrides: dict[str, dict[str, float | int]] | None = None,
     report_prefix: str = "skab_benchmark",
 ) -> BenchmarkResult:
     """递归运行 SKAB 全场景对比实验。"""
@@ -102,6 +107,7 @@ def run_skab_benchmark(
     failed_tasks: dict[str, str] = {}
     for detector in detectors:
         overrides = (config_overrides or {}).get(detector, {})
+        default_min_event_length, default_merge_gap = recommended_event_policy(detector)
         config = AnalysisConfig(
             detector=detector,
             threshold=(thresholds or {}).get(
@@ -109,8 +115,10 @@ def run_skab_benchmark(
                 DETECTOR_RECOMMENDED_THRESHOLDS.get(detector, settings.anomaly_threshold),
             ),
             rolling_window=settings.rolling_window,
-            min_event_length=settings.min_event_length,
-            merge_gap=settings.merge_gap,
+            min_event_length=int(
+                overrides.get("min_event_length", default_min_event_length)
+            ),
+            merge_gap=int(overrides.get("merge_gap", default_merge_gap)),
             contamination=settings.contamination,
             hybrid_mad_weight=float(overrides.get("hybrid_mad_weight", 0.50)),
             hybrid_forest_weight=float(overrides.get("hybrid_forest_weight", 0.30)),
@@ -151,6 +159,8 @@ def run_skab_benchmark(
                         detector,
                         file_path.parent.name,
                         config.threshold,
+                        config.min_event_length,
+                        config.merge_gap,
                         result,
                         inference_seconds,
                     )
@@ -274,6 +284,8 @@ def to_benchmark_record(
     detector: str,
     scenario: str,
     threshold: float,
+    min_event_length: int,
+    merge_gap: int,
     result: AnalysisResult,
     inference_seconds: float,
 ) -> BenchmarkRecord:
@@ -287,6 +299,8 @@ def to_benchmark_record(
         detector=detector,
         detector_name=result.detector_name,
         threshold=threshold,
+        min_event_length=min_event_length,
+        merge_gap=merge_gap,
         scenario=scenario,
         file_name=result.profile.source_name,
         row_count=result.profile.row_count,

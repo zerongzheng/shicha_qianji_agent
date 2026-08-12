@@ -94,6 +94,7 @@ def test_api_module_is_importable() -> None:
     assert "/api/v1/work-orders/{record_id}" in paths
     assert "/api/v1/model-compare" in paths
     assert "/api/v1/forecast-compare" in paths
+    assert "/api/v1/model-calls" in paths
 
 
 def test_system_diagnostics_does_not_expose_local_paths() -> None:
@@ -166,6 +167,10 @@ def test_api_payload_exposes_root_causes_and_work_orders(tmp_path) -> None:
     assert payload["work_order_drafts"][0]["record_id"].startswith("run_test:")
     assert payload["execution_trace"]
     assert payload["execution_trace"][0]["step_id"] == "data_ingestion"
+    assert payload["raw_data_profile"]["row_count"] == rows
+    assert payload["preprocessing"]["quality_gate"] == "passed"
+    assert payload["optimization_recommendations"]
+    assert payload["optimization_recommendations"][0]["status"] == "待人工确认"
 
 
 def test_openapi_exposes_wanwu_job_contract() -> None:
@@ -176,8 +181,12 @@ def test_openapi_exposes_wanwu_job_contract() -> None:
     assert app is not None
     schema = app.openapi()
     request_schema = schema["components"]["schemas"]["JobCreateRequest"]
+    analysis_schema = schema["components"]["schemas"]["AnalysisResponse"]
 
     assert schema["servers"][0]["url"]
     assert request_schema["additionalProperties"] is False
+    assert {"raw_data_profile", "preprocessing", "optimization_recommendations"} <= set(
+        analysis_schema["properties"]
+    )
     assert request_schema["properties"]["operation"]["enum"] == ["analyze", "diagnose"]
     assert schema["paths"]["/api/v1/jobs"]["post"]["responses"]["202"]

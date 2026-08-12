@@ -7,13 +7,18 @@ import json
 from pathlib import Path
 
 from app.analysis import analyze_file, analyze_folder
-from app.analysis.detection import DETECTOR_RECOMMENDED_THRESHOLDS
+from app.analysis.detection import (
+    DETECTOR_RECOMMENDED_THRESHOLDS,
+    recommended_event_policy,
+)
 from app.config import get_settings
 from app.experiments import (
     analyze_skab_system_effectiveness,
     build_competition_report,
     evaluate_detector_consensus,
+    evaluate_event_policy,
     evaluate_forecast_effectiveness,
+    evaluate_optimization_effectiveness,
     evaluate_regime_strategy,
     run_hybrid_weight_ablation,
     run_skab_benchmark,
@@ -52,7 +57,18 @@ def main() -> None:
         help="告警阈值；不填写时使用所选检测器在验证集冻结的推荐阈值",
     )
     parser.add_argument("--window", type=int, default=settings.rolling_window)
-    parser.add_argument("--min-event-length", type=int, default=settings.min_event_length)
+    parser.add_argument(
+        "--min-event-length",
+        type=int,
+        default=None,
+        help="最短异常事件长度；不填写时使用所选检测器的验证集推荐值",
+    )
+    parser.add_argument(
+        "--merge-gap",
+        type=int,
+        default=None,
+        help="相邻告警段合并间隔；不填写时使用所选检测器的验证集推荐值",
+    )
     parser.add_argument("--contamination", type=float, default=settings.contamination)
     parser.add_argument(
         "--benchmark",
@@ -80,9 +96,19 @@ def main() -> None:
         help="在固定独立测试集比较单模型与四模型严格多数共识",
     )
     parser.add_argument(
+        "--tune-event-policy",
+        action="store_true",
+        help="只用验证集选择时频模型的最短事件长度和合并间隔，并在独立测试集复核",
+    )
+    parser.add_argument(
         "--evaluate-forecast",
         action="store_true",
         help="评价 SKAB 时间尾段预测和受控退化场景提前预警成效",
+    )
+    parser.add_argument(
+        "--evaluate-optimization",
+        action="store_true",
+        help="运行受控参数优化建议机制实验，评价越界暴露、误动作和约束遵守",
     )
     parser.add_argument(
         "--evaluate-regimes",
@@ -142,16 +168,45 @@ def main() -> None:
         if args.threshold is not None
         else DETECTOR_RECOMMENDED_THRESHOLDS.get(args.detector, settings.anomaly_threshold)
     )
+    recommended_min_event_length, recommended_merge_gap = recommended_event_policy(
+        args.detector
+    )
     config = AnalysisConfig(
         detector=args.detector,
         threshold=threshold,
         rolling_window=_ensure_odd_window(args.window),
-        min_event_length=args.min_event_length,
-        merge_gap=settings.merge_gap,
+        min_event_length=(
+            args.min_event_length
+            if args.min_event_length is not None
+            else recommended_min_event_length
+        ),
+        merge_gap=(args.merge_gap if args.merge_gap is not None else recommended_merge_gap),
         contamination=args.contamination,
     )
 
-    if args.evaluate_forecast:
+    if args.tune_event_policy:
+        evaluation = evaluate_event_policy(args.data_root)
+        summary = {
+            "recommended": evaluation.recommended,
+            "selected_min_event_length": evaluation.selected_validation.min_event_length,
+            "selected_merge_gap": evaluation.selected_validation.merge_gap,
+            "baseline_test_event_recall": evaluation.baseline_test.event_recall,
+            "selected_test_event_recall": evaluation.selected_test.event_recall,
+            "baseline_test_event_f1": evaluation.baseline_test.event_f1,
+            "selected_test_event_f1": evaluation.selected_test.event_f1,
+            "baseline_test_false_events": evaluation.baseline_test.average_false_events,
+            "selected_test_false_events": evaluation.selected_test.average_false_events,
+            "csv_path": str(evaluation.csv_path),
+            "report_path": str(evaluation.report_path),
+        }
+    elif args.evaluate_optimization:
+        evaluation = evaluate_optimization_effectiveness()
+        summary = {
+            "scenario_count": len(evaluation.records),
+            "csv_path": str(evaluation.csv_path),
+            "report_path": str(evaluation.report_path),
+        }
+    elif args.evaluate_forecast:
         evaluation = evaluate_forecast_effectiveness(
             args.data_root,
             max_files=args.max_files or None,
@@ -207,6 +262,8 @@ def main() -> None:
             "forecast_report_path": str(pack.forecast_effectiveness.report_path),
             "forecast_csv_path": str(pack.forecast_effectiveness.real_csv_path),
             "controlled_warning_csv_path": str(pack.forecast_effectiveness.warning_csv_path),
+            "optimization_report_path": str(pack.optimization_effectiveness.report_path),
+            "optimization_csv_path": str(pack.optimization_effectiveness.csv_path),
             "false_positive_report_path": str(pack.false_positive_analysis.report_path),
             "false_positive_csv_path": str(pack.false_positive_analysis.csv_path),
             "system_effectiveness_report_path": str(pack.system_effectiveness.report_path),

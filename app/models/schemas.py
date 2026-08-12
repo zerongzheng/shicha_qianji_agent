@@ -188,6 +188,25 @@ class WorkOrderDraft:
 
 
 @dataclass(frozen=True)
+class OptimizationRecommendation:
+    """带证据、约束和回退条件的参数或能耗优化建议。"""
+
+    recommendation_id: str
+    category: str
+    target: str
+    action: str
+    adjustment_direction: str
+    suggested_range: str
+    confidence: str
+    evidence: tuple[str, ...]
+    constraints: tuple[str, ...]
+    validation_metrics: tuple[str, ...]
+    observation_window: str
+    rollback_condition: str
+    status: str = "待人工确认"
+
+
+@dataclass(frozen=True)
 class HistoricalCaseMatch:
     """从已闭环工单中检索到的相似故障案例。"""
 
@@ -238,6 +257,11 @@ class AnalysisResult:
     metrics: EvaluationMetrics | None
     trend_summary: dict[str, dict[str, Any]]
     recommendations: list[str]
+    raw_profile: DataProfile | None = None
+    preprocessing: dict[str, Any] = field(default_factory=dict)
+    optimization_recommendations: list[OptimizationRecommendation] = field(
+        default_factory=list
+    )
     device_context: dict[str, Any] = field(default_factory=dict)
     model_selection: dict[str, Any] = field(default_factory=dict)
     detector_validation: dict[str, Any] = field(default_factory=dict)
@@ -259,6 +283,7 @@ class AnalysisResult:
         return {
             "数据文件": self.profile.source_name,
             "设备配置": self.device_context,
+            "自适应预处理": self.preprocessing,
             "模型选择": self.model_selection,
             "检测器": self.detector_name,
             "数据点数": self.profile.row_count,
@@ -305,6 +330,7 @@ class AnalysisResult:
             "预测结果": _forecast_overview(self.forecast_results),
             "风险预警": self.risk_alerts,
             "运维建议": self.recommendations,
+            "优化建议": [asdict(item) for item in self.optimization_recommendations],
         }
 
 

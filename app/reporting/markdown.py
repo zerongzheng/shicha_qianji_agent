@@ -62,6 +62,29 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
             f"{sensor.mean_value:.4f} | {sensor.std_value:.4f} |"
         )
 
+    preprocessing = result.preprocessing
+    lines.extend(
+        [
+            "",
+            "### 自适应预处理证据",
+            "",
+            f"- 原始数据点：{preprocessing.get('raw_row_count', profile.row_count)}",
+            f"- 处理后数据点：{preprocessing.get('processed_row_count', profile.row_count)}",
+            f"- 时间对齐新增点：{preprocessing.get('inserted_row_count', 0)}",
+            f"- 自动填补点：{preprocessing.get('filled_count', 0)}",
+            f"- 不规则采样比例：{float(preprocessing.get('irregular_sampling_ratio', 0)):.2%}",
+            f"- 质量门：{preprocessing.get('quality_gate', '未记录')}",
+            "",
+            "| 环节 | 状态 | 方法 | 选择原因 |",
+            "| --- | --- | --- | --- |",
+        ]
+    )
+    for action in preprocessing.get("actions", []):
+        lines.append(
+            f"| {action.get('action', '未知')} | {action.get('status', '未知')} | "
+            f"{action.get('method', '未记录')} | {action.get('reason', '未记录')} |"
+        )
+
     lines.extend(["", "## 4. 任务场景模型选择", ""])
     selection = result.model_selection
     if not selection:
@@ -343,6 +366,28 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
     for index, recommendation in enumerate(result.recommendations, start=1):
         lines.append(f"{index}. {recommendation}")
 
+    lines.extend(["", "### 受约束参数与能耗优化建议", ""])
+    for recommendation in result.optimization_recommendations:
+        lines.extend(
+            [
+                f"#### {recommendation.recommendation_id}｜{recommendation.category}｜{recommendation.target}",
+                "",
+                f"- 待确认动作：{recommendation.action}",
+                f"- 调整方向：{recommendation.adjustment_direction}",
+                f"- 建议范围：{recommendation.suggested_range}",
+                f"- 可信度：{recommendation.confidence}",
+                f"- 观察窗口：{recommendation.observation_window}",
+                f"- 回退条件：{recommendation.rollback_condition}",
+                "- 证据：",
+                *[f"  - {item}" for item in recommendation.evidence],
+                "- 约束：",
+                *[f"  - {item}" for item in recommendation.constraints],
+                "- 验证指标：",
+                *[f"  - {item}" for item in recommendation.validation_metrics],
+                "",
+            ]
+        )
+
     lines.extend(["", "## 14. 趋势预测与风险预警", ""])
     if not result.forecast_results:
         lines.append("当前数据长度不足，未生成预测结果。")
@@ -377,11 +422,13 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
             "## 15. 方法说明",
             "",
             (
-                "系统先由确定性算法完成数据校验和主模型异常检测，再以稳健统计、树模型、"
+                "系统先自动判断采样规则、缺失模式和噪声水平，完成时间对齐与保守填补，"
+                "并按模型需要选择稳健缩放策略；随后由确定性算法完成主模型异常检测，再以稳健统计、树模型、"
                 "多变量重构及时频关系模型进行交叉核验，随后执行无监督工况识别、标签评估和趋势计算，"
                 "并比较异常事件前后的传感器相关性与差分时滞。确定性根因引擎再把事件前后"
                 "变化方向、关系证据、工况上下文和预测趋势与通用故障模式匹配，输出候选根因、"
-                "证据缺口和工单草案。"
+                "证据缺口和工单草案。受约束建议层再综合预测、候选根因、历史案例和设备安全范围，"
+                "生成带观察指标与回退条件的参数或能耗优化草案。"
                 "预测模块在五类候选模型上开展时间顺序滚动回测，以 RMSE 为主选择最优模型，"
                 "并融合历史残差和模型分歧构造 95% 预测区间。之后将结构化结果交给智能体解释。"
                 "原始工业数据不会直接交由大模型判断，"
@@ -453,6 +500,12 @@ def _format_trace_output(output_summary: dict[str, object]) -> str:
         "candidate_count": "候选根因",
         "historical_case_match_count": "历史案例命中",
         "work_order_draft_count": "工单草案",
+        "inserted_row_count": "对齐新增点",
+        "filled_count": "填补点",
+        "time_alignment_applied": "时间对齐",
+        "quality_gate": "质量门",
+        "recommendation_count": "优化建议",
+        "categories": "建议类别",
         "reason": "原因",
     }
     return "；".join(

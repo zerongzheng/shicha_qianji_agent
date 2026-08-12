@@ -114,6 +114,24 @@ class IndustrialRepository:
                     UNIQUE (run_id, source_work_order_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS model_call_logs (
+                    call_id TEXT PRIMARY KEY,
+                    run_id TEXT,
+                    timestamp TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    duration_ms REAL NOT NULL,
+                    input_character_count INTEGER NOT NULL,
+                    output_character_count INTEGER NOT NULL,
+                    prompt_tokens INTEGER,
+                    completion_tokens INTEGER,
+                    total_tokens INTEGER,
+                    error_type TEXT,
+                    content_stored INTEGER NOT NULL DEFAULT 0
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_runs_file_created
                     ON analysis_runs(file_id, started_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_runs_status_created
@@ -122,6 +140,10 @@ class IndustrialRepository:
                     ON work_orders(status, priority, updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_work_orders_run
                     ON work_orders(run_id, event_number);
+                CREATE INDEX IF NOT EXISTS idx_model_calls_time
+                    ON model_call_logs(timestamp DESC);
+                CREATE INDEX IF NOT EXISTS idx_model_calls_run
+                    ON model_call_logs(run_id, timestamp DESC);
                 """
             )
             # 兼容旧数据库：新增字段通过迁移补齐，不要求删除已有分析记录。
@@ -189,6 +211,60 @@ class IndustrialRepository:
                 metadata,
             )
         return metadata
+
+    def record_model_call(self, record: dict[str, Any]) -> None:
+        """保存脱敏模型调用元数据，不接受提示词或模型正文。"""
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO model_call_logs (
+                    call_id, run_id, timestamp, operation, provider, model, status,
+                    duration_ms, input_character_count, output_character_count,
+                    prompt_tokens, completion_tokens, total_tokens, error_type,
+                    content_stored
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record["call_id"],
+                    record.get("run_id"),
+                    record["timestamp"],
+                    record["operation"],
+                    record["provider"],
+                    record["model"],
+                    record["status"],
+                    float(record["duration_ms"]),
+                    int(record.get("input_character_count", 0)),
+                    int(record.get("output_character_count", 0)),
+                    record.get("prompt_tokens"),
+                    record.get("completion_tokens"),
+                    record.get("total_tokens"),
+                    record.get("error_type"),
+                    int(bool(record.get("content_stored", False))),
+                ),
+            )
+
+    def list_model_calls(
+        self,
+        *,
+        limit: int = 100,
+        run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """按时间倒序查询脱敏模型调用记录。"""
+
+        clauses: list[str] = []
+        values: list[Any] = []
+        if run_id:
+            clauses.append("run_id = ?")
+            values.append(run_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        values.append(max(1, min(1000, int(limit))))
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM model_call_logs {where} ORDER BY timestamp DESC LIMIT ?",
+                values,
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def start_run(
         self,

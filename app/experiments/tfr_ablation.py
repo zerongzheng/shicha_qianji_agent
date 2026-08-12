@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from app.analysis.detection import apply_detection_threshold
+from app.analysis.detection import apply_detection_threshold, recommended_event_policy
 from app.analysis.evaluation import evaluate_predictions
 from app.analysis.pipeline import analyze_file
 from app.config import get_settings
@@ -133,12 +133,13 @@ def _evaluate_candidate(
 
     candidate_id, time_weight, frequency_weight, relation_weight = candidate
     settings = get_settings()
+    min_event_length, merge_gap = recommended_event_policy("time_frequency_relation")
     base_config = AnalysisConfig(
         detector="time_frequency_relation",
         threshold=settings.anomaly_threshold,
         rolling_window=settings.rolling_window,
-        min_event_length=settings.min_event_length,
-        merge_gap=settings.merge_gap,
+        min_event_length=min_event_length,
+        merge_gap=merge_gap,
         contamination=settings.contamination,
         tfr_time_weight=time_weight,
         tfr_frequency_weight=frequency_weight,

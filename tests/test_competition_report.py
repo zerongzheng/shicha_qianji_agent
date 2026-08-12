@@ -7,10 +7,12 @@ from pathlib import Path
 from app.experiments.competition_report import (
     _build_effectiveness_rows,
     _build_report,
+    _has_current_protocol,
     _read_records,
     _summarize,
     _summarize_by_model,
 )
+from app.experiments.protocol import PROTOCOL_VERSION
 
 
 def test_competition_summary_aggregates_by_scenario_and_model(tmp_path: Path) -> None:
@@ -132,3 +134,17 @@ def test_competition_report_mentions_dynamic_main_model_metrics(tmp_path: Path) 
 
     assert "事件召回为 0.7300" in report
     assert "0.9412" not in report
+
+
+def test_competition_report_rejects_stale_protocol(tmp_path: Path) -> None:
+    """流水线版本变化后不得继续复用旧实验数字。"""
+
+    protocol = tmp_path / "SKAB_EXPERIMENT_PROTOCOL.json"
+    protocol.write_text('{"protocol_version":"old"}', encoding="utf-8")
+    assert not _has_current_protocol(tmp_path)
+
+    protocol.write_text(
+        f'{{"protocol_version":"{PROTOCOL_VERSION}"}}',
+        encoding="utf-8",
+    )
+    assert _has_current_protocol(tmp_path)

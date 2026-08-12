@@ -18,6 +18,8 @@ from app.analysis.evaluation import evaluate_predictions
 from app.analysis.forecast import forecast_sensors
 from app.analysis.model_selection import select_detection_model
 from app.analysis.model_validation import cross_validate_detectors
+from app.analysis.optimization import generate_optimization_recommendations
+from app.analysis.preprocessing import adaptive_preprocess
 from app.analysis.profiling import build_profile
 from app.analysis.regime import analyze_operating_regimes, suppress_transition_only_events
 from app.analysis.relationships import analyze_event_relationships
@@ -141,21 +143,57 @@ def analyze_file(
     )
 
     started_at = perf_counter()
-    profile = build_profile(dataframe, source_path.name)
+    raw_profile = build_profile(dataframe, source_path.name)
     execution_trace.append(
         ExecutionTraceStep(
             step_id="data_profile",
-            title="数据画像与质量检查",
+            title="原始数据画像与质量检查",
             module="app.analysis.profiling.build_profile",
             status="completed",
             input_summary={"row_count": len(dataframe)},
             output_summary={
-                "sensor_count": len(profile.sensor_columns),
-                "missing_total": profile.missing_total,
-                "sampling_seconds": profile.sampling_seconds,
+                "sensor_count": len(raw_profile.sensor_columns),
+                "missing_total": raw_profile.missing_total,
+                "sampling_seconds": raw_profile.sampling_seconds,
             },
             duration_seconds=_elapsed_seconds(started_at),
             limitation="数据画像反映当前文件质量，不代表设备长期健康状态。",
+        )
+    )
+
+    # 预处理先根据时间轴和缺失模式决定动作，再把处理后的统一数据交给所有下游模型。
+    # 标签只随时间对齐聚合，不参与插值、噪声判断或模型缩放。
+    started_at = perf_counter()
+    preprocessing_result = adaptive_preprocess(
+        dataframe,
+        expected_sampling_seconds=loaded.context.get("expected_sampling_seconds"),
+        analysis_goal="industrial_anomaly_forecast",
+    )
+    dataframe = preprocessing_result.dataframe
+    preprocessing = preprocessing_result.summary
+    profile = build_profile(dataframe, source_path.name)
+    execution_trace.append(
+        ExecutionTraceStep(
+            step_id="adaptive_preprocessing",
+            title="自适应对齐、填补与模型适配",
+            module="app.analysis.preprocessing.adaptive_preprocess",
+            status="completed",
+            input_summary={
+                "raw_row_count": raw_profile.row_count,
+                "raw_missing_count": raw_profile.missing_total,
+                "expected_sampling_seconds": loaded.context.get(
+                    "expected_sampling_seconds"
+                ),
+            },
+            output_summary={
+                "processed_row_count": profile.row_count,
+                "inserted_row_count": preprocessing["inserted_row_count"],
+                "filled_count": preprocessing["filled_count"],
+                "time_alignment_applied": preprocessing["time_alignment_applied"],
+                "quality_gate": preprocessing["quality_gate"],
+            },
+            duration_seconds=_elapsed_seconds(started_at),
+            limitation="自动填补恢复的是算法输入连续性，不代表缺失期间的真实设备状态。",
         )
     )
 
@@ -168,6 +206,11 @@ def analyze_file(
     if config.use_healthy_baseline and baseline_path.exists():
         # 基线沿用同一设备配置，确保企业字段别名与当前分析数据保持一致。
         candidate = load_time_series(baseline_path, config.device_profile_id)
+        candidate = adaptive_preprocess(
+            candidate,
+            expected_sampling_seconds=loaded.context.get("expected_sampling_seconds"),
+            analysis_goal="healthy_baseline",
+        ).dataframe
         if set(profile.sensor_columns).issubset(candidate.columns):
             healthy_reference = candidate[profile.sensor_columns]
 
@@ -332,7 +375,6 @@ def analyze_file(
             limitation="相关性和时滞用于缩小排查范围，不能替代设备机理和现场复测。",
         )
     )
-    recommendations = generate_recommendations(profile, events, trends, metrics)
     if run_forecast:
         started_at = perf_counter()
         forecasts = forecast_sensors(
@@ -415,6 +457,38 @@ def analyze_file(
             limitation="系统只生成待确认草案，派单、执行、验收和根因回写仍由运维人员负责。",
         )
     )
+    recommendations = generate_recommendations(profile, events, trends, metrics)
+    optimization_recommendations = generate_optimization_recommendations(
+        profile,
+        preprocessing,
+        forecasts,
+        event_diagnoses,
+        loaded.context,
+        historical_case_matches,
+    )
+    execution_trace.append(
+        ExecutionTraceStep(
+            step_id="optimization_recommendation",
+            title="受约束参数与能耗优化建议",
+            module="app.analysis.optimization.generate_optimization_recommendations",
+            status="completed",
+            input_summary={
+                "forecast_sensor_count": len(forecasts),
+                "diagnosis_count": len(event_diagnoses),
+                "device_safe_ranges_available": sum(
+                    bool(item.get("safe_range"))
+                    for item in loaded.context.get("sensor_metadata", {}).values()
+                ),
+            },
+            output_summary={
+                "recommendation_count": len(optimization_recommendations),
+                "categories": sorted(
+                    {item.category for item in optimization_recommendations}
+                ),
+            },
+            limitation="建议为待确认草案；没有设备安全范围时不输出控制设定值，也不直接下发设备。",
+        )
+    )
 
     result = AnalysisResult(
         source_path=source_path,
@@ -428,6 +502,9 @@ def analyze_file(
         metrics=metrics,
         trend_summary=trends,
         recommendations=recommendations,
+        raw_profile=raw_profile,
+        preprocessing=preprocessing,
+        optimization_recommendations=optimization_recommendations,
         device_context=loaded.context,
         model_selection=model_selection,
         detector_validation=detector_validation,

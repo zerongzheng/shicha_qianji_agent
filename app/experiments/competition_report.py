@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -14,7 +15,11 @@ from statistics import mean
 from zoneinfo import ZoneInfo
 
 from app.config import get_settings
-from app.experiments.protocol import build_protocol_manifest, write_protocol_artifacts
+from app.experiments.protocol import (
+    PROTOCOL_VERSION,
+    build_protocol_manifest,
+    write_protocol_artifacts,
+)
 from app.experiments.split import build_skab_split
 from app.experiments.tuning import tune_and_evaluate
 
@@ -55,9 +60,14 @@ def build_competition_report(
 
     split = build_skab_split(root)
     selected_thresholds: dict[str, float] = {}
-    if rerun_experiments:
+    selected_event_policies: dict[str, dict[str, int]] = {}
+    # 流水线升级后不能静默复用旧指标。协议版本不一致时自动重跑固定划分实验，
+    # 确保报告中的数字与当前预处理、标签聚合和模型实现完全一致。
+    protocol_is_current = _has_current_protocol(target_dir)
+    if rerun_experiments or not protocol_is_current:
         tuning = tune_and_evaluate(root, output_dir=target_dir)
         selected_thresholds = tuning.selected_thresholds
+        selected_event_policies = tuning.selected_event_policies
         # 阈值调优函数已经使用冻结参数完成独立测试，这里直接复用结果，
         # 避免生成竞赛汇总时把同一套模型重复运行一遍。
         benchmark_path = tuning.test_benchmark.report_path
@@ -74,6 +84,7 @@ def build_competition_report(
         if benchmark_path is None or split_path is None:
             tuning = tune_and_evaluate(root, output_dir=target_dir)
             selected_thresholds = tuning.selected_thresholds
+            selected_event_policies = tuning.selected_event_policies
             benchmark_path = tuning.test_benchmark.report_path
             split_path = tuning.split_csv_path
 
@@ -86,10 +97,13 @@ def build_competition_report(
     summary_rows = _summarize(records)
     if not selected_thresholds:
         selected_thresholds = _thresholds_from_records(records)
+    if not selected_event_policies:
+        selected_event_policies = _event_policies_from_records(records)
     protocol = build_protocol_manifest(
         root,
         split,
         selected_thresholds=selected_thresholds,
+        selected_event_policies=selected_event_policies,
         detectors=tuple(sorted({record["detector"] for record in records})),
     )
     protocol_json_path, protocol_markdown_path = write_protocol_artifacts(
@@ -260,6 +274,19 @@ def _latest_file(directory: Path, *patterns: str) -> Path | None:
     return files[0] if files else None
 
 
+def _has_current_protocol(directory: Path) -> bool:
+    """只有协议文件存在且版本一致时，才允许复用历史实验产物。"""
+
+    path = directory / "SKAB_EXPERIMENT_PROTOCOL.json"
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return payload.get("protocol_version") == PROTOCOL_VERSION
+
+
 def _read_records(csv_path: Path) -> list[dict[str, str]]:
     """读取逐文件实验记录，并验证关键列存在。"""
 
@@ -416,12 +443,12 @@ def _build_report(
             "- 当前结果证明时察千机已经具备从原始时序到风险事件和运维建议的可运行流程。",
             "- 当前结果不代表联通企业设备现场效果；企业数据到位后仍需重新建立健康基线、校准阈值并做独立验证。",
             "",
-            "## 五、下一步校赛工作",
+            "## 五、现有成果与下一步",
             "",
-            "1. 选取 2 至 3 个典型 SKAB 异常文件，制作原始曲线、异常分数、事件区间和传感器贡献图。",
-            "2. 固定推荐检测器和参数，页面、命令行、API 使用同一份配置。",
-            "3. 完成 Streamlit 的设备健康总览和一键报告演示。",
-            "4. 整理设备数据协议、知识库资料模板和现场反馈字段，为后续企业数据接入预留接口。",
+            "1. 已生成 other、valve1、valve2 三类典型案例，包含风险曲线、事件区间、传感器贡献和诊断摘要。",
+            "2. 已冻结推荐检测器和阈值，Vue3 页面、命令行、API 与万悟工具接口使用同一份配置。",
+            "3. 已完成从文件上传、智能分析、证据展示到工单确认和历史案例沉淀的 Vue3 运维闭环。",
+            "4. 下一步在企业数据到位后重新建立健康基线、校准阈值，并用运行日志和维修记录复核诊断结论。",
             "",
             "## 六、复现文件",
             "",
@@ -442,6 +469,28 @@ def _thresholds_from_records(records: list[dict[str, str]]) -> dict[str, float]:
         if detector not in thresholds and record.get("threshold") not in {None, ""}:
             thresholds[detector] = float(record["threshold"])
     return thresholds
+
+
+def _event_policies_from_records(
+    records: list[dict[str, str]],
+) -> dict[str, dict[str, int]]:
+    """从独立测试明细恢复每个检测器冻结的事件后处理参数。"""
+
+    policies: dict[str, dict[str, int]] = {}
+    for record in records:
+        detector = record["detector"]
+        if detector in policies:
+            continue
+        if record.get("min_event_length") in {None, ""} or record.get("merge_gap") in {
+            None,
+            "",
+        }:
+            continue
+        policies[detector] = {
+            "min_event_length": int(record["min_event_length"]),
+            "merge_gap": int(record["merge_gap"]),
+        }
+    return policies
 
 
 def _build_effectiveness_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:

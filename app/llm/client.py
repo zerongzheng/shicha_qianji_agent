@@ -13,6 +13,7 @@ from openai import APIConnectionError, APIStatusError, OpenAI, RateLimitError
 
 from app.config import Settings, get_settings
 from app.llm.rate_limit import acquire_embedding_slot, create_chat_rate_limiter
+from app.observability import ModelCallAudit
 
 
 def create_chat_model(settings: Settings | None = None) -> ChatOpenAI:
@@ -50,16 +51,32 @@ def embed_texts(texts: Sequence[str], settings: Settings | None = None) -> list[
         return []
     # 知识库可批量向量化为一次请求；查询向量单独请求。两类请求共享 Embedding 接口额度。
     acquire_embedding_slot(settings)
+    audit = ModelCallAudit(
+        operation="knowledge_embedding",
+        provider=settings.llm_provider,
+        model=settings.llm_embedding_model,
+        input_character_count=sum(len(item) for item in clean_texts),
+    )
     client = OpenAI(
         api_key=settings.llm_api_key,
         base_url=settings.llm_base_url,
         timeout=60,
         max_retries=0,
     )
-    response = client.embeddings.create(
-        model=settings.llm_embedding_model,
-        input=clean_texts,
-        encoding_format="float",
+    try:
+        response = client.embeddings.create(
+            model=settings.llm_embedding_model,
+            input=clean_texts,
+            encoding_format="float",
+        )
+    except Exception as exc:
+        audit.finish("failed", error_type=type(exc).__name__)
+        raise
+    usage = getattr(response, "usage", None)
+    audit.finish(
+        "success",
+        output_character_count=len(response.data),
+        usage=(usage.model_dump() if hasattr(usage, "model_dump") else {}),
     )
     ordered = sorted(response.data, key=lambda item: item.index)
     return [list(item.embedding) for item in ordered]

@@ -103,6 +103,9 @@ class AnalysisResponse(StrictApiModel):
     device_profile: dict[str, Any] = Field(default_factory=dict)
     data_profile: dict[str, Any]
     data_quality: dict[str, Any] | None = None
+    # 三个字段在自适应预处理升级前不存在，默认值保证旧数据库任务仍可读取。
+    raw_data_profile: dict[str, Any] | None = None
+    preprocessing: dict[str, Any] = Field(default_factory=dict)
     detector: str
     visualization: dict[str, Any] | None = None
     anomaly_events: list[dict[str, Any]]
@@ -116,6 +119,7 @@ class AnalysisResponse(StrictApiModel):
     forecast_results: dict[str, Any]
     risk_alerts: list[dict[str, Any]]
     recommendations: list[str]
+    optimization_recommendations: list[dict[str, Any]] = Field(default_factory=list)
     # 旧数据库结果没有执行轨迹，默认空列表保证历史任务仍能正常打开。
     execution_trace: list[dict[str, Any]] = Field(default_factory=list)
     summary: dict[str, Any]

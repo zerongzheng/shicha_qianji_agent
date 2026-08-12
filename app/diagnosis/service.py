@@ -17,6 +17,7 @@ from app.config import Settings, get_settings
 from app.knowledge.retriever import KnowledgeChunk, search_knowledge
 from app.llm import create_chat_model, format_llm_error
 from app.models import AnalysisResult
+from app.observability import ModelCallAudit, response_usage_metadata
 
 DIAGNOSIS_SYSTEM_PROMPT = """
 你是“时察千机”工业时序诊断智能体。你只能依据输入中的算法证据和知识库证据作答。
@@ -80,7 +81,12 @@ class AutomaticDiagnosisService:
         self.settings = settings or get_settings()
         self.allow_external_calls = allow_external_calls
 
-    def diagnose(self, result: AnalysisResult) -> AutomaticDiagnosis:
+    def diagnose(
+        self,
+        result: AnalysisResult,
+        *,
+        run_id: str | None = None,
+    ) -> AutomaticDiagnosis:
         """根据已经完成的工业分析结果生成自动诊断。"""
 
         evidence = build_diagnosis_evidence(
@@ -110,16 +116,29 @@ class AutomaticDiagnosisService:
             )
 
         try:
+            model_input = _build_model_input(evidence)
+            audit = ModelCallAudit(
+                operation="automatic_diagnosis",
+                provider=self.settings.llm_provider,
+                model=self.settings.llm_chat_model,
+                input_character_count=len(DIAGNOSIS_SYSTEM_PROMPT) + len(model_input),
+                run_id=run_id,
+            )
             model = create_chat_model(self.settings)
             response = model.invoke(
                 [
                     SystemMessage(content=DIAGNOSIS_SYSTEM_PROMPT),
-                    HumanMessage(content=_build_model_input(evidence)),
+                    HumanMessage(content=model_input),
                 ]
             )
             content = response.content
             if not isinstance(content, str) or not content.strip():
                 raise ValueError("比赛大模型没有返回可用的诊断正文。")
+            audit.finish(
+                "success",
+                output_character_count=len(content),
+                usage=response_usage_metadata(response),
+            )
             return AutomaticDiagnosis(
                 status="generated",
                 model=self.settings.llm_chat_model,
@@ -129,6 +148,8 @@ class AutomaticDiagnosisService:
             )
         # 自动诊断是解释层，限流或网络异常不能让已经完成的工业分析失效。
         except Exception as exc:  # noqa: BLE001
+            if "audit" in locals():
+                audit.finish("failed", error_type=type(exc).__name__)
             return AutomaticDiagnosis(
                 status="fallback",
                 model=None,

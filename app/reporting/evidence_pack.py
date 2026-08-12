@@ -23,6 +23,10 @@ from app.experiments.forecast_effectiveness import (
     ForecastEffectiveness,
     evaluate_forecast_effectiveness,
 )
+from app.experiments.optimization_effectiveness import (
+    OptimizationEffectiveness,
+    evaluate_optimization_effectiveness,
+)
 from app.experiments.system_effectiveness import (
     SystemEffectiveness,
     analyze_skab_system_effectiveness,
@@ -39,6 +43,7 @@ class EvidencePack:
     competition_report: CompetitionReport
     consensus_evaluation: ConsensusEvaluation
     forecast_effectiveness: ForecastEffectiveness
+    optimization_effectiveness: OptimizationEffectiveness
     false_positive_analysis: FalsePositiveAnalysis
     system_effectiveness: SystemEffectiveness
     cases: tuple[CasePackage, ...]
@@ -74,6 +79,11 @@ def build_evidence_pack(
         resolved_data_root,
         output_dir=target / "experiments",
     )
+    # 优化建议实验使用固定受控轨迹，只验证“小步、限幅、可回退”的执行机制。
+    # 它不依赖 SKAB，也不能被表述为企业设备节能率或现场控制收益。
+    optimization_effectiveness = evaluate_optimization_effectiveness(
+        output_dir=target / "experiments",
+    )
     false_positive_analysis = analyze_skab_false_positives(
         resolved_data_root,
         output_dir=target / "experiments",
@@ -96,6 +106,7 @@ def build_evidence_pack(
             competition,
             consensus_evaluation,
             forecast_effectiveness,
+            optimization_effectiveness,
             false_positive_analysis,
             system_effectiveness,
             cases,
@@ -108,6 +119,7 @@ def build_evidence_pack(
         competition,
         consensus_evaluation,
         forecast_effectiveness,
+        optimization_effectiveness,
         false_positive_analysis,
         system_effectiveness,
         cases,
@@ -159,6 +171,7 @@ def _build_index(
     competition: CompetitionReport,
     consensus_evaluation: ConsensusEvaluation,
     forecast_effectiveness: ForecastEffectiveness,
+    optimization_effectiveness: OptimizationEffectiveness,
     false_positive_analysis: FalsePositiveAnalysis,
     system_effectiveness: SystemEffectiveness,
     cases: tuple[CasePackage, ...],
@@ -176,10 +189,11 @@ def _build_index(
         "1. 先展示 `experiments/skab_competition_summary.md`，说明数据划分和模型对比。",
         "2. 展示多模型共识实验，说明为什么交叉验证只增强可信度、不直接覆盖主告警。",
         "3. 展示趋势预测与提前预警实验，区分 SKAB 时间尾段结果和受控退化模拟。",
-        "4. 展示 `experiments/time_frequency_relation_false_positive_analysis.md`，说明 other 场景的误报来源。",
-        "5. 再展示典型案例中的风险图，说明异常如何从数据中被发现。",
-        "6. 打开案例摘要，沿着“异常事件 - 主导传感器 - 候选原因 - 排查动作”讲解。",
-        "7. 回到 Vue3 的“运维闭环”，演示工单确认、现场反馈和历史案例沉淀。",
+        "4. 展示受约束优化建议实验，说明建议如何限幅、观察、回退并保留人工确认。",
+        "5. 展示 `experiments/time_frequency_relation_false_positive_analysis.md`，说明 other 场景的误报来源。",
+        "6. 再展示典型案例中的风险图，说明异常如何从数据中被发现。",
+        "7. 打开案例摘要，沿着“异常事件 - 主导传感器 - 候选原因 - 排查动作”讲解。",
+        "8. 回到 Vue3 的“运维闭环”，演示工单确认、现场反馈和历史案例沉淀。",
         "",
         "## 实验材料",
         "",
@@ -195,6 +209,9 @@ def _build_index(
         f"- SKAB 时间尾段逐序列记录：`{forecast_effectiveness.real_csv_path}`",
         f"- 受控退化场景记录：`{forecast_effectiveness.warning_csv_path}`",
         f"- 预测成功记录：{len(forecast_effectiveness.real_records)}；失败任务：{len(forecast_effectiveness.failed_tasks)}",
+        f"- 受约束优化建议报告：`{optimization_effectiveness.report_path}`",
+        f"- 受约束优化建议逐场景记录：`{optimization_effectiveness.csv_path}`",
+        f"- 优化机制场景数：{len(optimization_effectiveness.records)}（含稳定无风险对照）",
         f"- 误报解释报告：`{false_positive_analysis.report_path}`",
         f"- 逐事件误报审计表：`{false_positive_analysis.csv_path}`",
         f"- 误报事件数：{len(false_positive_analysis.events)}；成功分析文件：{false_positive_analysis.analyzed_file_count}/{false_positive_analysis.file_count}",

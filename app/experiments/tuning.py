@@ -14,7 +14,7 @@ from pathlib import Path
 from statistics import mean
 from zoneinfo import ZoneInfo
 
-from app.analysis.detection import apply_detection_threshold
+from app.analysis.detection import apply_detection_threshold, recommended_event_policy
 from app.analysis.evaluation import evaluate_predictions
 from app.analysis.pipeline import analyze_file
 from app.config import get_settings
@@ -28,6 +28,8 @@ from app.models import AnalysisConfig
 
 DEFAULT_THRESHOLDS = (2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 7.0, 8.0, 9.0, 10.0)
 MIN_VALIDATION_EVENT_RECALL = 0.50
+TFR_MIN_EVENT_LENGTHS = (3, 5, 8, 12)
+TFR_MERGE_GAPS = (5, 10, 20, 30)
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,8 @@ class ThresholdTrial:
     average_false_events: float
     healthy_false_event_rate: float
     failed_files: int
+    min_event_length: int = 3
+    merge_gap: int = 5
 
 
 @dataclass(frozen=True)
@@ -53,6 +57,7 @@ class TuningResult:
     split: ExperimentSplit
     trials: tuple[ThresholdTrial, ...]
     selected_thresholds: dict[str, float]
+    selected_event_policies: dict[str, dict[str, int]]
     test_benchmark: BenchmarkResult
     trials_csv_path: Path
     split_csv_path: Path
@@ -82,6 +87,7 @@ def tune_and_evaluate(
 
     trials: list[ThresholdTrial] = []
     selected_thresholds: dict[str, float] = {}
+    selected_event_policies: dict[str, dict[str, int]] = {}
     for detector in detectors:
         detector_trials = _tune_detector(
             detector=detector,
@@ -92,6 +98,10 @@ def tune_and_evaluate(
         trials.extend(detector_trials)
         best = select_best_trial(detector_trials)
         selected_thresholds[detector] = best.threshold
+        selected_event_policies[detector] = {
+            "min_event_length": best.min_event_length,
+            "merge_gap": best.merge_gap,
+        }
 
     timestamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d_%H%M%S")
     trials_csv_path = target_dir / f"threshold_trials_{timestamp}.csv"
@@ -105,6 +115,7 @@ def tune_and_evaluate(
         detectors=detectors,
         files=split.test_files,
         thresholds=selected_thresholds,
+        config_overrides=selected_event_policies,
         output_dir=target_dir,
         report_prefix="independent_test",
     )
@@ -114,6 +125,7 @@ def tune_and_evaluate(
             split=split,
             trials=trials,
             selected_thresholds=selected_thresholds,
+            selected_event_policies=selected_event_policies,
             test_benchmark=test_benchmark,
         ),
         encoding="utf-8",
@@ -122,6 +134,7 @@ def tune_and_evaluate(
         split=split,
         trials=tuple(trials),
         selected_thresholds=selected_thresholds,
+        selected_event_policies=selected_event_policies,
         test_benchmark=test_benchmark,
         trials_csv_path=trials_csv_path,
         split_csv_path=split_csv_path,
@@ -150,6 +163,8 @@ def select_best_trial(trials: list[ThresholdTrial]) -> ThresholdTrial:
             trial.point_f1,
             -trial.average_false_events,
             -trial.threshold,
+            -trial.min_event_length,
+            -trial.merge_gap,
         ),
     )
 
@@ -163,12 +178,13 @@ def _tune_detector(
     """对一个检测器只推理一次，再复用分数完成多个阈值评估。"""
 
     settings = get_settings()
+    default_min_event_length, default_merge_gap = recommended_event_policy(detector)
     base_config = AnalysisConfig(
         detector=detector,
         threshold=settings.anomaly_threshold,
         rolling_window=settings.rolling_window,
-        min_event_length=settings.min_event_length,
-        merge_gap=settings.merge_gap,
+        min_event_length=default_min_event_length,
+        merge_gap=default_merge_gap,
         contamination=settings.contamination,
     )
     cached_results = []
@@ -189,60 +205,57 @@ def _tune_detector(
             failed_files += 1
 
     trials: list[ThresholdTrial] = []
+    event_policies = (
+        tuple(
+            (min_event_length, merge_gap)
+            for min_event_length in TFR_MIN_EVENT_LENGTHS
+            for merge_gap in TFR_MERGE_GAPS
+        )
+        if detector == "time_frequency_relation"
+        else ((default_min_event_length, default_merge_gap),)
+    )
     for threshold in thresholds:
-        validation_metrics = []
-        healthy_false_events = 0
-        healthy_file_count = 0
-        threshold_config = AnalysisConfig(
-            detector=detector,
-            threshold=threshold,
-            rolling_window=base_config.rolling_window,
-            min_event_length=base_config.min_event_length,
-            merge_gap=base_config.merge_gap,
-            contamination=base_config.contamination,
-        )
-        for result in cached_results:
-            predicted, _ = apply_detection_threshold(
-                dataframe=result.dataframe,
-                sensor_scores=result.anomaly_scores,
-                combined_score=result.combined_score,
-                config=threshold_config,
-            )
-            metrics = evaluate_predictions(
-                result.dataframe,
-                predicted,
-                result.combined_score,
-                merge_gap=threshold_config.merge_gap,
-            )
-            if metrics is None:
-                continue
-            if result.source_path.parent.name.lower() == "anomaly-free":
-                healthy_file_count += 1
-                healthy_false_events += metrics.false_positive_event_count
-            else:
-                validation_metrics.append(metrics)
-
-        point_f1 = _average(metric.f1_score for metric in validation_metrics)
-        event_f1 = _average(metric.event_f1_score for metric in validation_metrics)
-        event_recall = _average(metric.event_recall for metric in validation_metrics)
-        false_events = _average(
-            float(metric.false_positive_event_count) for metric in validation_metrics
-        )
-        healthy_false_event_rate = healthy_false_events / max(healthy_file_count, 1)
-        objective = _industrial_objective(
-            point_f1=point_f1,
-            event_f1=event_f1,
-            event_recall=event_recall,
-            average_false_events=false_events,
-            healthy_false_event_rate=healthy_false_event_rate,
-            failed_files=failed_files,
-        )
-        trials.append(
-            ThresholdTrial(
+        for min_event_length, merge_gap in event_policies:
+            validation_metrics = []
+            healthy_false_events = 0
+            healthy_file_count = 0
+            threshold_config = AnalysisConfig(
                 detector=detector,
                 threshold=threshold,
-                objective=objective,
-                file_count=len(validation_metrics),
+                rolling_window=base_config.rolling_window,
+                min_event_length=min_event_length,
+                merge_gap=merge_gap,
+                contamination=base_config.contamination,
+            )
+            for result in cached_results:
+                predicted, _ = apply_detection_threshold(
+                    dataframe=result.dataframe,
+                    sensor_scores=result.anomaly_scores,
+                    combined_score=result.combined_score,
+                    config=threshold_config,
+                )
+                metrics = evaluate_predictions(
+                    result.dataframe,
+                    predicted,
+                    result.combined_score,
+                    merge_gap=threshold_config.merge_gap,
+                )
+                if metrics is None:
+                    continue
+                if result.source_path.parent.name.lower() == "anomaly-free":
+                    healthy_file_count += 1
+                    healthy_false_events += metrics.false_positive_event_count
+                else:
+                    validation_metrics.append(metrics)
+
+            point_f1 = _average(metric.f1_score for metric in validation_metrics)
+            event_f1 = _average(metric.event_f1_score for metric in validation_metrics)
+            event_recall = _average(metric.event_recall for metric in validation_metrics)
+            false_events = _average(
+                float(metric.false_positive_event_count) for metric in validation_metrics
+            )
+            healthy_false_event_rate = healthy_false_events / max(healthy_file_count, 1)
+            objective = _industrial_objective(
                 point_f1=point_f1,
                 event_f1=event_f1,
                 event_recall=event_recall,
@@ -250,7 +263,22 @@ def _tune_detector(
                 healthy_false_event_rate=healthy_false_event_rate,
                 failed_files=failed_files,
             )
-        )
+            trials.append(
+                ThresholdTrial(
+                    detector=detector,
+                    threshold=threshold,
+                    objective=objective,
+                    file_count=len(validation_metrics),
+                    point_f1=point_f1,
+                    event_f1=event_f1,
+                    event_recall=event_recall,
+                    average_false_events=false_events,
+                    healthy_false_event_rate=healthy_false_event_rate,
+                    failed_files=failed_files,
+                    min_event_length=min_event_length,
+                    merge_gap=merge_gap,
+                )
+            )
     return trials
 
 
@@ -282,6 +310,7 @@ def _build_tuning_report(
     split: ExperimentSplit,
     trials: list[ThresholdTrial],
     selected_thresholds: dict[str, float],
+    selected_event_policies: dict[str, dict[str, int]],
     test_benchmark: BenchmarkResult,
 ) -> str:
     """生成竞赛实验方法和参数选择报告。"""
@@ -298,24 +327,29 @@ def _build_tuning_report(
         "## 1. 实验原则",
         "",
         "- 健康文件仅用于无监督标定和健康误报约束，不参与最终模型排名。",
-        "- 阈值只使用验证集标签选择，独立测试集在参数冻结后运行。",
+        "- 阈值和事件后处理参数只使用验证集标签联合选择，独立测试集在参数冻结后运行。",
         "- 按完整文件划分，避免同一段连续时序同时进入验证集和测试集。",
         "- 目标函数优先事件级检出，并惩罚误报事件和健康数据告警。",
         f"- 参数选择要求验证集事件召回不低于 {MIN_VALIDATION_EVENT_RECALL:.0%}，防止以漏报换低误报。",
         "",
-        "## 2. 阈值选择",
+        "## 2. 参数联合选择",
         "",
-        "| 检测器 | 最佳阈值 | 验证目标 | 点级 F1 | 事件级 F1 | 事件召回 | 平均误报事件 | 健康误报事件 |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| 检测器 | 最佳阈值 | 最短事件 | 合并间隔 | 验证目标 | 点级 F1 | 事件级 F1 | 事件召回 | 平均误报事件 | 健康误报事件 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for detector, threshold in selected_thresholds.items():
         best = next(
             trial
             for trial in trials
-            if trial.detector == detector and trial.threshold == threshold
+            if trial.detector == detector
+            and trial.threshold == threshold
+            and trial.min_event_length
+            == selected_event_policies[detector]["min_event_length"]
+            and trial.merge_gap == selected_event_policies[detector]["merge_gap"]
         )
         lines.append(
-            f"| {detector} | {threshold:.2f} | {best.objective:.4f} | {best.point_f1:.4f} | "
+            f"| {detector} | {threshold:.2f} | {best.min_event_length} | {best.merge_gap} | "
+            f"{best.objective:.4f} | {best.point_f1:.4f} | "
             f"{best.event_f1:.4f} | {best.event_recall:.4f} | "
             f"{best.average_false_events:.2f} | {best.healthy_false_event_rate:.2f} |"
         )

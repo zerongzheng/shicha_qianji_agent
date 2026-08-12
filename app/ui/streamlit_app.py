@@ -17,7 +17,10 @@ import streamlit as st
 
 from app.agent import IndustrialAgent
 from app.analysis import analyze_file
-from app.analysis.detection import DETECTOR_RECOMMENDED_THRESHOLDS
+from app.analysis.detection import (
+    DETECTOR_RECOMMENDED_THRESHOLDS,
+    recommended_event_policy,
+)
 from app.config import get_settings
 from app.data import save_uploaded_file
 from app.diagnosis import AutomaticDiagnosisService, build_fallback_diagnosis
@@ -195,11 +198,22 @@ def _render_sidebar() -> tuple[Path, AnalysisConfig] | None:
             value=int(settings.rolling_window),
             step=2,
         )
+        recommended_min_event_length, recommended_merge_gap = recommended_event_policy(
+            str(detector)
+        )
         min_event_length = st.number_input(
             "最短事件长度",
             min_value=1,
             max_value=60,
-            value=int(settings.min_event_length),
+            value=recommended_min_event_length,
+            key=f"min_event_length_{detector}",
+        )
+        merge_gap = st.number_input(
+            "事件合并间隔",
+            min_value=0,
+            max_value=120,
+            value=recommended_merge_gap,
+            key=f"merge_gap_{detector}",
         )
 
         run_clicked = st.button("开始智能分析", type="primary", width="stretch")
@@ -224,7 +238,7 @@ def _render_sidebar() -> tuple[Path, AnalysisConfig] | None:
         threshold=float(threshold),
         rolling_window=odd_window,
         min_event_length=int(min_event_length),
-        merge_gap=settings.merge_gap,
+        merge_gap=int(merge_gap),
         contamination=settings.contamination,
     )
 

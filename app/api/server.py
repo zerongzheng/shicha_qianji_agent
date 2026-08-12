@@ -15,7 +15,10 @@ from math import isfinite
 from pathlib import Path
 from typing import Annotated, Any
 
-from app.analysis.detection import DETECTOR_RECOMMENDED_THRESHOLDS
+from app.analysis.detection import (
+    DETECTOR_RECOMMENDED_THRESHOLDS,
+    recommended_event_policy,
+)
 from app.analysis.forecast import MODEL_LABELS, forecast_sensors
 from app.analysis.pipeline import analyze_file
 from app.analysis.profiling import build_profile
@@ -154,6 +157,7 @@ def _parse_config(payload: dict[str, Any] | None) -> AnalysisConfig:
         detector,
         settings.anomaly_threshold,
     )
+    default_min_event_length, default_merge_gap = recommended_event_policy(detector)
     return AnalysisConfig(
         device_profile_id=(
             None
@@ -165,8 +169,11 @@ def _parse_config(payload: dict[str, Any] | None) -> AnalysisConfig:
         detector=detector,
         threshold=float(payload.get("threshold", default_threshold)),
         rolling_window=max(5, int(payload.get("rolling_window", settings.rolling_window))),
-        min_event_length=max(1, int(payload.get("min_event_length", settings.min_event_length))),
-        merge_gap=max(0, int(payload.get("merge_gap", settings.merge_gap))),
+        min_event_length=max(
+            1,
+            int(payload.get("min_event_length", default_min_event_length)),
+        ),
+        merge_gap=max(0, int(payload.get("merge_gap", default_merge_gap))),
         contamination=float(payload.get("contamination", settings.contamination)),
         hybrid_mad_weight=float(payload.get("hybrid_mad_weight", 0.50)),
         hybrid_forest_weight=float(payload.get("hybrid_forest_weight", 0.30)),
@@ -276,6 +283,16 @@ def _result_payload(run_id: str, result: Any) -> dict[str, Any]:
                 for item in result.profile.sensors[:12]
             ],
         },
+        "raw_data_profile": (
+            {
+                "row_count": result.raw_profile.row_count,
+                "missing_total": result.raw_profile.missing_total,
+                "sampling_seconds": result.raw_profile.sampling_seconds,
+            }
+            if result.raw_profile
+            else None
+        ),
+        "preprocessing": result.preprocessing,
         "detector": result.detector_name,
         "visualization": _visualization_payload(result, threshold=threshold),
         "anomaly_events": [event.__dict__ for event in result.events],
@@ -311,6 +328,9 @@ def _result_payload(run_id: str, result: Any) -> dict[str, Any]:
         "forecast_results": result.forecast_results,
         "risk_alerts": result.risk_alerts,
         "recommendations": result.recommendations,
+        "optimization_recommendations": [
+            asdict(item) for item in result.optimization_recommendations
+        ],
         "execution_trace": [asdict(item) for item in result.execution_trace],
         "summary": summary,
         "limitations": [
@@ -839,7 +859,7 @@ def _execute_analysis_job(
         response = _result_payload(run_id, result)
         diagnosis_status = None
         if operation == "diagnose":
-            automatic = AutomaticDiagnosisService().diagnose(result)
+            automatic = AutomaticDiagnosisService().diagnose(result, run_id=run_id)
             response["automatic_diagnosis"] = automatic.to_dict()
             diagnosis_status = automatic.status
     except Exception as exc:  # noqa: BLE001  后台任务必须自行落库，不能依赖 FastAPI。
@@ -1153,7 +1173,9 @@ if app:
                 case_matcher=get_repository().find_similar_cases,
             )
             response = _result_payload(logger.run_id, result)
-            automatic = AutomaticDiagnosisService().diagnose(result)
+            automatic = AutomaticDiagnosisService().diagnose(
+                result, run_id=logger.run_id
+            )
             response["automatic_diagnosis"] = automatic.to_dict()
         except Exception as exc:
             log_record = logger.finish(
@@ -1588,6 +1610,23 @@ if app:
         if run is None:
             raise HTTPException(status_code=404, detail="找不到对应分析任务")
         return {"status": "success", "run": run}
+
+    @app.get("/api/v1/model-calls")
+    def list_model_calls(
+        limit: int = 100,
+        run_id: str | None = None,
+        x_api_key: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """查询不含提示词和模型正文的调用审计记录。"""
+
+        _check_api_key(x_api_key)
+        calls = get_repository().list_model_calls(limit=limit, run_id=run_id)
+        return {
+            "status": "success",
+            "call_count": len(calls),
+            "content_stored": False,
+            "calls": calls,
+        }
 
     @app.get("/api/v1/work-orders")
     def list_work_orders(
