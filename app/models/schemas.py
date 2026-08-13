@@ -27,10 +27,10 @@ class AnalysisConfig:
     detector_selection_mode: str = "manual"
     analysis_goal: str = "balanced"
     detector: str = "time_frequency_relation"
-    threshold: float = 4.5
+    threshold: float = 3.5
     rolling_window: int = 61
-    min_event_length: int = 3
-    merge_gap: int = 5
+    min_event_length: int = 12
+    merge_gap: int = 30
     contamination: float = 0.01
     random_state: int = 42
     use_healthy_baseline: bool = True

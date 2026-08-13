@@ -11,9 +11,13 @@ import secrets
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from datetime import datetime, timedelta
 from math import isfinite
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import urlparse
+
+import psycopg
 
 from app.analysis.detection import (
     DETECTOR_RECOMMENDED_THRESHOLDS,
@@ -27,6 +31,7 @@ from app.api.schemas import (
     AnalysisRequest,
     AnalysisResponse,
     ArchiveRequest,
+    DataSourceRequest,
     ErrorResponse,
     FilePreflightResponse,
     FileUploadResponse,
@@ -36,7 +41,10 @@ from app.api.schemas import (
     JobCreateRequest,
     JobResultResponse,
     JobStatusResponse,
+    LoginRequest,
+    LoginResponse,
     ModelCompareRequest,
+    NotificationAcknowledgeRequest,
     RunIdRequest,
     WanwuCaseListRequest,
     WanwuJobAcceptedResponse,
@@ -45,9 +53,11 @@ from app.api.schemas import (
     WanwuQuickDiagnosisResponse,
     WanwuWorkOrderListRequest,
     WanwuWorkOrderUpdateRequest,
+    WorkOrderAssignmentRequest,
     WorkOrderUpdateRequest,
 )
 from app.api.wanwu_openapi import build_wanwu_openapi
+from app.automation import MonitoringService, dispatch_run_notifications
 from app.config import get_settings
 from app.data.device_profiles import load_device_profiles
 from app.data.loader import (
@@ -65,14 +75,20 @@ from app.models import (
     AnalysisConfig,
 )
 from app.observability import RunLogger
+from app.security import (
+    generate_session_token,
+    hash_password,
+    hash_session_token,
+    verify_password,
+)
 from app.storage import get_repository
 
 try:
-    from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+    from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
     from fastapi.middleware.cors import CORSMiddleware
 except ImportError:  # 让未安装 API 依赖时，核心分析和 Streamlit 仍可用。
     FastAPI = None
-    File = Header = UploadFile = Any
+    Depends = File = Header = UploadFile = Any
     CORSMiddleware = None
 
 
@@ -81,22 +97,57 @@ UPLOAD_DIR = settings.output_dir / "api_uploads"
 # 快速诊断会按文件哈希复用历史结果。每当分析管线或返回证据发生实质升级时必须递增
 # 此版本，防止同一份演示 CSV 长期命中旧结果而看不到新能力。
 QUICK_DIAGNOSIS_VERSION = "0.8.0"
+_monitoring_service: MonitoringService | None = None
 
 
 @asynccontextmanager
 async def _lifespan(_app: Any):
     """启动时清理中断任务，关闭时等待后台线程完成。"""
 
-    get_repository().fail_incomplete_runs("服务重启导致任务中断，请重新提交")
+    global _monitoring_service
+    repository = get_repository()
+    _ensure_bootstrap_users(repository)
+    repository.fail_incomplete_runs("服务重启导致任务中断，请重新提交")
+    monitor = get_monitoring_service()
+    repository = get_repository()
+    enabled_sources = (
+        repository.list_data_sources(enabled_only=True)
+        if hasattr(repository, "list_data_sources")
+        else []
+    )
+    if getattr(settings, "automatic_monitor_enabled", False) or enabled_sources:
+        monitor.start()
     try:
         yield
     finally:
+        monitor.stop()
+        _monitoring_service = None
         cancelled_run_ids = get_job_manager().shutdown()
         get_job_manager.cache_clear()
         repository = get_repository()
         for run_id in cancelled_run_ids:
             repository.cancel_run(run_id, "服务关闭取消了尚未执行的排队任务")
         repository.fail_incomplete_runs("服务关闭导致任务中断，请重新提交")
+
+
+def get_monitoring_service() -> MonitoringService:
+    """返回当前进程唯一的自动监测调度器。"""
+
+    global _monitoring_service
+    if _monitoring_service is None:
+        default_storage = settings.output_dir / "auto_ingestion"
+        _monitoring_service = MonitoringService(
+            get_repository(),
+            getattr(
+                settings,
+                "automatic_monitor_storage_dir",
+                default_storage,
+            ),
+            _submit_automatic_ingestion,
+            max_bytes=getattr(settings, "max_upload_bytes", 25 * 1024 * 1024),
+            tick_seconds=getattr(settings, "automatic_monitor_tick_seconds", 1.0),
+        )
+    return _monitoring_service
 
 
 app = (
@@ -126,6 +177,9 @@ if app is not None and CORSMiddleware is not None:
             for origin in settings.frontend_allowed_origins.split(",")
             if origin.strip()
         ],
+        # Vite 在 5173 被占用时会自动选择 5174、5175 等端口。本地开发只允许回环主机，
+        # 但不固定端口，避免前端页面能打开却被浏览器 CORS 拦截 API 请求。
+        allow_origin_regex=r"^https?://(?:localhost|127\.0\.0\.1)(?::\d+)?$",
         allow_credentials=True,
         allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["*"],
@@ -138,6 +192,92 @@ def _check_api_key(api_key: str | None) -> None:
     expected = getattr(settings, "industrial_api_key", "")
     if expected and not secrets.compare_digest(api_key or "", expected):
         raise HTTPException(status_code=401, detail="工业分析服务鉴权失败")
+
+
+def _ensure_bootstrap_users(repository: Any) -> None:
+    """用环境变量首次初始化校赛演示人员，永不把明文密码写入仓库。"""
+
+    password = settings.auth_bootstrap_password
+    if not password:
+        return
+    accounts = (
+        ("admin", "系统管理员", "系统管理员"),
+        ("production", "生产负责人", "生产负责人"),
+        ("engineer", "设备工程师", "设备工程师"),
+        ("operator", "运行值班员", "运行值班员"),
+        ("observer", "观察人员", "观察人员"),
+    )
+    for username, display_name, role in accounts:
+        if repository.get_user_by_username(username) is None:
+            repository.upsert_user(
+                username=username,
+                display_name=display_name,
+                role=role,
+                password_hash=hash_password(password),
+            )
+
+
+def _bearer_token(authorization: str | None) -> str:
+    """严格解析 Bearer 会话令牌，避免把其他认证头误当作登录态。"""
+
+    scheme, _, token = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        raise HTTPException(status_code=401, detail="请先登录时察千机工作台")
+    return token.strip()
+
+
+def _current_user(
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict[str, Any]:
+    """解析当前人员；关闭本地认证时返回兼容身份，方便算法与万悟独立联调。"""
+
+    if not settings.auth_enabled:
+        return {
+            "user_id": None,
+            "username": "local",
+            "display_name": "本地调试用户",
+            "role": "系统管理员",
+            "active": True,
+        }
+    token = _bearer_token(authorization)
+    user = get_repository().get_user_by_session(hash_session_token(token))
+    if user is None:
+        raise HTTPException(status_code=401, detail="登录已过期，请重新登录")
+    return user
+
+
+def _optional_current_user(
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict[str, Any] | None:
+    """读取可选登录态，供同时支持浏览器人员和万悟 API Key 的接口使用。"""
+
+    if not settings.auth_enabled:
+        return _current_user(authorization)
+    if not authorization:
+        return None
+    return _current_user(authorization)
+
+
+def _check_user_or_api_key(user: dict[str, Any] | None, api_key: str | None) -> None:
+    """人工操作必须来自已登录人员，或来自配置了有效密钥的万悟工作流。"""
+
+    if user is not None:
+        return
+    expected = getattr(settings, "industrial_api_key", "")
+    if expected and secrets.compare_digest(api_key or "", expected):
+        return
+    raise HTTPException(status_code=401, detail="请先登录，或使用有效的工业服务 API Key")
+
+
+def _require_roles(*roles: str):
+    """生成角色权限依赖，当前只保护人员管理和工单指派等人工操作。"""
+
+    def dependency(user: Annotated[dict[str, Any], Depends(_current_user)]) -> dict[str, Any]:
+        if user["role"] not in roles:
+            raise HTTPException(status_code=403, detail="当前账号没有执行此操作的权限")
+        return user
+
+    return dependency
 
 
 def _parse_config(payload: dict[str, Any] | None) -> AnalysisConfig:
@@ -235,6 +375,35 @@ def _parse_bool(value: Any) -> bool:
     raise ValueError("布尔配置只能使用 true/false、1/0 或 yes/no。")
 
 
+def _validate_data_source(payload: DataSourceRequest) -> None:
+    """在保存前验证数据源端点，避免轮询线程长期重复报告固定配置错误。"""
+
+    if payload.source_type == "directory":
+        directory = Path(payload.endpoint).expanduser().resolve()
+        if not directory.is_dir():
+            raise HTTPException(status_code=400, detail=f"监控目录不存在：{directory}")
+        return
+    parsed = urlparse(payload.endpoint)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise HTTPException(status_code=400, detail="HTTP 数据源必须是有效的 http/https 地址")
+
+
+def _public_data_source(source: dict[str, Any]) -> dict[str, Any]:
+    """返回前端需要的配置和状态，不回显请求头或通知密钥。"""
+
+    public_source = {
+        key: value
+        for key, value in source.items()
+        if key not in {"request_headers"}
+    }
+    # 兼容旧数据：历史 routing 中可能保存过 webhook_url，任何 API 都不得将其回传浏览器。
+    routing = dict(public_source.get("routing") or {})
+    routing.pop("webhook_url", None)
+    public_source["routing"] = routing
+    public_source["request_header_count"] = len(source.get("request_headers") or {})
+    return public_source
+
+
 def _result_payload(run_id: str, result: Any) -> dict[str, Any]:
     """返回稳定的机器可读协议，避免万悟依赖 Markdown 文本解析。"""
 
@@ -244,7 +413,7 @@ def _result_payload(run_id: str, result: Any) -> dict[str, Any]:
     threshold = float(
         result.model_selection.get(
             "selected_threshold",
-            stored_config.get("threshold", 4.5),
+            stored_config.get("threshold", 3.5),
         )
     )
     return {
@@ -538,6 +707,9 @@ def _submit_analysis_job(
     source_path: Path,
     operation: str,
     config: AnalysisConfig,
+    source_id: str | None = None,
+    ingestion_id: str | None = None,
+    ingestion_storage_path: Path | None = None,
 ) -> dict[str, Any]:
     """登记并提交异步任务，保持普通 API 与万悟适配接口行为一致。"""
 
@@ -550,7 +722,15 @@ def _submit_analysis_job(
         detector=config.detector,
         config=asdict(config),
         status="queued",
+        source_id=source_id,
+        ingestion_id=ingestion_id,
     )
+    if ingestion_id and ingestion_storage_path:
+        repository.mark_ingestion_submitted(
+            ingestion_id,
+            run_id=run_id,
+            storage_path=ingestion_storage_path,
+        )
     try:
         get_job_manager().submit(
             run_id,
@@ -571,6 +751,28 @@ def _submit_analysis_job(
         "status_url": f"/api/v1/jobs/{run_id}",
         "result_url": f"/api/v1/jobs/{run_id}/result",
     }
+
+
+def _submit_automatic_ingestion(
+    source: dict[str, Any],
+    ingestion_id: str,
+    source_path: Path,
+) -> str:
+    """把自动采集快照登记为受控文件并提交现有分析队列。"""
+
+    file_id = f"auto_{ingestion_id}"
+    get_repository().register_file(file_id, source_path.name, source_path)
+    config = _parse_config(source.get("analysis_config") or {})
+    accepted = _submit_analysis_job(
+        file_id=file_id,
+        source_path=source_path,
+        operation="analyze",
+        config=config,
+        source_id=str(source["source_id"]),
+        ingestion_id=ingestion_id,
+        ingestion_storage_path=source_path,
+    )
+    return str(accepted["run_id"])
 
 
 def _job_status_payload(run: dict[str, Any]) -> dict[str, Any]:
@@ -843,7 +1045,7 @@ def _execute_analysis_job(
     operation: str,
     config: AnalysisConfig,
 ) -> None:
-    """后台执行分析或自动诊断，并把最终状态写回 SQLite。"""
+    """后台执行分析或自动诊断，并把最终状态写回 PostgreSQL。"""
 
     logger = RunLogger(run_id=run_id)
     repository = get_repository()
@@ -885,6 +1087,17 @@ def _execute_analysis_job(
         output_summary,
     )
     _finish_persisted_run(log_record, response=response)
+    # 通知是分析后的主动动作。投递失败只进入通知审计，不覆盖已成功的分析和工单。
+    try:
+        dispatch_run_notifications(repository, run_id)
+    except Exception as exc:  # noqa: BLE001 - 通知通道故障不能改变分析任务事实状态。
+        source = repository.get_data_source_for_run(run_id)
+        if source is not None:
+            repository.record_source_poll(
+                str(source["source_id"]),
+                success=True,
+                error=f"通知投递失败：{exc}",
+            )
 
 
 if app:
@@ -914,8 +1127,141 @@ if app:
     def health() -> dict[str, str]:
         """供万悟或部署平台检查服务是否在线。"""
 
-        get_repository()
-        return {"status": "ok", "service": "shichi-qianji", "database": "sqlite"}
+        if not get_repository().ping():
+            raise HTTPException(status_code=503, detail="PostgreSQL 数据库不可用")
+        return {"status": "ok", "service": "shichi-qianji", "database": "postgresql"}
+
+    @app.get("/api/v1/auth/config")
+    def auth_config() -> dict[str, Any]:
+        """告诉前端当前部署是否启用人员登录，不返回任何账号或密码信息。"""
+
+        return {
+            "status": "success",
+            "auth_enabled": settings.auth_enabled,
+            "session_hours": settings.auth_session_hours,
+        }
+
+    @app.post("/api/v1/auth/login", response_model=LoginResponse)
+    def login(payload: LoginRequest) -> dict[str, Any]:
+        """验证预置账号并签发可撤销的短期 Bearer 会话。"""
+
+        if not settings.auth_enabled:
+            raise HTTPException(status_code=409, detail="当前部署未启用人员登录")
+        repository = get_repository()
+        user = repository.get_user_by_username(payload.username)
+        if user is None or not bool(user["active"]) or not verify_password(
+            payload.password,
+            str(user["password_hash"]),
+        ):
+            raise HTTPException(status_code=401, detail="账号或密码错误")
+        token = generate_session_token()
+        expires_at = (
+            datetime.now().astimezone() + timedelta(hours=settings.auth_session_hours)
+        ).isoformat()
+        session = repository.create_session(
+            user_id=str(user["user_id"]),
+            token_hash=hash_session_token(token),
+            expires_at=expires_at,
+        )
+        public_user = repository.get_user_by_session(hash_session_token(token))
+        repository.record_audit(
+            user_id=str(user["user_id"]),
+            action="login",
+            target_type="session",
+            target_id=session["session_id"],
+        )
+        return {
+            "status": "success",
+            "token": token,
+            "expires_at": session["expires_at"],
+            "user": public_user,
+        }
+
+    @app.get("/api/v1/auth/me")
+    def current_user(
+        user: Annotated[dict[str, Any], Depends(_current_user)],
+    ) -> dict[str, Any]:
+        """恢复浏览器刷新前的登录态。"""
+
+        return {"status": "success", "user": user}
+
+    @app.post("/api/v1/auth/logout")
+    def logout(
+        authorization: Annotated[str | None, Header()] = None,
+        user: Annotated[dict[str, Any] | None, Depends(_optional_current_user)] = None,
+    ) -> dict[str, Any]:
+        """撤销当前会话；关闭认证时保持兼容成功。"""
+
+        if settings.auth_enabled:
+            token = _bearer_token(authorization)
+            get_repository().revoke_session(hash_session_token(token))
+            get_repository().record_audit(
+                user_id=user.get("user_id") if user else None,
+                action="logout",
+                target_type="session",
+            )
+        return {"status": "success"}
+
+    @app.get("/api/v1/users")
+    def list_users(
+        _user: Annotated[
+            dict[str, Any],
+            Depends(_require_roles("系统管理员", "生产负责人")),
+        ],
+    ) -> dict[str, Any]:
+        """返回可指派人员；密码、令牌和内部审计信息始终不出库。"""
+
+        users = get_repository().list_users()
+        return {"status": "success", "user_count": len(users), "users": users}
+
+    @app.get("/api/v1/notifications/mine")
+    def list_my_notifications(
+        unread_only: bool = False,
+        user: Annotated[dict[str, Any] | None, Depends(_current_user)] = None,
+    ) -> dict[str, Any]:
+        """返回当前人员收到的主动告警。"""
+
+        notifications = (
+            get_repository().list_notifications(
+                limit=100,
+                recipient_user_id=user.get("user_id"),
+                unread_only=unread_only,
+            )
+            if user and user.get("user_id")
+            else []
+        )
+        return {
+            "status": "success",
+            "notification_count": len(notifications),
+            "unread_count": sum(1 for item in notifications if not item.get("read_at")),
+            "notifications": notifications,
+        }
+
+    @app.post("/api/v1/notifications/acknowledge")
+    def acknowledge_notification(
+        payload: NotificationAcknowledgeRequest,
+        user: Annotated[dict[str, Any], Depends(_current_user)],
+    ) -> dict[str, Any]:
+        """签收主动告警并写入人工审计轨迹。"""
+
+        if not user.get("user_id"):
+            raise HTTPException(status_code=409, detail="当前部署未启用人员身份")
+        try:
+            notification = get_repository().acknowledge_notification(
+                payload.notification_id,
+                user["user_id"],
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        get_repository().record_audit(
+            user_id=user["user_id"],
+            action="acknowledge_notification",
+            target_type="notification",
+            target_id=payload.notification_id,
+        )
+        return {"status": "success", "notification": notification}
 
     @app.get("/api/v1/system/diagnostics")
     def system_diagnostics() -> dict[str, Any]:
@@ -934,9 +1280,8 @@ if app:
         except ValueError as exc:
             device_profile_error = str(exc)
         try:
-            get_repository()
-            database_ready = settings.database_path.parent.exists()
-        except (OSError, RuntimeError):
+            database_ready = get_repository().ping()
+        except (OSError, RuntimeError, psycopg.Error):
             pass
 
         checks = {
@@ -968,7 +1313,7 @@ if app:
             "status": "ready" if checks["database"] == "ok" and not warnings else "degraded",
             "service": "shichi-qianji",
             "version": app.version,
-            "database": {"engine": "sqlite", "ready": database_ready},
+            "database": {"engine": "postgresql", "ready": database_ready},
             "knowledge_base": {"ready": bool(knowledge_files), "document_count": len(knowledge_files)},
             "data_sources": {
                 "default_skab_ready": settings.default_skab_file.exists(),
@@ -1598,6 +1943,97 @@ if app:
         )
         return {"status": "success", "run_count": len(runs), "runs": runs}
 
+    @app.get("/api/v1/monitoring/status")
+    def monitoring_status(
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """返回无人值守监测、采集批次和通知的统一看板数据。"""
+
+        _check_api_key(x_api_key)
+        repository = get_repository()
+        sources = [_public_data_source(item) for item in repository.list_data_sources()]
+        # 本机快照路径只供后端复现分析，不通过看板接口暴露。
+        ingestions = [
+            {key: value for key, value in item.items() if key != "storage_path"}
+            for item in repository.list_ingestions(limit=100)
+        ]
+        notifications = repository.list_notifications(limit=100)
+        return {
+            "status": "success",
+            "monitor": get_monitoring_service().status(),
+            "notification_channels": {
+                "wecom": {
+                    "enabled": settings.wecom_enabled,
+                    "configured": bool(settings.wecom_webhook_url),
+                }
+            },
+            "source_count": len(sources),
+            "enabled_source_count": sum(int(item["enabled"]) for item in sources),
+            "sources": sources,
+            "ingestions": ingestions,
+            "notifications": notifications,
+        }
+
+    @app.post("/api/v1/monitoring/sources")
+    def save_monitoring_source(
+        payload: DataSourceRequest,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """保存数据源和告警路由；启用后调度器自动开始轮询。"""
+
+        _check_api_key(x_api_key)
+        _validate_data_source(payload)
+        source = get_repository().upsert_data_source(
+            {
+                "source_id": payload.source_id,
+                "name": payload.name,
+                "source_type": payload.source_type,
+                "endpoint": payload.endpoint,
+                "interval_seconds": payload.interval_seconds,
+                "enabled": payload.enabled,
+                "config": {
+                    "timeout_seconds": payload.timeout_seconds,
+                    "initial_scan_mode": payload.initial_scan_mode,
+                    "request_headers": payload.request_headers,
+                    "analysis_config": payload.analysis_config.as_overrides(),
+                    "routing": payload.routing.model_dump(exclude_none=True),
+                },
+            }
+        )
+        if payload.enabled:
+            get_monitoring_service().start()
+        return {"status": "success", "source": _public_data_source(source)}
+
+    @app.post("/api/v1/monitoring/sources/{source_id}/poll")
+    def poll_monitoring_source(
+        source_id: str,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """立即采集一次，主要用于配置验收和比赛现场演示。"""
+
+        _check_api_key(x_api_key)
+        try:
+            result = get_monitoring_service().poll_once(source_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"status": "success", "poll": result}
+
+    @app.delete("/api/v1/monitoring/sources/{source_id}")
+    def delete_monitoring_source(
+        source_id: str,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """删除未产生历史的数据源；已有历史的数据源应停用。"""
+
+        _check_api_key(x_api_key)
+        try:
+            source = get_repository().delete_data_source(source_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"status": "success", "source": _public_data_source(source)}
+
     @app.get("/api/v1/runs/{run_id}")
     def get_run(
         run_id: str,
@@ -1638,11 +2074,13 @@ if app:
         priority: str | None = None,
         include_archived: bool = False,
         archived_only: bool = False,
+        mine: bool = False,
         x_api_key: Annotated[str | None, Header()] = None,
+        user: Annotated[dict[str, Any] | None, Depends(_optional_current_user)] = None,
     ) -> dict[str, Any]:
         """按优先级返回待办工单，可筛选状态和所属任务。"""
 
-        _check_api_key(x_api_key)
+        _check_user_or_api_key(user, x_api_key)
         work_orders = get_repository().list_work_orders(
             limit=limit,
             offset=max(0, offset),
@@ -1650,6 +2088,7 @@ if app:
             run_id=run_id,
             search=search,
             priority=priority,
+            assigned_user_id=(user.get("user_id") if mine and user else None),
             include_archived=include_archived,
             archived_only=archived_only,
         )
@@ -1658,6 +2097,7 @@ if app:
             run_id=run_id,
             search=search,
             priority=priority,
+            assigned_user_id=(user.get("user_id") if mine and user else None),
             include_archived=include_archived,
             archived_only=archived_only,
         )
@@ -1716,19 +2156,93 @@ if app:
         record_id: str,
         payload: WorkOrderUpdateRequest,
         x_api_key: Annotated[str | None, Header()] = None,
+        user: Annotated[dict[str, Any] | None, Depends(_optional_current_user)] = None,
     ) -> dict[str, Any]:
         """接收万悟或现场人员回写的工单状态与确认结果。"""
 
-        _check_api_key(x_api_key)
+        _check_user_or_api_key(user, x_api_key)
+        current_order = get_repository()._get_work_order(record_id)
+        if current_order is None:
+            raise HTTPException(status_code=404, detail=f"找不到工单：{record_id}")
+        is_manager = user and user.get("role") in {"系统管理员", "生产负责人"}
+        if (
+            settings.auth_enabled
+            and current_order.get("assigned_user_id")
+            and current_order["assigned_user_id"] != (user or {}).get("user_id")
+            and not is_manager
+        ):
+            raise HTTPException(status_code=403, detail="该工单已指派给其他人员")
+        values = payload.model_dump(exclude_unset=True)
+        if user and user.get("display_name") and not values.get("handled_by"):
+            values["handled_by"] = user["display_name"]
         try:
             work_order = get_repository().update_work_order(
                 record_id,
-                payload.model_dump(exclude_unset=True),
+                values,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if user:
+            get_repository().record_audit(
+                user_id=user.get("user_id"),
+                action="update_work_order",
+                target_type="work_order",
+                target_id=record_id,
+                detail={"status": work_order["status"]},
+            )
+        return {"status": "success", "work_order": work_order}
+
+    @app.post("/api/v1/work-orders/{record_id}/accept")
+    def accept_work_order(
+        record_id: str,
+        user: Annotated[dict[str, Any], Depends(_current_user)],
+    ) -> dict[str, Any]:
+        """当前人员确认接单，并写入接单时间和责任人。"""
+
+        if not user.get("user_id"):
+            raise HTTPException(status_code=409, detail="当前部署未启用人员身份")
+        try:
+            work_order = get_repository().accept_work_order(record_id, user["user_id"])
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        get_repository().record_audit(
+            user_id=user["user_id"],
+            action="accept_work_order",
+            target_type="work_order",
+            target_id=record_id,
+        )
+        return {"status": "success", "work_order": work_order}
+
+    @app.post("/api/v1/work-orders/{record_id}/assign")
+    def assign_work_order(
+        record_id: str,
+        payload: WorkOrderAssignmentRequest,
+        user: Annotated[
+            dict[str, Any],
+            Depends(_require_roles("系统管理员", "生产负责人")),
+        ],
+    ) -> dict[str, Any]:
+        """由管理员或生产负责人调整工单责任人。"""
+
+        try:
+            work_order = get_repository().assign_work_order(record_id, payload.user_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        get_repository().record_audit(
+            user_id=user.get("user_id"),
+            action="assign_work_order",
+            target_type="work_order",
+            target_id=record_id,
+            detail={"assigned_user_id": payload.user_id},
+        )
         return {"status": "success", "work_order": work_order}
 
     @app.post("/api/v1/runs/{run_id}/archive")
@@ -1795,6 +2309,38 @@ if app:
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"status": "success", "work_order": work_order}
+
+    @app.delete("/api/v1/work-orders/{record_id}")
+    def delete_archived_work_order(
+        record_id: str,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """永久删除已归档工单；正常队列中的工单必须先完成并归档。"""
+
+        _check_api_key(x_api_key)
+        try:
+            result = get_repository().delete_archived_work_order(record_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"status": "success", "deleted": result}
+
+    @app.delete("/api/v1/runs/{run_id}")
+    def delete_archived_run(
+        run_id: str,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """永久删除已归档分析任务及其关联工单、通知和模型调用记录。"""
+
+        _check_api_key(x_api_key)
+        try:
+            result = get_repository().delete_archived_run(run_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"status": "success", "deleted": result}
 
     @app.post("/api/v1/model-compare")
     def model_compare(

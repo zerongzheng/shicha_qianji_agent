@@ -28,6 +28,7 @@ from app.experiments import (
 from app.models import AnalysisConfig
 from app.reporting.case_package import build_case_package
 from app.reporting.evidence_pack import build_evidence_pack
+from app.storage import get_repository
 
 
 def main() -> None:
@@ -406,7 +407,7 @@ def _run_basic_check(settings: object) -> dict[str, object]:
         "默认 SKAB 文件存在": default_file.is_file(),
         "默认 SKAB 目录存在": default_dir.is_dir(),
         "输出目录可创建": _ensure_directory(output_dir),
-        "数据库目录可创建": _ensure_directory(Path(settings.database_path).parent),
+        "PostgreSQL 数据库可连接": get_repository().ping(),
     }
     errors = [name for name, passed in checks.items() if not passed]
     if not errors:

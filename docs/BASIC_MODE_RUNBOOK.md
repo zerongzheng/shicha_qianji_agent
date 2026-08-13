@@ -1,6 +1,6 @@
 # 基础运行手册
 
-本手册说明校赛阶段最常用的三种运行方式。当前项目默认使用 SQLite，不需要先启动 PostgreSQL；Vue3、FastAPI 和万悟是三个可以独立运行的部分。
+本手册说明校赛阶段最常用的三种运行方式。当前项目统一使用 PostgreSQL，启动 FastAPI 前需要确认 PostgreSQL 服务可连接；Vue3、FastAPI 和万悟是三个可以独立运行的部分。
 
 ## 运行模式
 

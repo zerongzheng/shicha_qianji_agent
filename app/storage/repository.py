@@ -1,8 +1,7 @@
-"""工业分析结果与工单闭环的 SQLite 仓储。
+"""工业分析结果与工单闭环的 PostgreSQL 仓储。
 
-SQLite 适合当前单机开发、比赛演示和小规模试运行：无需额外服务，数据库文件可以随项目
-部署，同时具备事务、索引和结构化查询能力。本模块使用 Python 标准库 ``sqlite3``，避免
-在项目早期引入 ORM 和迁移框架带来的额外复杂度。
+仓储统一使用 PostgreSQL，支撑多人登录、并发工单、主动通知和后续服务器部署。上层业务
+仍只依赖本类提供的稳定方法，不直接拼接数据库连接或感知驱动细节。
 
 数据库保存文件元数据、任务参数、分析结果和现场反馈。原始 CSV 仍保存在受控上传目录，
 不写进数据库，避免数据库快速膨胀，也便于以后迁移到对象存储。
@@ -12,17 +11,21 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
+import re
 import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from zoneinfo import ZoneInfo
+
+import psycopg
+from psycopg import sql
+from psycopg.rows import dict_row
 
 from app.config import get_settings
 from app.diagnosis.patterns import classify_sensor
@@ -31,152 +34,94 @@ from app.models import HistoricalCaseMatch
 WORK_ORDER_STATUSES = {"待确认", "已确认", "处理中", "待验证", "已完成", "已关闭"}
 
 
+class PostgresConnection:
+    """给 psycopg 提供仓储内部使用的轻量执行接口。
+
+    旧仓储方法已经统一使用参数绑定，并没有把用户输入拼进 SQL。这里集中转换占位符，
+    能保留稳定的业务方法，同时让底层彻底切换为 PostgreSQL。
+    """
+
+    def __init__(self, connection: psycopg.Connection) -> None:
+        self._connection = connection
+
+    def execute(
+        self,
+        query: str,
+        parameters: Mapping[str, Any] | tuple[Any, ...] | list[Any] | None = None,
+    ) -> psycopg.Cursor:
+        converted = query
+        if isinstance(parameters, Mapping):
+            converted = re.sub(r":([A-Za-z_][A-Za-z0-9_]*)", r"%(\1)s", query)
+        elif parameters is not None:
+            converted = query.replace("?", "%s")
+        return self._connection.execute(converted, parameters)
+
+
+def _scalar(row: Mapping[str, Any] | None) -> Any:
+    """读取聚合查询的第一列，避免依赖数据库驱动的数字下标行为。"""
+
+    return next(iter(row.values())) if row else None
+
+
 class IndustrialRepository:
     """封装建表、事务和常用业务查询。"""
 
-    def __init__(self, database_path: str | Path) -> None:
-        self.database_path = Path(database_path).expanduser().resolve()
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, database_url: str, schema: str = "public") -> None:
+        if not str(database_url).startswith(("postgresql://", "postgres://")):
+            raise ValueError("DATABASE_URL 必须是 PostgreSQL 连接地址")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema):
+            raise ValueError("DATABASE_SCHEMA 只能包含字母、数字和下划线")
+        self.database_url = str(database_url)
+        self.schema = schema
         self._initialize()
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _connect(self) -> Iterator["PostgresConnection"]:
         """为每次操作创建短连接，适配 FastAPI 多线程请求。"""
 
-        connection = sqlite3.connect(self.database_path, timeout=30.0)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 30000")
+        raw = psycopg.connect(self.database_url, row_factory=dict_row, connect_timeout=10)
+        raw.execute(sql.SQL("SET search_path TO {}") .format(sql.Identifier(self.schema)))
+        connection = PostgresConnection(raw)
         try:
             yield connection
-            connection.commit()
+            raw.commit()
         except Exception:
-            connection.rollback()
+            raw.rollback()
             raise
         finally:
-            connection.close()
+            raw.close()
 
     def _initialize(self) -> None:
         """创建当前版本所需表和索引；重复启动不会破坏已有数据。"""
 
+        migration_dir = Path(__file__).with_name("migrations")
+        with psycopg.connect(self.database_url, row_factory=dict_row, connect_timeout=10) as raw:
+            raw.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(self.schema)))
+            raw.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(self.schema)))
+            raw.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations ("
+                "version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
+            )
+            applied = {
+                row["version"]
+                for row in raw.execute("SELECT version FROM schema_migrations").fetchall()
+            }
+            for migration in sorted(migration_dir.glob("*.sql")):
+                if migration.name in applied:
+                    continue
+                for statement in migration.read_text(encoding="utf-8").split(";"):
+                    if statement.strip():
+                        raw.execute(statement)
+                raw.execute(
+                    "INSERT INTO schema_migrations (version) VALUES (%s)",
+                    (migration.name,),
+                )
+
+    def ping(self) -> bool:
+        """执行真实数据库查询，供健康检查判断 PostgreSQL 是否可用。"""
+
         with self._connect() as connection:
-            # WAL 让看板读取和分析任务写入更好地并行。
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute("PRAGMA synchronous = NORMAL")
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS uploaded_files (
-                    file_id TEXT PRIMARY KEY,
-                    file_name TEXT NOT NULL,
-                    storage_path TEXT NOT NULL,
-                    sha256 TEXT NOT NULL,
-                    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS analysis_runs (
-                    run_id TEXT PRIMARY KEY,
-                    file_id TEXT NOT NULL,
-                    operation TEXT NOT NULL,
-                    detector TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    config_json TEXT NOT NULL,
-                    result_json TEXT,
-                    error TEXT,
-                    started_at TEXT NOT NULL,
-                    finished_at TEXT,
-                    duration_ms REAL,
-                    archived_at TEXT,
-                    archive_reason TEXT,
-                    FOREIGN KEY (file_id) REFERENCES uploaded_files(file_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS work_orders (
-                    record_id TEXT PRIMARY KEY,
-                    run_id TEXT NOT NULL,
-                    source_work_order_id TEXT NOT NULL,
-                    event_number INTEGER NOT NULL,
-                    priority TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    assigned_role TEXT NOT NULL,
-                    actions_json TEXT NOT NULL,
-                    evidence_json TEXT NOT NULL,
-                    required_feedback_json TEXT NOT NULL,
-                    confirmed_cause TEXT,
-                    feedback_note TEXT,
-                    handled_by TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    archived_at TEXT,
-                    archive_reason TEXT,
-                    FOREIGN KEY (run_id) REFERENCES analysis_runs(run_id) ON DELETE CASCADE,
-                    UNIQUE (run_id, source_work_order_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS model_call_logs (
-                    call_id TEXT PRIMARY KEY,
-                    run_id TEXT,
-                    timestamp TEXT NOT NULL,
-                    operation TEXT NOT NULL,
-                    provider TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    duration_ms REAL NOT NULL,
-                    input_character_count INTEGER NOT NULL,
-                    output_character_count INTEGER NOT NULL,
-                    prompt_tokens INTEGER,
-                    completion_tokens INTEGER,
-                    total_tokens INTEGER,
-                    error_type TEXT,
-                    content_stored INTEGER NOT NULL DEFAULT 0
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_runs_file_created
-                    ON analysis_runs(file_id, started_at DESC);
-                CREATE INDEX IF NOT EXISTS idx_runs_status_created
-                    ON analysis_runs(status, started_at DESC);
-                CREATE INDEX IF NOT EXISTS idx_work_orders_status_priority
-                    ON work_orders(status, priority, updated_at DESC);
-                CREATE INDEX IF NOT EXISTS idx_work_orders_run
-                    ON work_orders(run_id, event_number);
-                CREATE INDEX IF NOT EXISTS idx_model_calls_time
-                    ON model_call_logs(timestamp DESC);
-                CREATE INDEX IF NOT EXISTS idx_model_calls_run
-                    ON model_call_logs(run_id, timestamp DESC);
-                """
-            )
-            # 兼容旧数据库：新增字段通过迁移补齐，不要求删除已有分析记录。
-            self._add_column_if_missing(connection, "analysis_runs", "archived_at", "TEXT")
-            self._add_column_if_missing(connection, "analysis_runs", "archive_reason", "TEXT")
-            self._add_column_if_missing(connection, "work_orders", "archived_at", "TEXT")
-            self._add_column_if_missing(connection, "work_orders", "archive_reason", "TEXT")
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_runs_archived_created "
-                "ON analysis_runs(archived_at, started_at DESC)"
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_work_orders_archived_updated "
-                "ON work_orders(archived_at, updated_at DESC)"
-            )
-
-    @staticmethod
-    def _add_column_if_missing(
-        connection: sqlite3.Connection,
-        table_name: str,
-        column_name: str,
-        column_definition: str,
-    ) -> None:
-        """给旧表补列；表名和列名均来自代码常量，不接受外部输入。"""
-
-        columns = {
-            row[1]
-            for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
-        }
-        if column_name not in columns:
-            connection.execute(
-                f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}"
-            )
+            return _scalar(connection.execute("SELECT 1").fetchone()) == 1
 
     def register_file(
         self,
@@ -218,12 +163,27 @@ class IndustrialRepository:
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT OR REPLACE INTO model_call_logs (
+                INSERT INTO model_call_logs (
                     call_id, run_id, timestamp, operation, provider, model, status,
                     duration_ms, input_character_count, output_character_count,
                     prompt_tokens, completion_tokens, total_tokens, error_type,
                     content_stored
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(call_id) DO UPDATE SET
+                    run_id = excluded.run_id,
+                    timestamp = excluded.timestamp,
+                    operation = excluded.operation,
+                    provider = excluded.provider,
+                    model = excluded.model,
+                    status = excluded.status,
+                    duration_ms = excluded.duration_ms,
+                    input_character_count = excluded.input_character_count,
+                    output_character_count = excluded.output_character_count,
+                    prompt_tokens = excluded.prompt_tokens,
+                    completion_tokens = excluded.completion_tokens,
+                    total_tokens = excluded.total_tokens,
+                    error_type = excluded.error_type,
+                    content_stored = excluded.content_stored
                 """,
                 (
                     record["call_id"],
@@ -266,6 +226,552 @@ class IndustrialRepository:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def upsert_data_source(self, source: dict[str, Any]) -> dict[str, Any]:
+        """新增或更新自动数据源，密钥等扩展配置统一保存在 config_json。"""
+
+        source_id = str(source.get("source_id") or f"src_{uuid.uuid4().hex[:12]}")
+        timestamp = _now()
+        values = {
+            "source_id": source_id,
+            "name": str(source["name"]).strip(),
+            "source_type": str(source["source_type"]),
+            "endpoint": str(source["endpoint"]).strip(),
+            "interval_seconds": float(source["interval_seconds"]),
+            "enabled": int(bool(source.get("enabled", True))),
+            "config_json": _to_json(source.get("config") or {}),
+            "created_at": timestamp,
+            "updated_at": timestamp,
+        }
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO data_sources (
+                    source_id, name, source_type, endpoint, interval_seconds, enabled,
+                    config_json, created_at, updated_at
+                ) VALUES (
+                    :source_id, :name, :source_type, :endpoint, :interval_seconds, :enabled,
+                    :config_json, :created_at, :updated_at
+                )
+                ON CONFLICT(source_id) DO UPDATE SET
+                    name = excluded.name,
+                    source_type = excluded.source_type,
+                    endpoint = excluded.endpoint,
+                    interval_seconds = excluded.interval_seconds,
+                    enabled = excluded.enabled,
+                    config_json = excluded.config_json,
+                    updated_at = excluded.updated_at
+                """,
+                values,
+            )
+        result = self.get_data_source(source_id)
+        if result is None:
+            raise RuntimeError("数据源保存后未能读取")
+        return result
+
+    def get_data_source(self, source_id: str) -> dict[str, Any] | None:
+        """读取一个数据源的完整内部配置。"""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM data_sources WHERE source_id = ?",
+                (source_id,),
+            ).fetchone()
+        return _data_source_record(row) if row else None
+
+    def list_data_sources(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
+        """按创建时间返回数据源，供调度器和配置页使用。"""
+
+        query = "SELECT * FROM data_sources"
+        parameters: tuple[Any, ...] = ()
+        if enabled_only:
+            query += " WHERE enabled = 1"
+        query += " ORDER BY created_at DESC"
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [_data_source_record(row) for row in rows]
+
+    def list_due_data_sources(self) -> list[dict[str, Any]]:
+        """返回已启用且达到轮询周期的数据源。"""
+
+        now = datetime.now(ZoneInfo("Asia/Shanghai"))
+        due: list[dict[str, Any]] = []
+        for source in self.list_data_sources(enabled_only=True):
+            last_poll_at = source.get("last_poll_at")
+            if not last_poll_at:
+                due.append(source)
+                continue
+            try:
+                next_poll = datetime.fromisoformat(str(last_poll_at)) + timedelta(
+                    seconds=float(source["interval_seconds"])
+                )
+            except ValueError:
+                due.append(source)
+                continue
+            if next_poll <= now:
+                due.append(source)
+        return due
+
+    def delete_data_source(self, source_id: str) -> dict[str, Any]:
+        """删除尚未产生采集历史的数据源；已有证据时只允许停用。"""
+
+        source = self.get_data_source(source_id)
+        if source is None:
+            raise LookupError(f"找不到数据源：{source_id}")
+        with self._connect() as connection:
+            count = int(
+                _scalar(connection.execute(
+                    "SELECT COUNT(*) FROM data_ingestions WHERE source_id = ?",
+                    (source_id,),
+                ).fetchone())
+            )
+            if count:
+                raise ValueError("已有采集历史的数据源不能删除，请改为停用以保留审计链")
+            connection.execute("DELETE FROM data_sources WHERE source_id = ?", (source_id,))
+        return source
+
+    def record_source_poll(
+        self,
+        source_id: str,
+        *,
+        success: bool,
+        error: str | None,
+    ) -> None:
+        """记录轮询结果；采集失败不会禁用数据源。"""
+
+        timestamp = _now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE data_sources
+                SET last_poll_at = ?,
+                    last_success_at = CASE WHEN ? THEN ? ELSE last_success_at END,
+                    last_error = ?, updated_at = ?
+                WHERE source_id = ?
+                """,
+                (timestamp, bool(success), timestamp, error, timestamp, source_id),
+            )
+
+    def reserve_ingestion(
+        self,
+        *,
+        source_id: str,
+        fingerprint: str,
+        item_key: str,
+        file_name: str,
+    ) -> dict[str, Any] | None:
+        """原子预留新数据批次；同一源相同内容只允许分析一次。"""
+
+        ingestion_id = f"ing_{uuid.uuid4().hex[:12]}"
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO data_ingestions (
+                        ingestion_id, source_id, fingerprint, item_key, file_name,
+                        status, detected_at
+                    ) VALUES (?, ?, ?, ?, ?, 'detected', ?)
+                    """,
+                    (
+                        ingestion_id,
+                        source_id,
+                        fingerprint,
+                        item_key,
+                        file_name,
+                        _now(),
+                    ),
+                )
+        except psycopg.IntegrityError:
+            return None
+        return self.get_ingestion(ingestion_id)
+
+    def mark_ingestion_submitted(
+        self,
+        ingestion_id: str,
+        *,
+        run_id: str,
+        storage_path: Path,
+    ) -> None:
+        """关联不可变快照和异步分析任务。"""
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE data_ingestions
+                SET status = 'submitted', storage_path = ?, run_id = ?, submitted_at = ?, error = NULL
+                WHERE ingestion_id = ?
+                """,
+                (str(storage_path.resolve()), run_id, _now(), ingestion_id),
+            )
+
+    def mark_ingestion_failed(self, ingestion_id: str, error: str) -> None:
+        """保存采集或任务提交失败信息。"""
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE data_ingestions
+                SET status = 'failed', error = ?, finished_at = ?
+                WHERE ingestion_id = ?
+                """,
+                (error, _now(), ingestion_id),
+            )
+
+    def get_ingestion(self, ingestion_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM data_ingestions WHERE ingestion_id = ?",
+                (ingestion_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_ingestions(
+        self,
+        *,
+        limit: int = 100,
+        source_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        # 永久删除自动分析任务后仍保留采集指纹，防止同一文件被轮询器再次提交；
+        # 这类最小去重记录不再出现在监测时间线中。
+        query = "SELECT * FROM data_ingestions WHERE status != 'removed'"
+        parameters: list[Any] = []
+        if source_id:
+            query += " AND source_id = ?"
+            parameters.append(source_id)
+        query += " ORDER BY detected_at DESC LIMIT ?"
+        parameters.append(max(1, min(500, int(limit))))
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_data_source_for_run(self, run_id: str) -> dict[str, Any] | None:
+        """查找自动任务所属数据源；手工任务返回空。"""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT s.* FROM analysis_runs AS r
+                JOIN data_sources AS s ON s.source_id = r.source_id
+                WHERE r.run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        return _data_source_record(row) if row else None
+
+    def create_notification(
+        self,
+        *,
+        run_id: str,
+        record_id: str,
+        priority: str,
+        recipient_name: str,
+        recipient_role: str,
+        channel: str,
+        title: str,
+        message: str,
+        recipient_user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """创建或读取幂等通知记录。"""
+
+        notification_id = f"ntf_{uuid.uuid4().hex[:12]}"
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO notifications (
+                    notification_id, run_id, record_id, priority, recipient_name,
+                    recipient_role, recipient_user_id, channel, title, message, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                ON CONFLICT(record_id, recipient_name, channel) DO NOTHING
+                """,
+                (
+                    notification_id,
+                    run_id,
+                    record_id,
+                    priority,
+                    recipient_name,
+                    recipient_role,
+                    recipient_user_id,
+                    channel,
+                    title,
+                    message,
+                    _now(),
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM notifications
+                WHERE record_id = ? AND recipient_name = ? AND channel = ?
+                """,
+                (record_id, recipient_name, channel),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("通知创建后未能读取")
+        return dict(row)
+
+    def get_notification(self, notification_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM notifications WHERE notification_id = ?",
+                (notification_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def mark_notification_sent(self, notification_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE notifications
+                SET status = 'sent', attempts = attempts + 1, error = NULL, sent_at = ?
+                WHERE notification_id = ?
+                """,
+                (_now(), notification_id),
+            )
+
+    def mark_notification_failed(self, notification_id: str, error: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE notifications
+                SET status = 'failed', attempts = attempts + 1, error = ?
+                WHERE notification_id = ?
+                """,
+                (error, notification_id),
+            )
+
+    def list_notifications(
+        self,
+        *,
+        limit: int = 100,
+        status: str | None = None,
+        recipient_user_id: str | None = None,
+        unread_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM notifications"
+        parameters: list[Any] = []
+        conditions: list[str] = []
+        if status:
+            conditions.append("status = ?")
+            parameters.append(status)
+        if recipient_user_id:
+            conditions.append("recipient_user_id = ?")
+            parameters.append(recipient_user_id)
+        if unread_only:
+            conditions.append("read_at IS NULL")
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        parameters.append(max(1, min(500, int(limit))))
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_user(
+        self,
+        *,
+        username: str,
+        display_name: str,
+        role: str,
+        password_hash: str,
+        active: bool = True,
+    ) -> dict[str, Any]:
+        """新增演示账号；已有账号只同步姓名、角色和启用状态，不覆盖其密码。"""
+
+        timestamp = _now()
+        user_id = f"usr_{uuid.uuid4().hex[:12]}"
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO users (
+                    user_id, username, display_name, role, password_hash,
+                    active, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(username) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    role = excluded.role,
+                    active = excluded.active,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    user_id,
+                    username.strip().lower(),
+                    display_name.strip(),
+                    role.strip(),
+                    password_hash,
+                    int(active),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM users WHERE username = ?",
+                (username.strip().lower(),),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("账号保存后未能读取")
+        return _public_user(row)
+
+    def get_user_by_username(self, username: str) -> dict[str, Any] | None:
+        """读取登录校验所需的账号记录，返回值包含密码摘要且仅限后端使用。"""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM users WHERE username = ?",
+                (username.strip().lower(),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_active_users_for_role(self, role: str) -> list[dict[str, Any]]:
+        """按通知角色查找真实人员，并兼容算法工单中的相近角色称呼。"""
+
+        aliases = {
+            "设备工程师": ("设备工程师", "设备运维"),
+            "设备运维": ("设备运维", "设备工程师"),
+            "运行值班员": ("运行值班员", "运行监控"),
+            "运行监控": ("运行监控", "运行值班员"),
+            "生产值班负责人": ("生产值班负责人", "生产负责人"),
+            "生产负责人": ("生产负责人", "生产值班负责人"),
+        }
+        candidates = aliases.get(role, (role,))
+        placeholders = ",".join("?" for _ in candidates)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM users WHERE active = 1 AND role IN ({placeholders}) "
+                "ORDER BY created_at ASC",
+                list(candidates),
+            ).fetchall()
+        return [_public_user(row) for row in rows]
+
+    def list_users(self, *, active_only: bool = True) -> list[dict[str, Any]]:
+        """返回可指派人员列表，不暴露密码摘要。"""
+
+        query = "SELECT * FROM users"
+        if active_only:
+            query += " WHERE active = 1"
+        query += " ORDER BY role, display_name"
+        with self._connect() as connection:
+            rows = connection.execute(query).fetchall()
+        return [_public_user(row) for row in rows]
+
+    def create_session(
+        self,
+        *,
+        user_id: str,
+        token_hash: str,
+        expires_at: str,
+    ) -> dict[str, Any]:
+        """保存登录会话摘要，并更新账号最后登录时间。"""
+
+        timestamp = _now()
+        session_id = f"ses_{uuid.uuid4().hex[:16]}"
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO user_sessions (
+                    session_id, user_id, token_hash, created_at, expires_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (session_id, user_id, token_hash, timestamp, expires_at, timestamp),
+            )
+            connection.execute(
+                "UPDATE users SET last_login_at = ?, updated_at = ? WHERE user_id = ?",
+                (timestamp, timestamp, user_id),
+            )
+        return {"session_id": session_id, "expires_at": expires_at}
+
+    def get_user_by_session(self, token_hash: str) -> dict[str, Any] | None:
+        """校验未撤销且未过期的会话，并返回可公开的当前用户信息。"""
+
+        now = _now()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT u.*, s.session_id, s.expires_at
+                FROM user_sessions AS s
+                JOIN users AS u ON u.user_id = s.user_id
+                WHERE s.token_hash = ? AND s.revoked_at IS NULL
+                  AND s.expires_at > ? AND u.active = 1
+                """,
+                (token_hash, now),
+            ).fetchone()
+            if row:
+                connection.execute(
+                    "UPDATE user_sessions SET last_seen_at = ? WHERE session_id = ?",
+                    (now, row["session_id"]),
+                )
+        return _public_user(row) if row else None
+
+    def revoke_session(self, token_hash: str) -> bool:
+        """撤销当前令牌；重复退出保持幂等。"""
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE user_sessions SET revoked_at = ? "
+                "WHERE token_hash = ? AND revoked_at IS NULL",
+                (_now(), token_hash),
+            )
+        return cursor.rowcount == 1
+
+    def record_audit(
+        self,
+        *,
+        user_id: str | None,
+        action: str,
+        target_type: str,
+        target_id: str | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        """记录登录、接单、签收等关键人工动作，形成可追溯责任链。"""
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO audit_logs (
+                    audit_id, user_id, action, target_type, target_id, detail_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"aud_{uuid.uuid4().hex[:16]}",
+                    user_id,
+                    action,
+                    target_type,
+                    target_id,
+                    _to_json(detail or {}),
+                    _now(),
+                ),
+            )
+
+    def acknowledge_notification(
+        self,
+        notification_id: str,
+        user_id: str,
+    ) -> dict[str, Any]:
+        """由通知接收人签收告警；管理员可以通过上层权限另行处理。"""
+
+        timestamp = _now()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM notifications WHERE notification_id = ?",
+                (notification_id,),
+            ).fetchone()
+            if row is None:
+                raise LookupError(f"找不到通知：{notification_id}")
+            if row["recipient_user_id"] and row["recipient_user_id"] != user_id:
+                raise PermissionError("只能签收发送给自己的通知")
+            connection.execute(
+                """
+                UPDATE notifications
+                SET read_at = COALESCE(read_at, ?),
+                    acknowledged_at = COALESCE(acknowledged_at, ?),
+                    acknowledged_by = COALESCE(acknowledged_by, ?)
+                WHERE notification_id = ?
+                """,
+                (timestamp, timestamp, user_id, notification_id),
+            )
+            updated = connection.execute(
+                "SELECT * FROM notifications WHERE notification_id = ?",
+                (notification_id,),
+            ).fetchone()
+        return dict(updated)
+
     def start_run(
         self,
         run_id: str,
@@ -274,6 +780,8 @@ class IndustrialRepository:
         detector: str,
         config: dict[str, Any],
         status: str = "running",
+        source_id: str | None = None,
+        ingestion_id: str | None = None,
     ) -> None:
         """在耗时计算开始前登记任务，异常退出后仍能留下记录。"""
 
@@ -284,8 +792,9 @@ class IndustrialRepository:
             connection.execute(
                 """
                 INSERT INTO analysis_runs (
-                    run_id, file_id, operation, detector, status, config_json, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    run_id, file_id, operation, detector, status, config_json, started_at,
+                    source_id, ingestion_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -295,6 +804,8 @@ class IndustrialRepository:
                     status,
                     _to_json(config),
                     _now(),
+                    source_id,
+                    ingestion_id,
                 ),
             )
 
@@ -382,6 +893,20 @@ class IndustrialRepository:
                     run_id,
                     analysis.get("work_order_drafts", []),
                 )
+            # 自动采集批次跟随分析任务进入终态，便于监控页定位失败环节。
+            connection.execute(
+                """
+                UPDATE data_ingestions
+                SET status = ?, error = ?, finished_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    "completed" if status == "success" else status,
+                    error,
+                    _now(),
+                    run_id,
+                ),
+            )
 
     def record_local_analysis(
         self,
@@ -395,7 +920,7 @@ class IndustrialRepository:
 
         FastAPI 异步任务天然会记录 ``analysis_runs``，但 Streamlit 为了交互速度会直接
         调用分析流水线。若不在这里补一次持久化，页面上生成的工单无法被现场确认，也不会
-        沉淀为下一次分析可检索的历史案例。因此本方法复用同一套 SQLite 表和工单结构。
+        沉淀为下一次分析可检索的历史案例。因此本方法复用同一套 PostgreSQL 表和工单结构。
         """
 
         source = Path(source_path).expanduser().resolve()
@@ -512,6 +1037,7 @@ class IndustrialRepository:
         run_id: str | None = None,
         search: str | None = None,
         priority: str | None = None,
+        assigned_user_id: str | None = None,
         offset: int = 0,
         include_archived: bool = False,
         archived_only: bool = False,
@@ -523,16 +1049,19 @@ class IndustrialRepository:
             run_id=run_id,
             search=search,
             priority=priority,
+            assigned_user_id=assigned_user_id,
             include_archived=include_archived,
             archived_only=archived_only,
         )
         # 同时取出分析任务文件名，让前端能区分同标题但来自不同数据文件的工单。
         query = (
             "SELECT w.*, f.file_name AS source_file_name, "
-            "r.started_at AS source_run_started_at "
+            "r.started_at AS source_run_started_at, "
+            "u.display_name AS assigned_user_name "
             "FROM work_orders AS w "
             "JOIN analysis_runs AS r ON r.run_id = w.run_id "
-            "JOIN uploaded_files AS f ON f.file_id = r.file_id"
+            "JOIN uploaded_files AS f ON f.file_id = r.file_id "
+            "LEFT JOIN users AS u ON u.user_id = w.assigned_user_id"
         )
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
@@ -551,6 +1080,7 @@ class IndustrialRepository:
         run_id: str | None = None,
         search: str | None = None,
         priority: str | None = None,
+        assigned_user_id: str | None = None,
         include_archived: bool = False,
         archived_only: bool = False,
     ) -> int:
@@ -561,6 +1091,7 @@ class IndustrialRepository:
             run_id=run_id,
             search=search,
             priority=priority,
+            assigned_user_id=assigned_user_id,
             include_archived=include_archived,
             archived_only=archived_only,
         )
@@ -568,7 +1099,7 @@ class IndustrialRepository:
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
         with self._connect() as connection:
-            return int(connection.execute(query, parameters).fetchone()[0])
+            return int(_scalar(connection.execute(query, parameters).fetchone()))
 
     @staticmethod
     def _work_order_filters(
@@ -577,6 +1108,7 @@ class IndustrialRepository:
         run_id: str | None,
         search: str | None,
         priority: str | None,
+        assigned_user_id: str | None,
         include_archived: bool,
         archived_only: bool,
     ) -> tuple[list[str], list[Any]]:
@@ -597,6 +1129,9 @@ class IndustrialRepository:
         if priority:
             conditions.append("w.priority = ?")
             parameters.append(priority)
+        if assigned_user_id:
+            conditions.append("w.assigned_user_id = ?")
+            parameters.append(assigned_user_id)
         if search and search.strip():
             keyword = f"%{search.strip().lower()}%"
             conditions.append(
@@ -618,11 +1153,11 @@ class IndustrialRepository:
                 raise LookupError(f"找不到分析任务：{run_id}")
             if row["status"] in {"queued", "running"}:
                 raise ValueError("排队中或运行中的任务不能归档")
-            active_orders = connection.execute(
+            active_orders = _scalar(connection.execute(
                 "SELECT COUNT(*) FROM work_orders "
                 "WHERE run_id = ? AND status NOT IN ('已完成', '已关闭')",
                 (run_id,),
-            ).fetchone()[0]
+            ).fetchone())
             if active_orders:
                 raise ValueError("该任务仍有未闭环工单，请先完成或关闭工单")
             if row["archived_at"] is None:
@@ -695,15 +1230,163 @@ class IndustrialRepository:
             raise LookupError(f"找不到工单：{record_id}")
         return restored
 
+    def delete_archived_work_order(self, record_id: str) -> dict[str, Any]:
+        """永久删除归档工单及其通知；来源分析任务和原始分析证据继续保留。"""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT w.record_id, w.run_id, w.archived_at, r.archived_at AS run_archived_at
+                FROM work_orders AS w
+                JOIN analysis_runs AS r ON r.run_id = w.run_id
+                WHERE w.record_id = ?
+                """,
+                (record_id,),
+            ).fetchone()
+            if row is None:
+                raise LookupError(f"找不到工单：{record_id}")
+            if row["archived_at"] is None and row["run_archived_at"] is None:
+                raise ValueError("只有已归档工单才能永久删除")
+
+            # 通知表通过 record_id 关联工单，当前数据库版本没有工单外键，因此显式清理。
+            notification_count = _scalar(connection.execute(
+                "SELECT COUNT(*) FROM notifications WHERE record_id = ?",
+                (record_id,),
+            ).fetchone())
+            connection.execute("DELETE FROM notifications WHERE record_id = ?", (record_id,))
+            connection.execute("DELETE FROM work_orders WHERE record_id = ?", (record_id,))
+        return {
+            "record_id": record_id,
+            "run_id": row["run_id"],
+            "deleted_notification_count": int(notification_count),
+        }
+
+    def delete_archived_run(self, run_id: str) -> dict[str, Any]:
+        """永久删除归档分析任务及关联工单、通知和模型调用审计。"""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT run_id, file_id, archived_at, ingestion_id FROM analysis_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise LookupError(f"找不到分析任务：{run_id}")
+            if row["archived_at"] is None:
+                raise ValueError("只有已归档分析任务才能永久删除")
+
+            work_order_count = _scalar(connection.execute(
+                "SELECT COUNT(*) FROM work_orders WHERE run_id = ?",
+                (run_id,),
+            ).fetchone())
+            notification_count = _scalar(connection.execute(
+                "SELECT COUNT(*) FROM notifications WHERE run_id = ?",
+                (run_id,),
+            ).fetchone())
+            model_call_count = _scalar(connection.execute(
+                "SELECT COUNT(*) FROM model_call_logs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone())
+
+            # 自动采集只留下内容指纹，不再关联已删除任务，也不再出现在监测时间线中。
+            connection.execute(
+                """
+                UPDATE data_ingestions
+                SET status = 'removed', run_id = NULL, error = NULL, finished_at = ?
+                WHERE run_id = ?
+                """,
+                (_now(), run_id),
+            )
+            connection.execute("DELETE FROM model_call_logs WHERE run_id = ?", (run_id,))
+            # work_orders 和 notifications 均通过 ON DELETE CASCADE 跟随任务删除。
+            connection.execute("DELETE FROM analysis_runs WHERE run_id = ?", (run_id,))
+
+            # 多次分析可能复用同一上传文件，只清理已经没有任务引用的文件元数据。
+            remaining_runs = _scalar(connection.execute(
+                "SELECT COUNT(*) FROM analysis_runs WHERE file_id = ?",
+                (row["file_id"],),
+            ).fetchone())
+            if remaining_runs == 0:
+                connection.execute("DELETE FROM uploaded_files WHERE file_id = ?", (row["file_id"],))
+
+        return {
+            "run_id": run_id,
+            "deleted_work_order_count": int(work_order_count),
+            "deleted_notification_count": int(notification_count),
+            "deleted_model_call_count": int(model_call_count),
+        }
+
     def _get_work_order(self, record_id: str) -> dict[str, Any] | None:
         """读取单条工单，供归档/恢复后返回最新状态。"""
 
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM work_orders WHERE record_id = ?",
+                """
+                SELECT w.*, u.display_name AS assigned_user_name
+                FROM work_orders AS w
+                LEFT JOIN users AS u ON u.user_id = w.assigned_user_id
+                WHERE w.record_id = ?
+                """,
                 (record_id,),
             ).fetchone()
         return _work_order_record(row) if row else None
+
+    def assign_work_order(self, record_id: str, user_id: str) -> dict[str, Any]:
+        """把未归档工单指派给真实人员，保留算法建议角色作为路由依据。"""
+
+        timestamp = _now()
+        with self._connect() as connection:
+            user = connection.execute(
+                "SELECT user_id, active FROM users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if user is None or not bool(user["active"]):
+                raise ValueError("指派对象不存在或已停用")
+            cursor = connection.execute(
+                """
+                UPDATE work_orders
+                SET assigned_user_id = ?, accepted_at = NULL, accepted_by = NULL,
+                    updated_at = ?
+                WHERE record_id = ? AND archived_at IS NULL
+                """,
+                (user_id, timestamp, record_id),
+            )
+            if cursor.rowcount != 1:
+                raise LookupError(f"找不到可指派工单：{record_id}")
+        assigned = self._get_work_order(record_id)
+        if assigned is None:
+            raise LookupError(f"找不到工单：{record_id}")
+        return assigned
+
+    def accept_work_order(self, record_id: str, user_id: str) -> dict[str, Any]:
+        """接收人确认接单；未明确指派时首次接单者自动成为负责人。"""
+
+        timestamp = _now()
+        with self._connect() as connection:
+            current = connection.execute(
+                "SELECT * FROM work_orders WHERE record_id = ?",
+                (record_id,),
+            ).fetchone()
+            if current is None:
+                raise LookupError(f"找不到工单：{record_id}")
+            if current["archived_at"] is not None:
+                raise ValueError("已归档工单不能接单")
+            if current["assigned_user_id"] and current["assigned_user_id"] != user_id:
+                raise PermissionError("该工单已指派给其他人员")
+            connection.execute(
+                """
+                UPDATE work_orders
+                SET assigned_user_id = COALESCE(assigned_user_id, ?),
+                    accepted_at = COALESCE(accepted_at, ?),
+                    accepted_by = COALESCE(accepted_by, ?),
+                    updated_at = ?
+                WHERE record_id = ?
+                """,
+                (user_id, timestamp, user_id, timestamp, record_id),
+            )
+        accepted = self._get_work_order(record_id)
+        if accepted is None:
+            raise LookupError(f"找不到工单：{record_id}")
+        return accepted
 
     def update_work_order(
         self,
@@ -898,7 +1581,7 @@ class IndustrialRepository:
 
     def _upsert_work_orders(
         self,
-        connection: sqlite3.Connection,
+        connection: PostgresConnection,
         run_id: str,
         work_orders: list[dict[str, Any]],
     ) -> None:
@@ -946,11 +1629,12 @@ class IndustrialRepository:
 def get_repository() -> IndustrialRepository:
     """返回进程内共享仓储；数据库连接仍按操作短暂创建。"""
 
-    return IndustrialRepository(get_settings().database_path)
+    settings = get_settings()
+    return IndustrialRepository(settings.database_url, settings.database_schema)
 
 
-def _run_record(row: sqlite3.Row, include_result: bool) -> dict[str, Any]:
-    """将 SQLite 行转换为万悟可直接使用的字典。"""
+def _run_record(row: Mapping[str, Any], include_result: bool) -> dict[str, Any]:
+    """将 PostgreSQL 行转换为万悟可直接使用的字典。"""
 
     result = _from_json(row["result_json"], {})
     analysis = _result_analysis_section(result)
@@ -974,12 +1658,38 @@ def _run_record(row: sqlite3.Row, include_result: bool) -> dict[str, Any]:
         "duration_ms": row["duration_ms"],
         "archived_at": row["archived_at"],
         "archive_reason": row["archive_reason"],
+        "source_id": row["source_id"],
+        "ingestion_id": row["ingestion_id"],
     }
     if include_result:
         record["result"] = result or None
     else:
         record["summary"] = analysis.get("summary")
     return record
+
+
+def _data_source_record(row: Mapping[str, Any]) -> dict[str, Any]:
+    """转换数据源记录，并把内部 JSON 拆成分析、请求头和通知路由配置。"""
+
+    config = _from_json(row["config_json"], {})
+    return {
+        "source_id": row["source_id"],
+        "name": row["name"],
+        "source_type": row["source_type"],
+        "endpoint": row["endpoint"],
+        "interval_seconds": row["interval_seconds"],
+        "enabled": bool(row["enabled"]),
+        "analysis_config": config.get("analysis_config") or {},
+        "request_headers": config.get("request_headers") or {},
+        "routing": config.get("routing") or {},
+        "initial_scan_mode": config.get("initial_scan_mode") or "latest",
+        "timeout_seconds": config.get("timeout_seconds", 15),
+        "last_poll_at": row["last_poll_at"],
+        "last_success_at": row["last_success_at"],
+        "last_error": row["last_error"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
 
 
 def _analysis_result_record(run_id: str, result: Any) -> dict[str, Any]:
@@ -1033,7 +1743,7 @@ def _analysis_result_record(run_id: str, result: Any) -> dict[str, Any]:
     }
 
 
-def _work_order_record(row: sqlite3.Row) -> dict[str, Any]:
+def _work_order_record(row: Mapping[str, Any]) -> dict[str, Any]:
     """反序列化工单中的列表字段。"""
 
     # 列表查询会联表返回来源信息；更新单条工单的旧查询只返回 work_orders 本身，
@@ -1053,6 +1763,12 @@ def _work_order_record(row: sqlite3.Row) -> dict[str, Any]:
         "title": row["title"],
         "status": row["status"],
         "assigned_role": row["assigned_role"],
+        "assigned_user_id": row["assigned_user_id"] if "assigned_user_id" in row_keys else None,
+        "assigned_user_name": (
+            row["assigned_user_name"] if "assigned_user_name" in row_keys else None
+        ),
+        "accepted_at": row["accepted_at"] if "accepted_at" in row_keys else None,
+        "accepted_by": row["accepted_by"] if "accepted_by" in row_keys else None,
         "actions": _from_json(row["actions_json"], []),
         "evidence_summary": _from_json(row["evidence_json"], []),
         "required_feedback": _from_json(row["required_feedback_json"], []),
@@ -1066,7 +1782,7 @@ def _work_order_record(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def _confirmed_case_record(row: sqlite3.Row) -> dict[str, Any] | None:
+def _confirmed_case_record(row: Mapping[str, Any]) -> dict[str, Any] | None:
     """从历史任务结果中提取指定事件的稳定案例特征。"""
 
     result = _from_json(row["result_json"], {})
@@ -1206,6 +1922,22 @@ def _now() -> str:
     """数据库统一保存带时区的 ISO 时间。"""
 
     return datetime.now(ZoneInfo("Asia/Shanghai")).isoformat()
+
+
+def _public_user(row: Mapping[str, Any]) -> dict[str, Any]:
+    """移除密码摘要等内部字段，只返回前端和通知路由需要的身份信息。"""
+
+    keys = set(row.keys())
+    return {
+        "user_id": row["user_id"],
+        "username": row["username"],
+        "display_name": row["display_name"],
+        "role": row["role"],
+        "active": bool(row["active"]),
+        "last_login_at": row["last_login_at"],
+        "session_id": row["session_id"] if "session_id" in keys else None,
+        "expires_at": row["expires_at"] if "expires_at" in keys else None,
+    }
 
 
 def _to_json(value: Any) -> str:

@@ -24,7 +24,8 @@ class Settings:
 
     project_root: Path
     output_dir: Path
-    database_path: Path
+    database_url: str
+    database_schema: str
     knowledge_dir: Path
     device_profiles_dir: Path
     default_skab_file: Path
@@ -51,6 +52,9 @@ class Settings:
     forecast_holdout: int
     async_job_workers: int
     async_job_queue_size: int
+    automatic_monitor_enabled: bool
+    automatic_monitor_tick_seconds: float
+    automatic_monitor_storage_dir: Path
     max_upload_bytes: int
     wanwu_download_timeout: float
     wanwu_allow_private_file_urls: bool
@@ -58,6 +62,12 @@ class Settings:
     api_public_base_url: str
     industrial_api_key: str
     frontend_allowed_origins: str
+    auth_enabled: bool
+    auth_session_hours: int
+    auth_bootstrap_password: str
+    wecom_enabled: bool
+    wecom_webhook_url: str
+    wecom_timeout_seconds: float
 
     @property
     def llm_enabled(self) -> bool:
@@ -86,9 +96,11 @@ def get_settings() -> Settings:
     return Settings(
         project_root=PROJECT_ROOT,
         output_dir=PROJECT_ROOT / "outputs",
-        database_path=_resolve_path(
-            os.getenv("DATABASE_PATH", "outputs/shichi_qianji.db")
+        database_url=os.getenv(
+            "DATABASE_URL",
+            "postgresql://shichi_qianji_app:change-me@127.0.0.1:5432/shichi_qianji",
         ),
+        database_schema=os.getenv("DATABASE_SCHEMA", "public").strip() or "public",
         knowledge_dir=PROJECT_ROOT / "resources" / "knowledge",
         device_profiles_dir=_resolve_path(
             os.getenv("DEVICE_PROFILES_DIR", "resources/device_profiles")
@@ -130,16 +142,27 @@ def get_settings() -> Settings:
             os.getenv("EMBEDDING_REQUESTS_PER_MINUTE", "5")
         ),
         anomaly_detector=os.getenv("ANOMALY_DETECTOR", "time_frequency_relation"),
-        anomaly_threshold=float(os.getenv("ANOMALY_THRESHOLD", "4.5")),
+        anomaly_threshold=float(os.getenv("ANOMALY_THRESHOLD", "3.5")),
         rolling_window=int(os.getenv("ROLLING_WINDOW", "61")),
-        min_event_length=int(os.getenv("MIN_EVENT_LENGTH", "3")),
-        merge_gap=int(os.getenv("MERGE_GAP", "5")),
+        min_event_length=int(os.getenv("MIN_EVENT_LENGTH", "12")),
+        merge_gap=int(os.getenv("MERGE_GAP", "30")),
         contamination=float(os.getenv("CONTAMINATION", "0.08")),
         forecast_horizon=int(os.getenv("FORECAST_HORIZON", "30")),
         forecast_lookback=int(os.getenv("FORECAST_LOOKBACK", "120")),
         forecast_holdout=int(os.getenv("FORECAST_HOLDOUT", "30")),
         async_job_workers=max(1, int(os.getenv("ASYNC_JOB_WORKERS", "2"))),
         async_job_queue_size=max(0, int(os.getenv("ASYNC_JOB_QUEUE_SIZE", "8"))),
+        automatic_monitor_enabled=os.getenv(
+            "AUTOMATIC_MONITOR_ENABLED", "false"
+        ).strip().lower()
+        in {"true", "1", "yes", "on"},
+        automatic_monitor_tick_seconds=max(
+            0.2,
+            float(os.getenv("AUTOMATIC_MONITOR_TICK_SECONDS", "1")),
+        ),
+        automatic_monitor_storage_dir=_resolve_path(
+            os.getenv("AUTOMATIC_MONITOR_STORAGE_DIR", "outputs/auto_ingestion")
+        ),
         max_upload_bytes=max(1024, int(os.getenv("MAX_UPLOAD_BYTES", "26214400"))),
         wanwu_download_timeout=max(
             1.0,
@@ -163,5 +186,18 @@ def get_settings() -> Settings:
         frontend_allowed_origins=os.getenv(
             "FRONTEND_ALLOWED_ORIGINS",
             "http://localhost:5173,http://127.0.0.1:5173",
+        ),
+        auth_enabled=os.getenv("AUTH_ENABLED", "false").strip().lower()
+        in {"true", "1", "yes", "on"},
+        auth_session_hours=max(1, int(os.getenv("AUTH_SESSION_HOURS", "12"))),
+        auth_bootstrap_password=os.getenv("AUTH_BOOTSTRAP_PASSWORD", "").strip(),
+        # 企业微信机器人地址包含访问密钥，只允许从本机环境变量读取。
+        # 业务接口只会返回 enabled/configured 两个布尔状态，不回显真实地址。
+        wecom_enabled=os.getenv("WECOM_ENABLED", "false").strip().lower()
+        in {"true", "1", "yes", "on"},
+        wecom_webhook_url=os.getenv("WECOM_WEBHOOK_URL", "").strip(),
+        wecom_timeout_seconds=max(
+            1.0,
+            float(os.getenv("WECOM_TIMEOUT_SECONDS", "10")),
         ),
     )

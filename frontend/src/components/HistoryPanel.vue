@@ -36,6 +36,7 @@ const emit = defineEmits([
   "retry-run",
   "archive-run",
   "restore-run",
+  "delete-run",
   "change-page",
   "toggle-archived",
  "refresh",
@@ -68,11 +69,15 @@ const emit = defineEmits([
         </div>
         <div v-for="item in paginatedHistoryRuns" :key="item.run_id" class="history-row">
           <span class="history-status" :class="item.status">{{ item.status }}</span>
-          <span><b>{{ item.file_name }}</b><small>{{ item.detector }} · {{ formatDate(item.started_at) }}{{ item.archived_at ? " · 已归档" : "" }}</small></span>
+          <span>
+            <b>{{ item.file_name }} <em class="run-source" :class="{ automatic: item.source_id }">{{ item.source_id ? "自动监测" : "手动调试" }}</em></b>
+            <small>{{ item.detector }} · {{ formatDate(item.started_at) }}{{ item.archived_at ? " · 已归档" : "" }}</small>
+          </span>
           <span>{{ item.duration_ms ? `${formatNumber(item.duration_ms, 0)} ms` : "-" }}</span>
           <button class="row-action view-action" :disabled="historyRunLoading === item.run_id" title="查看完整分析结果" @click="emit('view-run', item)">{{ historyRunLoading === item.run_id ? "加载中" : "查看" }}</button>
           <button v-if="item.status === 'failed' && !showArchived" class="row-action retry-action" :disabled="retryingRunId === item.run_id" title="使用原文件重试" @click="emit('retry-run', item)">{{ retryingRunId === item.run_id ? "重试中" : "重试" }}</button>
-          <button class="row-action" :disabled="historyActionId === item.run_id || refreshingHistory" :title="showArchived ? '恢复任务' : '归档任务'" @click="emit(showArchived ? 'restore-run' : 'archive-run', item)">{{ historyActionId === item.run_id ? (showArchived ? "恢复中" : "归档中") : (showArchived ? "恢复" : "归档") }}</button>
+          <button class="row-action" :disabled="historyActionId === item.run_id || refreshingHistory" :title="showArchived ? '恢复任务' : '归档任务'" @click="emit(showArchived ? 'restore-run' : 'archive-run', item)">{{ historyActionId === item.run_id ? (showArchived ? "处理中" : "归档中") : (showArchived ? "恢复" : "归档") }}</button>
+          <button v-if="showArchived" class="row-action delete-action" :disabled="historyActionId === item.run_id || refreshingHistory" title="永久删除任务及关联工单" @click="emit('delete-run', item)">彻底删除</button>
         </div>
         <div v-if="!paginatedHistoryRuns.length" class="panel-empty">{{ filteredHistoryRuns.length ? "当前页没有任务" : (showArchived ? "暂无归档任务" : "暂无历史任务") }}</div>
         <div class="pagination-bar history-pagination">
@@ -107,3 +112,7 @@ const emit = defineEmits([
  </section>
 </template>
 import CaseDrawer from "./CaseDrawer.vue";
+
+<style scoped>
+.run-source{display:inline-block;margin-left:6px;padding:2px 5px;background:#f0f2f2;color:#7b898b;font-size:9px;font-style:normal;font-weight:700;vertical-align:2px}.run-source.automatic{background:#e2f1ed;color:#2d7569}
+</style>

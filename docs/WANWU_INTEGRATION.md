@@ -340,7 +340,7 @@ POST /api/v1/forecast-compare
 }
 ```
 
-建议循环间隔设置为 2 至 5 秒，并设置最大循环次数。不要毫秒级连续查询 SQLite。
+建议循环间隔设置为 2 至 5 秒，并设置最大循环次数。不要毫秒级连续查询 PostgreSQL。
 用户撤回分析或工作流达到最大等待次数时，可调用 `cancel_industrial_analysis` 取消仍在
 排队的任务。已经进入 `running` 的计算不会被强制中断，接口会返回 HTTP 409，此时应继续
 查询最终状态，避免算法仍在运行而数据库被错误标记为取消。
@@ -455,8 +455,8 @@ X-API-Key: 你的服务密钥
 
 服务只接受 `file_id`，不接受 `E:\`、`..\` 或任意绝对路径。上传文件保存在 `outputs/api_uploads/`，
 运行日志保存在 `outputs/logs/runs.jsonl`，任务、结果和工单保存在
-`outputs/shichi_qianji.db`。正式部署时应将上传目录迁移到对象存储，将 SQLite 迁移到
-PostgreSQL，并增加文件过期清理、租户隔离和 HTTPS。
+PostgreSQL。正式部署时应将上传目录迁移到对象存储，并为 PostgreSQL 配置备份、最小权限账户，
+同时增加文件过期清理、租户隔离和 HTTPS。
 
 ## 现阶段边界
 

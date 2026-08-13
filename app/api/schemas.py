@@ -340,6 +340,73 @@ class WorkOrderUpdateRequest(StrictApiModel):
     handled_by: str | None = Field(default=None, max_length=200)
 
 
+class LoginRequest(StrictApiModel):
+    """本地竞赛演示登录请求；不开放公开注册。"""
+
+    username: str = Field(min_length=2, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    password: str = Field(min_length=1, max_length=200)
+
+
+class LoginResponse(StrictApiModel):
+    """登录成功后的短期会话令牌和当前用户。"""
+
+    status: Literal["success"]
+    token: str
+    expires_at: str
+    user: dict[str, Any]
+
+
+class NotificationAcknowledgeRequest(StrictApiModel):
+    """通知签收只需要通知编号，接收人员来自登录会话。"""
+
+    notification_id: str = Field(min_length=8, max_length=128)
+
+
+class WorkOrderAssignmentRequest(StrictApiModel):
+    """管理员或负责人指派工单时使用的用户编号。"""
+
+    user_id: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+
+
+class NotificationRecipient(StrictApiModel):
+    """一个告警接收人及其职责。"""
+
+    recipient_name: str = Field(min_length=1, max_length=100)
+    recipient_role: str = Field(min_length=1, max_length=100)
+
+
+class NotificationRoutingRequest(StrictApiModel):
+    """按工单优先级路由接收人；外部通知密钥由部署环境统一管理。"""
+
+    priority_routes: dict[Literal["P1", "P2", "P3"], list[NotificationRecipient]] = Field(
+        default_factory=dict
+    )
+
+
+class DataSourceRequest(StrictApiModel):
+    """无人值守数据源配置。"""
+
+    source_id: str | None = Field(
+        default=None,
+        min_length=6,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
+    name: str = Field(min_length=2, max_length=100)
+    source_type: Literal["directory", "http_csv"]
+    endpoint: str = Field(min_length=1, max_length=2000)
+    interval_seconds: float = Field(default=60, ge=1, le=86400)
+    enabled: bool = True
+    timeout_seconds: float = Field(default=15, ge=1, le=120)
+    initial_scan_mode: Literal["latest", "new_only", "all"] = Field(
+        default="latest",
+        description="首次接入时处理最新一批、只等待新批次或处理全部历史批次",
+    )
+    request_headers: dict[str, str] = Field(default_factory=dict)
+    analysis_config: AnalysisConfigRequest = Field(default_factory=AnalysisConfigRequest)
+    routing: NotificationRoutingRequest = Field(default_factory=NotificationRoutingRequest)
+
+
 class WanwuWorkOrderUpdateRequest(WorkOrderUpdateRequest):
     """万悟通过 JSON 同时传递工单编号和现场反馈。"""
 

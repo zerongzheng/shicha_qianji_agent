@@ -253,7 +253,7 @@ def _build_capability_comparison(rows: list[dict[str, object]]) -> str:
             "",
             f"- 当前独立测试中事件级 F1 最优模型：{best['detector_name']}（{best['event_f1']:.4f}）。",
             "- 系统默认模型同时考虑事件召回、误报控制、处理速度和可解释证据，不简单按照单一指标选择。",
-            "- 工单确认结果进入 SQLite，并可作为下一次相似异常的历史案例证据。",
+            "- 工单确认结果进入 PostgreSQL，并可作为下一次相似异常的历史案例证据。",
             "",
             "## 项目价值链",
             "",

@@ -46,6 +46,7 @@ frontend/node_modules/
 # 运行输出。保留目录本身，不提交分析报告和临时上传文件
 outputs/**
 !outputs/.gitkeep
+pytest-runtime-*/
 
 # 外部工业数据集不进入代码仓库
 data/raw/

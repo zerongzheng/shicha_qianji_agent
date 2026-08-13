@@ -28,7 +28,8 @@ def test_wanwu_base64_submit_poll_and_result(
     """万悟只发送 JSON 时，也应完成文件登记、异步分析、轮询和结果读取。"""
 
     test_settings = SimpleNamespace(
-        database_path=tmp_path / "wanwu_jobs.db",
+        database_url=tmp_path / "wanwu_jobs",
+        database_schema="public",
         async_job_workers=1,
         async_job_queue_size=2,
     )
@@ -174,7 +175,8 @@ def test_wanwu_quick_diagnosis_returns_local_result_without_model_call(
 
     test_settings = replace(
         server.get_settings(),
-        database_path=tmp_path / "quick.db",
+        database_url=tmp_path / "quick",
+        database_schema="public",
         output_dir=tmp_path,
         knowledge_dir=tmp_path,
         llm_api_key="must-not-be-used",

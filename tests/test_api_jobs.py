@@ -128,7 +128,8 @@ def test_async_job_can_cancel_queued_request(
     """万悟应能通过 HTTP 取消排队任务，并读取稳定的 cancelled 状态。"""
 
     test_settings = SimpleNamespace(
-        database_path=tmp_path / "cancel_jobs.db",
+        database_url=tmp_path / "cancel_jobs",
+        database_schema="public",
         async_job_workers=1,
         async_job_queue_size=1,
     )
@@ -201,7 +202,8 @@ def test_async_job_upload_poll_and_result(tmp_path: Path, monkeypatch: pytest.Mo
     """HTTP 链路应完成上传、立即受理、轮询和结果获取。"""
 
     test_settings = SimpleNamespace(
-        database_path=tmp_path / "jobs.db",
+        database_url=tmp_path / "jobs",
+        database_schema="public",
         async_job_workers=1,
         async_job_queue_size=2,
     )

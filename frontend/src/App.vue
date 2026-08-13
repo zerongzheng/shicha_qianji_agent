@@ -6,22 +6,35 @@ import {
   createJob,
   archiveRun,
   archiveWorkOrder,
+  deleteArchivedRun,
+  deleteArchivedWorkOrder,
   cancelJob,
   getJobResult,
   getFilePreflight,
   getJobStatus,
   getRun,
+  getMonitoringStatus,
   health,
   listCases,
   listDeviceProfiles,
   listRuns,
   listWorkOrders,
+  pollMonitoringSource,
+  saveMonitoringSource,
+  deleteMonitoringSource,
   registerDefaultSkabSample,
   removeCase,
   restoreRun,
   restoreWorkOrder,
   updateWorkOrder,
   uploadCsv,
+  acceptWorkOrder,
+  acknowledgeNotification,
+  getAuthConfig,
+  getCurrentUser,
+  login,
+  logout,
+  setSessionToken,
 } from "./api";
 import ConfirmDialog from "./components/ConfirmDialog.vue";
 import AnalysisProgressPanel from "./components/AnalysisProgressPanel.vue";
@@ -31,18 +44,32 @@ import HistoryPanel from "./components/HistoryPanel.vue";
 import OverviewPanel from "./components/OverviewPanel.vue";
 import EvidencePanel from "./components/EvidencePanel.vue";
 import ForecastPanel from "./components/ForecastPanel.vue";
+import MonitoringPanel from "./components/MonitoringPanel.vue";
+import DebugAnalysisPanel from "./components/DebugAnalysisPanel.vue";
+import LoginView from "./components/LoginView.vue";
 
 const tabs = [
+  { id: "monitoring", label: "自动监测" },
   { id: "overview", label: "风险总览" },
   { id: "evidence", label: "异常证据" },
   { id: "forecast", label: "趋势研判" },
   { id: "work-orders", label: "运维工单" },
   { id: "history", label: "历史记录" },
+  { id: "debug", label: "调试分析" },
 ];
 
-const activeTab = ref("overview");
+const activeTab = ref("monitoring");
+const authReady = ref(false);
+const authEnabled = ref(false);
+const authLoading = ref(false);
+const authError = ref("");
+const currentUser = ref(null);
+const monitoring = ref({ monitor: {}, sources: [], ingestions: [], notifications: [] });
+const monitoringLoading = ref(false);
+const monitoringActionId = ref("");
+const notificationActionId = ref("");
+const automaticRunLoading = ref("");
 const selectedFile = ref(null);
-const fileInput = ref(null);
 const filePreflight = ref(null);
 const showPreflight = ref(false);
 const preflightAccepted = ref(false);
@@ -64,6 +91,7 @@ const workOrderStatusFilter = ref("");
 const workOrderPriorityFilter = ref("");
 // 默认保留全部历史工单；打开该开关后只显示当前分析任务产生的工单。
 const currentWorkOrderOnly = ref(false);
+const myWorkOrdersOnly = ref(false);
 const workOrderPage = ref(1);
 const workOrderPageSize = 10;
 const workOrderTotal = ref(0);
@@ -95,9 +123,9 @@ const config = reactive({
   // null 表示自动识别；空字符串表示强制使用通用模式。
   device_profile_id: null,
   detector: "time_frequency_relation",
-  threshold: 4.5,
+  threshold: 3.5,
   rolling_window: 61,
-  min_event_length: 3,
+  min_event_length: 12,
 });
 
 const feedback = reactive({
@@ -259,16 +287,47 @@ const evidenceCharts = computed(() => new Map(
 const analysisScope = computed(() => {
   const sourceName = String(analysis.value?.data_profile?.source_name || selectedFile.value?.name || "");
   const isSkab = Boolean(selectedFile.value?.isSample) || /skab|valve|anomaly-free/i.test(sourceName);
+  const currentRun = runs.value.find((item) => item.run_id === currentAnalysisRunId.value);
+  const isAutomatic = Boolean(currentRun?.source_id || currentRun?.ingestion_id);
   return {
-    label: isSkab ? "SKAB 校赛样例" : "用户上传数据",
-    detail: isSkab
+    label: isAutomatic ? "自动监测任务" : isSkab ? "SKAB 校赛样例" : "手动调试数据",
+    detail: isAutomatic
+      ? "系统检测到新批次后自动完成分析，当前结果可追溯至对应数据源和采集记录。"
+      : isSkab
       ? "用于验证分析流程和工程闭环，不代表联通现场设备成效。"
-      : "结果基于当前上传文件生成，需结合设备台账和现场记录复核。",
+      : "结果来自单文件调试入口，需结合设备台账和现场记录复核。",
   };
 });
 
 onMounted(async () => {
+  try {
+    const configResponse = await getAuthConfig();
+    authEnabled.value = Boolean(configResponse.auth_enabled);
+    if (authEnabled.value) {
+      try {
+        const userResponse = await getCurrentUser();
+        currentUser.value = userResponse.user;
+        myWorkOrdersOnly.value = true;
+      } catch {
+        setSessionToken("");
+      }
+    }
+  } catch (error) {
+    authError.value = error.message;
+  } finally {
+    authReady.value = true;
+  }
+  if (!authEnabled.value || currentUser.value) await initializeWorkspace();
+  window.addEventListener("beforeunload", handleBeforeUnload);
+  window.addEventListener("keydown", handleGlobalKeydown);
+  window.addEventListener("focus", handleWindowFocus);
+  document.addEventListener("visibilitychange", handleVisibilityChange);
+});
+
+async function initializeWorkspace() {
   await refreshHistory();
+  await refreshMonitoring();
+  await loadLatestAutomaticRun();
   await loadDeviceProfiles();
   try {
     await health();
@@ -277,12 +336,36 @@ onMounted(async () => {
     apiStatus.value = "离线";
   }
   await resumeActiveJob();
-  window.addEventListener("beforeunload", handleBeforeUnload);
-  window.addEventListener("keydown", handleGlobalKeydown);
-  window.addEventListener("focus", handleWindowFocus);
-  document.addEventListener("visibilitychange", handleVisibilityChange);
   startAutoRefresh();
-});
+}
+
+async function handleLogin(credentials) {
+  authLoading.value = true;
+  authError.value = "";
+  try {
+    const response = await login(credentials.username, credentials.password);
+    setSessionToken(response.token);
+    currentUser.value = response.user;
+    myWorkOrdersOnly.value = true;
+    await initializeWorkspace();
+  } catch (error) {
+    setSessionToken("");
+    authError.value = error.message;
+  } finally {
+    authLoading.value = false;
+  }
+}
+
+async function handleLogout() {
+  if (feedbackDirty.value && !(await confirmDiscardChanges())) return;
+  await logout();
+  stopAutoRefresh();
+  currentUser.value = null;
+  analysis.value = null;
+  runs.value = [];
+  workOrders.value = [];
+  selectedWorkOrder.value = null;
+}
 
 onBeforeUnmount(() => {
   stopProgressTimer();
@@ -393,6 +476,7 @@ async function confirmDiscardChanges() {
 async function changeTab(tabId) {
   if (!(await confirmDiscardChanges())) return;
   activeTab.value = tabId;
+  if (tabId === "monitoring") await refreshMonitoring();
 }
 
 function openEvidenceEvent(index) {
@@ -454,11 +538,6 @@ function closeToast() {
   toastNotice.value = null;
 }
 
-async function chooseFile() {
-  if (!(await confirmDiscardChanges())) return;
-  fileInput.value?.click();
-}
-
 async function loadDefaultSkab() {
   if (sampleLoading.value || isAnalyzing.value || !(await confirmDiscardChanges())) return;
   sampleLoading.value = true;
@@ -478,18 +557,6 @@ async function loadDefaultSkab() {
   } finally {
     sampleLoading.value = false;
   }
-}
-
-function onFileChange(event) {
-  selectedFile.value = event.target.files?.[0] || null;
-  // 用户改选真实 CSV 后，必须清除默认样例标记，避免分析时继续使用旧的 sample file_id。
-  selectedSampleFileId.value = "";
-  filePreflight.value = null;
-  showPreflight.value = false;
-  preflightAccepted.value = false;
-  errorMessage.value = "";
-  successMessage.value = "";
-  if (selectedFile.value) inspectCsvFile(selectedFile.value);
 }
 
 // 只在浏览器内读取 CSV 的前几千行进行预检，帮助用户在提交分析前发现明显的数据问题。
@@ -600,6 +667,7 @@ async function refreshOperationalData() {
     cases.value = caseResponse.cases || [];
     historyWorkOrderTotal.value = Number(workOrderSummary.work_order_count || 0);
     await refreshWorkOrders();
+    if (activeTab.value === "monitoring") await refreshMonitoring();
     apiStatus.value = "在线";
     lastDataSyncAt.value = new Date();
   } catch (error) {
@@ -624,6 +692,7 @@ async function refreshWorkOrders() {
       status: workOrderStatusFilter.value,
       priority: workOrderPriorityFilter.value,
       run_id: currentWorkOrderOnly.value ? currentAnalysisRunId.value : "",
+      mine: myWorkOrdersOnly.value,
     });
     if (token !== workOrderRequestToken) return;
     workOrders.value = response.work_orders || [];
@@ -669,6 +738,14 @@ async function toggleCurrentWorkOrderScope() {
   await refreshHistory();
 }
 
+async function toggleMyWorkOrders() {
+  if (feedbackDirty.value && !(await confirmDiscardChanges())) return;
+  myWorkOrdersOnly.value = !myWorkOrdersOnly.value;
+  workOrderPage.value = 1;
+  selectedWorkOrder.value = null;
+  await refreshWorkOrders();
+}
+
 async function viewHistoryRun(run) {
   if (!run?.run_id || historyRunLoading.value) return;
   if (!(await confirmDiscardChanges())) return;
@@ -687,6 +764,52 @@ async function viewHistoryRun(run) {
   } finally {
     historyRunLoading.value = "";
   }
+}
+
+async function loadRunById(runIdToLoad, { navigate = true, announce = true } = {}) {
+  if (!runIdToLoad || automaticRunLoading.value) return;
+  automaticRunLoading.value = runIdToLoad;
+  errorMessage.value = "";
+  try {
+    const response = await getRun(runIdToLoad);
+    if (!response.run?.result) throw new Error("该自动任务尚未生成可查看的分析结果。");
+    loadAnalysisResult(response.run.result, runIdToLoad);
+    if (navigate) activeTab.value = "overview";
+    if (announce) {
+      showToast({
+        type: "success",
+        title: "已加载自动分析结果",
+        detail: response.run.file_name || runIdToLoad,
+      });
+    }
+  } catch (error) {
+    errorMessage.value = error.message;
+  } finally {
+    automaticRunLoading.value = "";
+  }
+}
+
+async function loadLatestAutomaticRun() {
+  if (analysis.value) return;
+  const latest = (monitoring.value.ingestions || []).find(
+    (item) => item.status === "completed" && item.run_id,
+  );
+  if (latest) await loadRunById(latest.run_id, { navigate: false, announce: false });
+}
+
+function selectDebugFile(file) {
+  selectedFile.value = file;
+  selectedSampleFileId.value = "";
+  filePreflight.value = null;
+  showPreflight.value = false;
+  preflightAccepted.value = false;
+  errorMessage.value = "";
+  successMessage.value = "";
+  if (file) inspectCsvFile(file);
+}
+
+function updateDebugConfig(key, value) {
+  config[key] = value;
 }
 
 async function retryHistoryRun(run) {
@@ -884,6 +1007,27 @@ async function restoreSelectedWorkOrder(order) {
   }
 }
 
+async function deleteSelectedWorkOrder(order) {
+  if (!order?.archived_at || workOrderActionId.value) return;
+  if (!(await requestConfirmation({
+    title: "彻底删除这张工单？",
+    detail: "工单、现场反馈、案例记忆和对应通知将永久删除；来源分析任务仍会保留。此操作不可恢复。",
+    confirmText: "彻底删除",
+    tone: "danger",
+  }))) return;
+  workOrderActionId.value = order.record_id;
+  try {
+    await deleteArchivedWorkOrder(order.record_id);
+    if (selectedWorkOrder.value?.record_id === order.record_id) selectedWorkOrder.value = null;
+    showToast({ type: "success", title: "工单已彻底删除", detail: "来源分析任务和原始分析证据仍保留。" });
+    await refreshHistory();
+  } catch (error) {
+    errorMessage.value = error.message;
+  } finally {
+    workOrderActionId.value = "";
+  }
+}
+
 async function archiveHistoryRun(run) {
   if (!run || run.archived_at || historyActionId.value) return;
   if (["queued", "running"].includes(run.status)) {
@@ -915,6 +1059,31 @@ async function restoreHistoryRun(run) {
     await restoreRun(run.run_id);
     successMessage.value = "分析任务已恢复到默认历史记录。";
     await refreshHistory();
+  } catch (error) {
+    errorMessage.value = error.message;
+  } finally {
+    historyActionId.value = "";
+  }
+}
+
+async function deleteHistoryRun(run) {
+  if (!run?.archived_at || historyActionId.value) return;
+  if (!(await requestConfirmation({
+    title: "彻底删除这次分析任务？",
+    detail: "分析结果、关联工单、案例记忆、通知和模型调用记录将永久删除。自动采集指纹会保留，以避免同一文件被再次分析。",
+    confirmText: "彻底删除",
+    tone: "danger",
+  }))) return;
+  historyActionId.value = run.run_id;
+  try {
+    await deleteArchivedRun(run.run_id);
+    if (currentAnalysisRunId.value === run.run_id) {
+      analysis.value = null;
+      runId.value = "";
+    }
+    showToast({ type: "success", title: "历史任务已彻底删除", detail: "关联工单和通知已同步清理。" });
+    await refreshHistory();
+    await refreshMonitoring();
   } catch (error) {
     errorMessage.value = error.message;
   } finally {
@@ -1033,6 +1202,25 @@ async function saveFeedback() {
   }
 }
 
+async function acceptSelectedWorkOrder() {
+  if (!selectedWorkOrder.value || !currentUser.value?.user_id) return;
+  workOrderActionId.value = selectedWorkOrder.value.record_id;
+  try {
+    const response = await acceptWorkOrder(selectedWorkOrder.value.record_id);
+    selectedWorkOrder.value = response.work_order;
+    showToast({
+      type: "success",
+      title: "工单已接收",
+      detail: `责任人已登记为 ${currentUser.value.display_name}，接单时间已写入审计记录。`,
+    });
+    await refreshWorkOrders();
+  } catch (error) {
+    showToast({ type: "error", title: "接单失败", detail: error.message }, 0);
+  } finally {
+    workOrderActionId.value = "";
+  }
+}
+
 function diagnosisForEvent(index) {
   return diagnoses.value.find((item) => item.event_number === index) || null;
 }
@@ -1105,6 +1293,91 @@ function selectForecastSensor(sensor) {
   selectedForecastSensor.value = sensor;
 }
 
+async function refreshMonitoring() {
+  monitoringLoading.value = true;
+  try {
+    const response = await getMonitoringStatus();
+    monitoring.value = response;
+    const latestCompleted = (response.ingestions || []).find(
+      (item) => item.status === "completed" && item.run_id,
+    );
+    // 用户停留在自动监测页时，新任务完成后静默同步到结果工作区；不强制跳转，
+    // 也不覆盖用户正在查看的证据、工单或历史任务。
+    if (
+      latestCompleted
+      && latestCompleted.run_id !== currentAnalysisRunId.value
+      && activeTab.value === "monitoring"
+    ) {
+      await loadRunById(latestCompleted.run_id, { navigate: false, announce: Boolean(analysis.value) });
+    }
+  } catch (error) {
+    errorMessage.value = error.message || "自动监测状态读取失败";
+  } finally {
+    monitoringLoading.value = false;
+  }
+}
+
+async function configureMonitoring(payload) {
+  monitoringActionId.value = "save";
+  try {
+    await saveMonitoringSource(payload);
+    await refreshMonitoring();
+    showToast({ type: "success", title: "数据源已保存", detail: "服务会按配置周期自动检测新批次。" });
+  } catch (error) {
+    errorMessage.value = error.message || "数据源保存失败";
+  } finally {
+    monitoringActionId.value = "";
+  }
+}
+
+async function runMonitoringPoll(sourceId) {
+  monitoringActionId.value = sourceId;
+  try {
+    const response = await pollMonitoringSource(sourceId);
+    await refreshMonitoring();
+    showToast({
+      type: "success",
+      title: "已完成一次检测",
+      detail: `发现 ${response.poll.detected} 批，提交 ${response.poll.submitted} 个自动分析任务。`,
+    });
+  } catch (error) {
+    errorMessage.value = error.message || "立即检测失败";
+  } finally {
+    monitoringActionId.value = "";
+  }
+}
+
+async function removeMonitoringSource(sourceId) {
+  monitoringActionId.value = sourceId;
+  try {
+    await deleteMonitoringSource(sourceId);
+    await refreshMonitoring();
+    showToast({ type: "success", title: "数据源已删除", detail: "没有采集历史的数据源才允许删除。" });
+  } catch (error) {
+    errorMessage.value = error.message || "数据源无法删除，请先停用并保留审计记录";
+  } finally {
+    monitoringActionId.value = "";
+  }
+}
+
+async function acknowledgeMonitoringNotification(notificationId) {
+  if (!notificationId || notificationActionId.value) return;
+  notificationActionId.value = notificationId;
+  try {
+    await acknowledgeNotification(notificationId);
+    showToast({
+      type: "success",
+      title: "异常通知已签收",
+      detail: "签收人员和时间已写入 PostgreSQL 审计记录。",
+    });
+    await refreshMonitoring();
+  } catch (error) {
+    showToast({ type: "error", title: "通知签收失败", detail: error.message }, 0);
+  } finally {
+    notificationActionId.value = "";
+  }
+}
+
 function contributionWidth(item) {
   const contributions = visualization.value?.sensor_contributions || [];
   const maximum = Number(contributions[0]?.score || 0);
@@ -1115,7 +1388,14 @@ function contributionWidth(item) {
 </script>
 
 <template>
-  <div class="app-shell">
+  <div v-if="!authReady" class="app-starting">正在连接时察千机服务...</div>
+  <LoginView
+    v-else-if="authEnabled && !currentUser"
+    :loading="authLoading"
+    :error="authError"
+    @login="handleLogin"
+  />
+  <div v-else class="app-shell">
     <header class="topbar">
       <div class="brand-block">
         <div class="brand-mark">SQ</div>
@@ -1127,9 +1407,12 @@ function contributionWidth(item) {
       <div class="topbar-meta">
         <span class="api-dot" :class="{ offline: apiStatus === '离线' }"></span>
         API {{ apiStatus }}
-        <span class="divider"></span>
-        <span>校赛验证环境</span>
+        <span class="topbar-environment"><span class="divider"></span>校赛验证环境</span>
         <span v-if="lastDataSyncAt" class="sync-meta">同步于 {{ formatClock(lastDataSyncAt) }}</span>
+        <div v-if="currentUser" class="user-session">
+          <span><b>{{ currentUser.display_name }}</b><small>{{ currentUser.role }}</small></span>
+          <button title="退出登录" @click="handleLogout">退出</button>
+        </div>
       </div>
     </header>
 
@@ -1146,62 +1429,12 @@ function contributionWidth(item) {
           <span class="nav-index">{{ String(tabs.indexOf(tab) + 1).padStart(2, '0') }}</span>
           {{ tab.label }}
         </button>
-
-        <div class="sidebar-divider"></div>
-        <div class="sidebar-label">数据任务</div>
-        <button class="outline-button" @click="chooseFile">选择 CSV 文件</button>
-        <button class="sample-button" :disabled="sampleLoading || isAnalyzing" @click="loadDefaultSkab">
-          {{ sampleLoading ? "准备样例中..." : "加载默认 SKAB 样例" }}
-        </button>
-        <input ref="fileInput" type="file" accept=".csv" hidden @change="onFileChange" />
-        <div class="selected-file" v-if="selectedFile">
-          <span class="file-type">CSV</span>
-          <span class="file-name">{{ selectedFile.name }}</span>
-        </div>
-        <div class="file-placeholder" v-else>尚未选择数据文件</div>
-
-        <label class="field-label" for="device-profile">设备数据配置</label>
-        <select
-          id="device-profile"
-          v-model="config.device_profile_id"
-          class="control-input"
-          :disabled="deviceProfilesLoading || isAnalyzing"
-        >
-          <option :value="null">自动识别</option>
-          <option value="generic">通用模式</option>
-          <option v-for="profile in deviceProfiles" :key="profile.profile_id" :value="profile.profile_id">
-            {{ profile.display_name }} · {{ profile.profile_id }}
-          </option>
-        </select>
-        <p class="device-profile-hint" :class="{ loading: deviceProfilesLoading }" v-if="deviceProfilesLoading">
-          正在读取可用设备配置...
-        </p>
-        <p
-          class="device-profile-hint matched"
-          v-else-if="filePreflight?.device_profile?.profile_id"
-        >
-          <span class="device-profile-hint-label">预检匹配</span>
-          <span class="device-profile-hint-name">{{ filePreflight.device_profile.display_name }}</span>
-        </p>
-        <p class="device-profile-hint" v-else>未知 CSV 会保留原字段并按通用模式分析。</p>
-
-        <label class="field-label" for="detector">检测器</label>
-        <select id="detector" v-model="config.detector" class="control-input">
-          <option value="time_frequency_relation">时频关系多路径</option>
-          <option value="window_autoencoder">滑动窗口 AutoEncoder</option>
-          <option value="hybrid">时序-工况混合</option>
-          <option value="pca_reconstruction">PCA 多变量重构</option>
-          <option value="mad">稳健 MAD</option>
-        </select>
-        <label class="field-label" for="threshold">异常阈值 {{ config.threshold }}</label>
-        <input id="threshold" v-model.number="config.threshold" type="range" min="2" max="10" step="0.1" />
-        <button class="primary-button" :disabled="isAnalyzing || !selectedFile" @click="startAnalysis">
-          {{ isAnalyzing ? "分析进行中..." : "开始智能分析" }}
-        </button>
-        <div v-if="filePreflight" class="sidebar-preflight">
-          <div class="preflight-title"><b>文件预检</b><span :class="{ warn: filePreflight.warnings.length }">{{ filePreflight.warnings.length ? '需确认' : '通过' }}</span></div>
-          <p>{{ filePreflight.rowCount }} 行 · {{ filePreflight.sensorCount }} 个测点 · 缺失率 {{ (filePreflight.missingRate * 100).toFixed(1) }}%</p>
-          <button class="outline-button preflight-button" :disabled="isAnalyzing" @click="showPreflight = true">查看检查结果</button>
+        <div class="sidebar-runtime">
+          <span :class="{ active: monitoring.monitor?.running }"></span>
+          <div>
+            <strong>{{ monitoring.status !== 'success' ? '正在同步监测状态' : monitoring.monitor?.running ? '自动监测运行中' : '自动监测未启用' }}</strong>
+            <small>{{ monitoring.status === 'success' ? `${monitoring.enabled_source_count || 0} 个数据源 · ${monitoring.ingestions?.length || 0} 个采集批次` : '连接后台监测服务...' }}</small>
+          </div>
         </div>
       </aside>
 
@@ -1211,7 +1444,9 @@ function contributionWidth(item) {
             <div class="eyebrow">INDUSTRIAL TIME-SERIES AGENT</div>
             <h1>{{ tabs.find((tab) => tab.id === activeTab)?.label }}</h1>
             <p v-if="analysis">当前任务：{{ runId || analysis.run_id }} · {{ analysis.data_profile?.source_name }}</p>
-            <p v-else>从一份工业时序数据开始，逐步形成可追溯的风险判断和处置动作。</p>
+            <p v-else-if="activeTab === 'monitoring'">数据接入后，系统持续检测新批次并自动完成分析、工单和分级通知。</p>
+            <p v-else-if="activeTab === 'debug'">单文件上传仅用于调试、对照实验和临时数据验证。</p>
+            <p v-else>结果由自动监测任务产生，也可从历史记录中选择任务查看。</p>
           </div>
           <div class="heading-status" :class="{ busy: isAnalyzing }">
             <span class="status-dot"></span>
@@ -1257,11 +1492,30 @@ function contributionWidth(item) {
           @confirm="confirmPreflightAndStart"
         />
 
-        <section v-if="activeTab === 'overview'" class="content-stack">
+        <MonitoringPanel
+          v-if="activeTab === 'monitoring'"
+          :monitoring="monitoring"
+          :loading="monitoringLoading"
+          :action-id="monitoringActionId"
+          :notification-action-id="notificationActionId"
+          :current-user="currentUser"
+          :format-date="formatDate"
+          :analysis="analysis"
+          :current-run-id="currentAnalysisRunId"
+          :run-loading="automaticRunLoading"
+          @refresh="refreshMonitoring"
+          @save-source="configureMonitoring"
+          @poll-source="runMonitoringPoll"
+          @delete-source="removeMonitoringSource"
+          @view-run="loadRunById"
+          @acknowledge-notification="acknowledgeMonitoringNotification"
+        />
+
+        <section v-else-if="activeTab === 'overview'" class="content-stack">
           <div v-if="!analysis" class="empty-panel">
             <div class="empty-icon">TS</div>
-            <h2>等待一份工业时序数据</h2>
-            <p>选择左侧 CSV 文件后，系统将自动完成数据画像、异常检测、趋势研判和工单生成。</p>
+            <h2>等待自动分析结果</h2>
+            <p>系统检测到新批次后会自动加载结果；也可以在自动监测或历史记录中选择任务。</p>
           </div>
           <OverviewPanel
             v-else
@@ -1291,7 +1545,7 @@ function contributionWidth(item) {
         </section>
 
         <section v-else-if="activeTab === 'evidence'" class="content-stack">
-          <div v-if="!analysis" class="empty-panel compact"><h2>尚未生成分析结果</h2><p>先选择 CSV 并开始智能分析。</p></div>
+          <div v-if="!analysis" class="empty-panel compact"><h2>尚未加载分析结果</h2><p>从自动监测记录或历史记录选择一次已完成任务。</p></div>
           <EvidencePanel
             v-else
             :analysis="analysis"
@@ -1311,7 +1565,7 @@ function contributionWidth(item) {
         </section>
 
         <section v-else-if="activeTab === 'forecast'" class="content-stack">
-          <div v-if="!analysis" class="empty-panel compact"><h2>尚未生成趋势研判</h2><p>先选择 CSV 并开始智能分析。</p></div>
+          <div v-if="!analysis" class="empty-panel compact"><h2>尚未加载趋势研判</h2><p>从自动监测记录或历史记录选择一次已完成任务。</p></div>
           <ForecastPanel
             v-else
             :analysis="analysis"
@@ -1345,6 +1599,8 @@ function contributionWidth(item) {
           :work-order-status-filter="workOrderStatusFilter"
           :work-order-priority-filter="workOrderPriorityFilter"
           :current-work-order-only="currentWorkOrderOnly"
+          :my-work-orders-only="myWorkOrdersOnly"
+          :current-user="currentUser"
           :current-run-id="currentAnalysisRunId"
           :current-source-file="analysis?.data_profile?.source_name || selectedFile?.name || ''"
           :feedback="feedback"
@@ -1357,18 +1613,22 @@ function contributionWidth(item) {
           @update:work-order-status-filter="workOrderStatusFilter = $event"
           @update:work-order-priority-filter="workOrderPriorityFilter = $event"
           @toggle-current-scope="toggleCurrentWorkOrderScope"
+          @toggle-my-scope="toggleMyWorkOrders"
           @select-order="selectWorkOrder"
           @restore-order="restoreSelectedWorkOrder"
+          @delete-order="deleteSelectedWorkOrder"
+          @toggle-archived="toggleArchivedRecords"
           @change-page="changeWorkOrderPage"
           @refresh="refreshWorkOrders"
           @export="exportWorkOrdersCsv"
           @clear-filters="clearWorkOrderFilters"
           @save-feedback="saveFeedback"
+          @accept-order="acceptSelectedWorkOrder"
           @archive-order="archiveSelectedWorkOrder"
         />
 
         <HistoryPanel
-          v-else
+          v-else-if="activeTab === 'history'"
           :analysis="analysis"
           :runs="runs"
           :filtered-history-runs="filteredHistoryRuns"
@@ -1396,6 +1656,7 @@ function contributionWidth(item) {
           @retry-run="retryHistoryRun"
           @archive-run="archiveHistoryRun"
           @restore-run="restoreHistoryRun"
+          @delete-run="deleteHistoryRun"
           @change-page="changeHistoryPage"
           @toggle-archived="toggleArchivedRecords"
           @refresh="refreshHistory"
@@ -1404,6 +1665,22 @@ function contributionWidth(item) {
           @select-case="selectCase"
           @delete-case="deleteConfirmedCase"
           @close-case="selectedCase = null"
+        />
+
+        <DebugAnalysisPanel
+          v-else-if="activeTab === 'debug'"
+          :selected-file="selectedFile"
+          :file-preflight="filePreflight"
+          :config="config"
+          :device-profiles="deviceProfiles"
+          :device-profiles-loading="deviceProfilesLoading"
+          :sample-loading="sampleLoading"
+          :analyzing="isAnalyzing"
+          @select-file="selectDebugFile"
+          @load-sample="loadDefaultSkab"
+          @start-analysis="startAnalysis"
+          @show-preflight="showPreflight = true"
+          @update-config="updateDebugConfig"
         />
       </main>
     </div>

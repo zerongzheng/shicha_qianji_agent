@@ -9,6 +9,16 @@ const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:800
 const API_KEY = import.meta.env.VITE_API_KEY || "";
 const REQUEST_TIMEOUT_MS = Number(import.meta.env.VITE_API_TIMEOUT_MS || 30000);
 const MAX_GET_RETRIES = 2;
+const SESSION_TOKEN_KEY = "shichi_qianji_session_token";
+
+export function getSessionToken() {
+  return window.localStorage.getItem(SESSION_TOKEN_KEY) || "";
+}
+
+export function setSessionToken(token) {
+  if (token) window.localStorage.setItem(SESSION_TOKEN_KEY, token);
+  else window.localStorage.removeItem(SESSION_TOKEN_KEY);
+}
 
 function isRetryableStatus(status) {
   return [408, 425, 429].includes(status) || status >= 500;
@@ -35,6 +45,8 @@ async function request(path, options = {}) {
   for (let retryIndex = 0; retryIndex <= (canRetry ? MAX_GET_RETRIES : 0); retryIndex += 1) {
     const headers = new Headers(fetchOptions.headers || {});
     if (API_KEY) headers.set("X-API-Key", API_KEY);
+    const sessionToken = getSessionToken();
+    if (sessionToken) headers.set("Authorization", `Bearer ${sessionToken}`);
     const controller = new AbortController();
     let timedOut = false;
     let timeoutId = null;
@@ -77,6 +89,10 @@ async function request(path, options = {}) {
       }
       if (!response.ok) {
         const detail = typeof payload === "object" ? payload.detail || payload.message : payload;
+        // 会话过期后清除本地令牌；页面下一次刷新会回到登录入口，避免反复携带失效令牌。
+        if (response.status === 401 && getSessionToken() && !path.startsWith("/api/v1/auth/login")) {
+          setSessionToken("");
+        }
         if (response.status === 429) {
           throw new Error(detail || "请求过于频繁，请稍后再试。系统会自动控制请求频率。");
         }
@@ -98,6 +114,11 @@ async function request(path, options = {}) {
         await sleep(Math.min(600 * (2 ** retryIndex), 3000));
         continue;
       }
+      if (error instanceof TypeError) {
+        throw new Error(
+          `无法连接后端服务（${API_BASE_URL}）。请确认后端已启动，并检查前端端口是否已被后端允许。`,
+        );
+      }
       throw error;
     } finally {
       if (timeoutId !== null) window.clearTimeout(timeoutId);
@@ -110,6 +131,71 @@ async function request(path, options = {}) {
 
 export function health(options = {}) {
   return request("/health", options);
+}
+
+export function getAuthConfig() {
+  return request("/api/v1/auth/config");
+}
+
+export function login(username, password) {
+  return request("/api/v1/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+}
+
+export function getCurrentUser() {
+  return request("/api/v1/auth/me");
+}
+
+export async function logout() {
+  try {
+    return await request("/api/v1/auth/logout", { method: "POST" });
+  } finally {
+    setSessionToken("");
+  }
+}
+
+export function listUsers() {
+  return request("/api/v1/users");
+}
+
+export function listMyNotifications(unreadOnly = false) {
+  return request(`/api/v1/notifications/mine?unread_only=${unreadOnly ? "true" : "false"}`);
+}
+
+export function acknowledgeNotification(notificationId) {
+  return request("/api/v1/notifications/acknowledge", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ notification_id: notificationId }),
+  });
+}
+
+// 自动监测看板同时返回数据源、采集批次和主动通知，避免前端分别拼接多份状态。
+export function getMonitoringStatus() {
+  return request("/api/v1/monitoring/status");
+}
+
+export function saveMonitoringSource(payload) {
+  return request("/api/v1/monitoring/sources", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export function pollMonitoringSource(sourceId) {
+  return request(`/api/v1/monitoring/sources/${encodeURIComponent(sourceId)}/poll`, {
+    method: "POST",
+  });
+}
+
+export function deleteMonitoringSource(sourceId) {
+  return request(`/api/v1/monitoring/sources/${encodeURIComponent(sourceId)}`, {
+    method: "DELETE",
+  });
 }
 
 // 获取后端已启用的设备配置，供分析前选择；接口不返回企业文件和本地路径。
@@ -176,6 +262,7 @@ export function listWorkOrders(includeArchived = false, archivedOnly = false, op
   // 事件与工单联动时必须限定所属分析任务，避免不同任务中相同事件编号串线。
   if (options.run_id) params.set("run_id", options.run_id);
   if (options.search?.trim()) params.set("search", options.search.trim());
+  if (options.mine) params.set("mine", "true");
   if (includeArchived) params.set("include_archived", "true");
   if (archivedOnly) params.set("archived_only", "true");
   const query = `?${params.toString()}`;
@@ -187,6 +274,20 @@ export function updateWorkOrder(recordId, payload) {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+  });
+}
+
+export function acceptWorkOrder(recordId) {
+  return request(`/api/v1/work-orders/${encodeURIComponent(recordId)}/accept`, {
+    method: "POST",
+  });
+}
+
+export function assignWorkOrder(recordId, userId) {
+  return request(`/api/v1/work-orders/${encodeURIComponent(recordId)}/assign`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId }),
   });
 }
 
@@ -225,6 +326,14 @@ export function archiveWorkOrder(recordId, reason = "用户归档") {
 
 export function restoreWorkOrder(recordId) {
   return request(`/api/v1/work-orders/${encodeURIComponent(recordId)}/restore`, { method: "POST" });
+}
+
+export function deleteArchivedWorkOrder(recordId) {
+  return request(`/api/v1/work-orders/${encodeURIComponent(recordId)}`, { method: "DELETE" });
+}
+
+export function deleteArchivedRun(runId) {
+  return request(`/api/v1/runs/${encodeURIComponent(runId)}`, { method: "DELETE" });
 }
 
 export { API_BASE_URL };

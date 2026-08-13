@@ -2,20 +2,23 @@
 
 > 面向浙江省国际大学生创新大赛人工智能赛道“时序工业类”命题的工业时序异常诊断与运维决策系统。
 
-时察千机将工业多变量传感器数据转化为可追溯的风险判断、异常证据、趋势预测、根因候选和运维工单，并通过现场反馈沉淀历史故障案例。当前校赛阶段使用公开 SKAB 数据集完成工程验证，企业真实数据接入后主要替换数据适配和设备知识，不改变整体应用闭环。
+时察千机持续监测工业多变量传感器数据，在新批次到达后自动完成采集、分析、风险判断、异常取证、根因诊断、工单生成与分级通知，并通过现场反馈沉淀历史故障案例。当前校赛阶段使用公开 SKAB 数据集完成工程验证，企业真实数据接入后主要替换数据适配和设备知识，不改变整体应用闭环。
 
 ## 项目定位
 
 本项目不是单纯的聊天机器人，也不是只输出一个异常标签的检测脚本，而是一套面向工业运维闭环的时序智能体：
 
 ```text
-工业 CSV
+目录 / HTTP 接口 / 企业数据平台
+  -> 定时检测新批次、内容去重与快照留存
+  -> 自动提交后台分析任务
   -> 数据质量检查与数据画像
   -> 多变量时序异常检测
   -> 连续异常事件合并与传感器归因
   -> 趋势预测与工况上下文分析
   -> 根因候选、证据缺口和验证步骤
   -> 生成优先级运维工单
+  -> P1/P2/P3 分级路由与主动通知
   -> 现场确认、处置与复测反馈
   -> 历史案例沉淀与相似案例检索
 ```
@@ -31,6 +34,8 @@
 当前代码已经形成可运行的校赛验证版本：
 
 - 支持 SKAB 及通用多变量 CSV 数据上传，并可自动匹配设备数据契约；
+- 支持目录和 HTTP CSV 数据源无人值守轮询，新批次自动去重、留存快照并提交分析；
+- 支持异常工单按 P1/P2/P3 路由至不同岗位，并通过站内通知或企业微信群机器人主动推送；
 - 支持数据画像、缺失值检查和浏览器端文件预检；
 - 支持 MAD、Isolation Forest、PCA 重构、滑动窗口 AutoEncoder、Hybrid 和时频关系多路径检测；
 - 支持根据任务目标、设备配置、数据规模和健康基线自动选择主模型，并保留完整候选排序；
@@ -42,7 +47,7 @@
 - 支持候选根因、支持证据、证据缺口和现场验证步骤；
 - 支持异步分析任务、任务状态轮询、取消排队任务和历史任务归档；
 - 支持运维工单状态流转、现场反馈、归档和历史案例沉淀；
-- 支持 Vue3 工业运维工作台和 Streamlit 备用调试页面；
+- 支持 Vue3 自动监测与工业运维工作台；手动上传集中在独立调试页，Streamlit 作为备用调试页面；
 - 支持一键登记默认 SKAB 样例，便于没有企业数据时完成完整演示；
 - 支持为元景万悟提供专用 OpenAPI 和工作流工具接口。
 
@@ -52,11 +57,13 @@
 
 ```mermaid
 flowchart LR
-    A["Vue3 工业运维工作台"] --> B["FastAPI 业务 API"]
+    I["目录 / HTTP 数据源"] --> M["自动采集与去重调度器"]
+    M --> B["FastAPI 业务 API"]
+    A["Vue3 自动监测与运维工作台"] --> B
     S["Streamlit 备用调试入口"] --> B
     W["元景万悟工作流 / 智能体"] --> B
     B --> C["工业时序分析引擎"]
-    B --> D["SQLite 任务与工单仓储"]
+    B --> D["PostgreSQL 数据源、任务、工单与通知仓储"]
     B --> E["本地工业知识库"]
     B --> F["比赛方 MaaS 大模型"]
 ```
@@ -90,7 +97,7 @@ shichi_qianji_agent/
 │  ├─ model_store/              # AutoEncoder 等模型的版本化存储
 │  ├─ observability/            # 运行日志与可追溯记录
 │  ├─ reporting/                # 报告、案例材料包和证据包
-│  ├─ storage/                  # SQLite 仓储、任务、工单和案例
+│  ├─ storage/                  # PostgreSQL 仓储、迁移、任务、工单和案例
 │  ├─ ui/                       # Streamlit 备用页面
 │  ├─ cli.py                    # 命令行入口
 │  └─ config.py                 # .env 配置读取
@@ -102,7 +109,7 @@ shichi_qianji_agent/
 ├─ tests/                       # 后端和核心流程测试
 ├─ docs/                        # 运行、算法和万悟接入文档
 ├─ scripts/                     # 基础服务启动、停止和检查脚本
-├─ outputs/                     # 本地数据库、上传文件、日志和实验产物
+├─ outputs/                     # 上传文件、日志和实验产物
 ├─ SKAB/                        # 外部数据集，与项目目录并列，不纳入本仓库
 ├─ .env                         # 本机密钥和路径，不提交
 ├─ .env.example                 # 可公开的配置模板
@@ -129,7 +136,35 @@ SKAB_DEFAULT_DIR=../SKAB/data/valve1
 HEALTHY_BASELINE_FILE=../SKAB/data/anomaly-free/anomaly-free.csv
 ```
 
-项目不把完整 SKAB 数据集提交到 GitHub。后续企业数据也建议放在项目外部，通过前端上传或 `.env` 指向数据目录。不同设备字段、单位、采样约定和健康基线通过 `resources/device_profiles/` 下的 JSON 配置适配，分析算法继续使用统一标准字段。
+项目不把完整 SKAB 数据集提交到 GitHub。后续企业数据也建议放在项目外部，通过“自动监测”页面配置目录或 HTTP 接口接入；手动上传仅保留为算法调试和对照实验入口。不同设备字段、单位、采样约定和健康基线通过 `resources/device_profiles/` 下的 JSON 配置适配，分析算法继续使用统一标准字段。
+
+## 无人值守运行
+
+后端和前端启动后，进入首页“自动监测”，新增一个数据源：
+
+```text
+名称：SKAB valve1 自动监测目录
+方式：监控目录
+目录：E:\大学课程\竞赛\SKAB\data\valve1
+周期：60 秒
+P1：生产值班负责人
+P2：设备工程师
+P3：运行值班员
+```
+
+保存并启用后无需再上传或下达分析指令。调度器会自动检测目录中的 CSV，通过 SHA-256 内容指纹跳过已处理数据，保存不可变快照并提交现有异步分析队列。分析成功后自动生成工单，并按优先级写入站内通知；启用企业微信群机器人后，还会将风险等级、责任岗位、接收人员、数据来源和工单编号主动推送至运维群。
+
+企业微信 Webhook 包含机器人访问密钥，只能写入被 Git 忽略的 `.env`，不能放入源码、前端表单或 `.env.example`：
+
+```dotenv
+WECOM_ENABLED=true
+WECOM_WEBHOOK_URL=请填写企业微信群机器人的完整地址
+WECOM_TIMEOUT_SECONDS=10
+```
+
+校赛演示使用一个运维群即可：系统仍按 P1/P2/P3 在 PostgreSQL 中完成责任岗位与接收人路由，同一个机器人负责实际送达，消息正文会明确标注应由谁处理。若企业后续要求分别推送到多个群，可在通知适配层增加“岗位到机器人”的部署配置，不需要修改异常检测和工单逻辑。
+
+比赛演示可先放入一个 CSV，再展示“自动处理记录”和“分级通知”；也可以点击“立即检测”缩短等待。当前目录轮询与 HTTP 轮询属于秒级或分钟级准实时采集，不宣称为 Kafka/MQTT 流式计算。企业后续提供消息队列、时序数据库或 CDC 接口时，只需新增采集适配器。
 
 设备配置采用“显式指定、自动匹配、通用回退”三层机制：
 
@@ -167,11 +202,16 @@ Copy-Item .env.example .env
 然后编辑 `.env`，至少检查：
 
 ```dotenv
-DATABASE_PATH=outputs/shichi_qianji.db
+DATABASE_URL=postgresql://shichi_qianji_app:你的数据库密码@127.0.0.1:5432/shichi_qianji
+DATABASE_SCHEMA=public
 LLM_API_KEY=你的比赛方接口密钥
 LLM_BASE_URL=https://maas-api.ai-yuanjing.com/openapi/compatible-mode/v1
 LLM_CHAT_MODEL=glm-5
 FRONTEND_ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+# 校赛演示需要展示真实人员责任闭环时启用；密码只写本地 .env。
+AUTH_ENABLED=true
+AUTH_SESSION_HOURS=12
+AUTH_BOOTSTRAP_PASSWORD=请设置一个校赛演示密码
 ```
 
 真实密钥只能写入本地 `.env`，不要写进代码、截图、前端源码或 GitHub。
@@ -208,6 +248,11 @@ Invoke-RestMethod http://127.0.0.1:8000/health
 ```
 
 前端通过 `frontend/.env` 中的 `VITE_API_BASE_URL` 调用后端，默认值为 `http://127.0.0.1:8000`。前端不直接访问数据库，也不保存大模型密钥。
+
+启用 `AUTH_ENABLED=true` 后，服务首次启动会创建 5 个预置账号，初始密码统一取自本地
+`AUTH_BOOTSTRAP_PASSWORD`：`admin`、`production`、`engineer`、`operator`、`observer`。
+它们分别对应系统管理员、生产负责人、设备工程师、运行值班员和观察人员。系统不开放公开注册；
+生产环境应为每个账号设置独立密码，或对接企业统一身份平台。
 
 ### B. 只运行后端接口
 
@@ -296,6 +341,11 @@ http://host.docker.internal:8000/integrations/wanwu/quick-openapi.json
 | `GET /api/v1/runs` | 查询历史分析任务 |
 | `GET /api/v1/work-orders` | 查询运维工单，可按 `run_id`、状态和优先级筛选 |
 | `PATCH /api/v1/work-orders/{record_id}` | 保存现场反馈 |
+| `POST /api/v1/auth/login` | 使用预置账号登录本地工作台 |
+| `GET /api/v1/auth/me` | 获取当前登录人员和岗位 |
+| `GET /api/v1/notifications/mine` | 查询当前人员的主动通知 |
+| `POST /api/v1/notifications/acknowledge` | 签收主动通知并记录审计 |
+| `POST /api/v1/work-orders/{record_id}/accept` | 当前责任人确认接单 |
 | `GET /api/v1/cases` | 查询历史确认案例 |
 | `POST /api/v1/wanwu/quick-diagnosis` | 万悟快速诊断入口 |
 | `POST /api/v1/wanwu/jobs/submit` | 万悟异步任务入口 |
@@ -304,10 +354,18 @@ http://host.docker.internal:8000/integrations/wanwu/quick-openapi.json
 
 ## 数据库与文件
 
-当前使用 SQLite，默认数据库为：
+项目统一使用 PostgreSQL，不再创建或读取 SQLite 文件。本机默认连接信息由 `.env` 提供：
 
-```text
-outputs/shichi_qianji.db
+```dotenv
+DATABASE_URL=postgresql://shichi_qianji_app:你的数据库密码@127.0.0.1:5432/shichi_qianji
+DATABASE_SCHEMA=public
+```
+
+首次启动时，仓储会按 `app/storage/migrations/` 中的版本脚本创建表，并在
+`schema_migrations` 中记录已应用版本。启动前可执行：
+
+```powershell
+& "E:\Tools\PostgreSQL\18\bin\pg_isready.exe" -h 127.0.0.1 -p 5432
 ```
 
 数据库保存：
@@ -315,6 +373,8 @@ outputs/shichi_qianji.db
 - 上传文件元数据；
 - 分析任务状态和结构化结果；
 - 工单状态、现场确认根因和复测反馈；
+- 用户身份、岗位、可撤销登录会话和工单责任人；
+- 个人告警通知、签收时间、接单时间和关键操作审计；
 - 已确认历史案例；
 - 归档时间和操作原因。
 - 脱敏的大模型/Embedding 调用元数据，包括模型、耗时、Token 用量和状态。
@@ -323,7 +383,7 @@ outputs/shichi_qianji.db
 `outputs/api_uploads/`，不直接写入数据库；报告、实验结果、限流状态、脱敏审计日志和模型缓存也保存在
 `outputs/` 下。`outputs/` 中的运行产物不会提交 GitHub。
 
-正式企业部署时再迁移到 PostgreSQL，并增加对象存储、用户身份、组织隔离、权限和审计日志。校赛阶段不需要先实现独立用户登录；后续接入万悟时优先复用万悟的登录体系。
+当前 PostgreSQL 已实现用户身份、岗位权限、工单指派/接单、通知签收和操作审计。后续接入万悟时可通过身份适配层复用万悟登录，不需要重写工单业务。
 
 ## 实验与成果材料
 
@@ -404,7 +464,6 @@ outputs/cases/             典型案例材料
 outputs/evidence_pack/     网评与答辩证据包
 outputs/api_uploads/       API 接收的 CSV
 outputs/logs/              运行日志
-outputs/shichi_qianji.db   SQLite 数据库
 ```
 
 ## 测试
@@ -415,7 +474,7 @@ cd "E:\大学课程\竞赛\shichi_qianji_agent"
 & "E:\Tools\uv\uv.exe" run pytest -q
 ```
 
-如果 Windows 临时目录权限导致 `pytest` 报错，可将临时目录改到项目内已有可写目录后再运行；`tmp_path` 权限错误不等于业务测试失败。
+数据库测试会为每个测试创建随机 PostgreSQL schema，结束后自动删除，不会读写正式 `public` 数据。可通过 `TEST_DATABASE_URL` 指向专用测试数据库。
 
 前端构建检查：
 
@@ -439,13 +498,14 @@ cd "E:\大学课程\竞赛\shichi_qianji_agent\frontend"
 7. 完成自适应时间对齐、缺失填补和模型缩放证据，并纳入执行链与分析报告。
 8. 完成带设备边界、观察指标、人工确认和回退条件的参数/能耗优化建议。
 9. 完成受约束优化机制实验，以及不保存提示词正文的模型调用审计。
+10. 完成 PostgreSQL 人员身份、分级通知、个人工单、接单签收和操作审计闭环。
 
 下一步按优先级推进：
 
 1. 获取企业时序数据后，按设备配置重新标定阈值、模型和设备专属根因规则；
 2. 用企业时序数据和运行日志复核误报分类，形成可引用的企业案例证据；
 3. 根据比赛方万悟配置确定公网部署和工作流发布方式；
-4. 企业部署阶段再迁移 PostgreSQL，并增加用户身份、组织隔离、权限和审计日志。
+4. 接入企业统一身份平台或万悟登录，并用企业真实组织架构替换校赛预置账号。
 
 稳定的 GitHub 可公开实验摘要见 [`docs/competition/SKAB_RESULTS.md`](docs/competition/SKAB_RESULTS.md)。
 

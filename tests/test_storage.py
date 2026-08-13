@@ -1,4 +1,4 @@
-"""SQLite 任务归档和工单闭环测试。"""
+"""PostgreSQL 任务归档和工单闭环测试。"""
 
 from __future__ import annotations
 
@@ -341,6 +341,37 @@ def test_repository_cannot_archive_run_with_open_work_order(tmp_path: Path) -> N
 
     with pytest.raises(ValueError, match="未闭环工单"):
         repository.archive_run(run_id)
+
+
+def test_repository_permanently_deletes_only_archived_records(tmp_path: Path) -> None:
+    """永久删除必须经过归档，并在一个事务中清理任务的关联记录。"""
+
+    repository = IndustrialRepository(tmp_path / "permanent_delete.db")
+    file_id = _register_sample_file(repository, tmp_path)
+    run_id = "run_permanent_delete"
+    repository.start_run(run_id, file_id, "analyze", "mad", {})
+    repository.finish_run(run_id, "success", 20.0, result=_sample_result(run_id))
+    record_id = f"{run_id}:WO-E001-000010"
+
+    with pytest.raises(ValueError, match="已归档"):
+        repository.delete_archived_run(run_id)
+    with pytest.raises(ValueError, match="已归档"):
+        repository.delete_archived_work_order(record_id)
+
+    repository.update_work_order(
+        record_id,
+        {"status": "已关闭", "confirmed_cause": "开发测试工单"},
+    )
+    repository.archive_work_order(record_id)
+    deleted_order = repository.delete_archived_work_order(record_id)
+    assert deleted_order["record_id"] == record_id
+    assert repository.list_work_orders(include_archived=True) == []
+
+    repository.archive_run(run_id)
+    deleted_run = repository.delete_archived_run(run_id)
+    assert deleted_run["run_id"] == run_id
+    assert repository.get_run(run_id) is None
+    assert repository.list_runs(include_archived=True) == []
 
 
 def test_repository_rejects_unknown_work_order_status(tmp_path: Path) -> None:
