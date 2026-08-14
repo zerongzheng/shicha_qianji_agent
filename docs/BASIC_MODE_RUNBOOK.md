@@ -1,13 +1,12 @@
 # 基础运行手册
 
-本手册说明校赛阶段最常用的三种运行方式。当前项目统一使用 PostgreSQL，启动 FastAPI 前需要确认 PostgreSQL 服务可连接；Vue3、FastAPI 和万悟是三个可以独立运行的部分。
+本手册说明校赛阶段最常用的两种运行方式。当前项目统一使用 PostgreSQL，启动 FastAPI 前需要确认 PostgreSQL 服务可连接；Vue3、FastAPI 和万悟是三个可以独立运行的部分。
 
 ## 运行模式
 
 | 模式 | 需要启动 | 用途 |
 | --- | --- | --- |
 | Vue3 正式工作台 | FastAPI + Vue3 | 推荐的项目演示方式 |
-| Streamlit 备用页面 | Streamlit，必要时可共用 FastAPI | 算法调试和备用演示 |
 | 本地万悟联动 | Docker 万悟 + FastAPI，可选 Vue3 | 验证平台工具和工作流接入 |
 
 ## 目录
@@ -50,20 +49,7 @@ cd "E:\大学课程\竞赛\shichi_qianji_agent\frontend"
 风险总览中的“自动分析链路”会展示本次任务实际执行的步骤。展开步骤可以查看调用模块、核心输出、耗时和使用边界。
 这里展示的是可审计的工程执行记录，不是大模型思维过程。旧历史任务没有该字段时会显示兼容提示，重新运行后即可生成完整轨迹。
 
-## 方式二：Streamlit 备用页面
-
-Streamlit 不是 Vue 前端的依赖，主要用于算法调试、离线验证和没有 Node 环境时的备用页面。
-
-```powershell
-cd "E:\大学课程\竞赛\shichi_qianji_agent"
-& "E:\Tools\uv\uv.exe" run streamlit run streamlit_app.py
-```
-
-访问：`http://127.0.0.1:8501`。
-
-如果需要 Streamlit 调用 FastAPI 的异步任务接口，仍建议同时启动后端；只做本地基础分析时可按页面提示运行。
-
-## 方式三：本地万悟基础模式
+## 方式二：本地万悟基础模式
 
 本机内存不足时使用基础模式，不启动全部本体服务。先启动 Docker Desktop，然后执行：
 
@@ -109,7 +95,7 @@ Invoke-RestMethod http://127.0.0.1:8000/api/v1/system/diagnostics | ConvertTo-Js
 
 ## 停止本地服务
 
-- FastAPI、Streamlit、Vite：在对应终端按 `Ctrl+C`；
+- FastAPI、Vite：在对应终端按 `Ctrl+C`；
 - 万悟基础模式：执行 `.\scripts\stop_basic_stack.ps1`。
 
 ## 常见问题
@@ -129,7 +115,6 @@ Invoke-RestMethod http://127.0.0.1:8000/health
 ```text
 FastAPI：8000
 Vue3：5173
-Streamlit：8501
 万悟：8081
 ```
 

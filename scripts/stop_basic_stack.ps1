@@ -12,6 +12,8 @@ $baseContainers = @(
     "rag-wanwu", "wga-sandbox-wanwu", "nginx-wanwu"
 )
 
+& (Join-Path $PSScriptRoot "stop_wanwu_trigger.ps1")
+
 Write-Host "Stopping Wanwu basic containers; all data is preserved..." -ForegroundColor Cyan
 docker stop --time 15 $baseContainers
 

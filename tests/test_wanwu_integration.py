@@ -117,6 +117,12 @@ def test_wanwu_openapi_only_exposes_json_tools() -> None:
         "/api/v1/wanwu/cases/list",
         "/api/v1/wanwu/work-orders/list",
         "/api/v1/wanwu/work-orders/update",
+        "/api/v1/wanwu/automation/cycle",
+        "/api/v1/wanwu/automation/status",
+        "/api/v1/wanwu/automation/notifications/dispatch",
+        "/api/v1/wanwu/data-sources/list",
+        "/api/v1/wanwu/data-sources/configure",
+        "/api/v1/wanwu/data-sources/verify",
     }
     assert schema["components"]["securitySchemes"]["IndustrialApiKey"]["name"] == "X-API-Key"
     for path, path_item in schema["paths"].items():
@@ -124,6 +130,176 @@ def test_wanwu_openapi_only_exposes_json_tools() -> None:
         for operation in path_item.values():
             assert operation["operationId"]
             assert "application/json" in operation["requestBody"]["content"]
+
+
+def test_wanwu_autonomous_cycle_returns_run_id_for_workflow_branch(monkeypatch) -> None:
+    """无人值守工具必须给万悟选择器返回可继续追踪的主任务编号。"""
+
+    class FakeMonitor:
+        def poll_once(self, source_id: str, *, max_submissions: int | None = None) -> dict:
+            assert source_id == "src_skab_valve1"
+            assert max_submissions == 1
+            return {
+                "source_id": source_id,
+                "detected": 1,
+                "submitted": 1,
+                "duplicates": 0,
+                "failed": 0,
+                "run_ids": ["run_autonomous001"],
+            }
+
+    monkeypatch.setattr(server, "get_monitoring_service", lambda: FakeMonitor())
+    client = TestClient(server.app)
+    response = client.post(
+        "/api/v1/wanwu/automation/cycle",
+        json={"source_id": "src_skab_valve1", "max_sources": 1},
+    )
+    client.close()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["cycle_status"] == "analysis_queued"
+    assert payload["primary_run_id"] == "run_autonomous001"
+    assert payload["submitted_count"] == 1
+    assert "查询任务状态" in payload["next_action"]
+
+
+def test_wanwu_can_manage_and_verify_directory_data_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """万悟应能配置和验收目录数据源，同时不回显后端保存的鉴权信息。"""
+
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    sample = incoming / "batch.csv"
+    sample.write_text("datetime,Pressure\n2026-01-01 00:00:00,1.0\n", encoding="utf-8")
+
+    class FakeRepository:
+        def __init__(self) -> None:
+            self.sources = {
+                "src_wanwu_demo": {
+                    "source_id": "src_wanwu_demo",
+                    "name": "旧名称",
+                    "source_type": "directory",
+                    "endpoint": str(incoming),
+                    "interval_seconds": 60.0,
+                    "enabled": False,
+                    "analysis_config": {"detector_selection_mode": "auto"},
+                    "request_headers": {"Authorization": "Bearer secret"},
+                    "routing": {"priority_routes": {"P1": []}},
+                    "initial_scan_mode": "latest",
+                    "timeout_seconds": 15.0,
+                    "last_poll_at": None,
+                    "last_success_at": None,
+                    "last_error": None,
+                    "created_at": "2026-08-14T10:00:00+08:00",
+                    "updated_at": "2026-08-14T10:00:00+08:00",
+                }
+            }
+            self.saved_config: dict = {}
+
+        def get_data_source(self, source_id: str) -> dict | None:
+            return self.sources.get(source_id)
+
+        def list_data_sources(self, *, enabled_only: bool = False) -> list[dict]:
+            values = list(self.sources.values())
+            return [item for item in values if item["enabled"]] if enabled_only else values
+
+        def upsert_data_source(self, source: dict) -> dict:
+            self.saved_config = dict(source["config"])
+            current = self.sources[source["source_id"]]
+            current.update(
+                {
+                    "name": source["name"],
+                    "source_type": source["source_type"],
+                    "endpoint": source["endpoint"],
+                    "interval_seconds": float(source["interval_seconds"]),
+                    "enabled": bool(source["enabled"]),
+                    "analysis_config": source["config"]["analysis_config"],
+                    "request_headers": source["config"]["request_headers"],
+                    "routing": source["config"]["routing"],
+                    "initial_scan_mode": source["config"]["initial_scan_mode"],
+                    "timeout_seconds": source["config"]["timeout_seconds"],
+                }
+            )
+            return current
+
+    repository = FakeRepository()
+    monkeypatch.setattr(server, "get_repository", lambda: repository)
+    client = TestClient(server.app)
+    configured = client.post(
+        "/api/v1/wanwu/data-sources/configure",
+        json={
+            "source_id": "src_wanwu_demo",
+            "name": "SKAB 演示实时目录",
+            "source_type": "directory",
+            "endpoint": str(incoming),
+            "interval_seconds": 30,
+            "enabled": True,
+            "initial_scan_mode": "new_only",
+        },
+    )
+    listed = client.post(
+        "/api/v1/wanwu/data-sources/list",
+        json={"enabled_only": True},
+    )
+    verified = client.post(
+        "/api/v1/wanwu/data-sources/verify",
+        json={"source_id": "src_wanwu_demo"},
+    )
+    client.close()
+
+    assert configured.status_code == 200
+    assert configured.json()["action"] == "updated"
+    assert configured.json()["source"]["request_header_count"] == 1
+    assert "secret" not in configured.text
+    assert repository.saved_config["request_headers"] == {
+        "Authorization": "Bearer secret"
+    }
+    assert listed.status_code == 200
+    assert listed.json()["source_count"] == 1
+    assert listed.json()["sources"][0]["source_id"] == "src_wanwu_demo"
+    assert verified.status_code == 200
+    assert verified.json()["reachable"] is True
+    assert verified.json()["csv_file_count"] == 1
+    assert verified.json()["latest_file_name"] == "batch.csv"
+
+
+def test_wanwu_dispatches_notifications_only_after_success(monkeypatch) -> None:
+    """主动告警节点必须校验任务成功，并返回不含内部错误详情的投递审计。"""
+
+    class FakeRepository:
+        def get_run(self, run_id: str) -> dict:
+            return {"run_id": run_id, "status": "success"}
+
+    repository = FakeRepository()
+    monkeypatch.setattr(server, "get_repository", lambda: repository)
+    monkeypatch.setattr(
+        server,
+        "dispatch_run_notifications",
+        lambda current_repository, run_id: [
+            {
+                "notification_id": "ntf_test001",
+                "run_id": run_id,
+                "status": "sent",
+                "channel": "wecom_robot",
+                "error": "内部字段不应返回",
+            }
+        ],
+    )
+    client = TestClient(server.app)
+    response = client.post(
+        "/api/v1/wanwu/automation/notifications/dispatch",
+        json={"run_id": "run_autonomous001"},
+    )
+    client.close()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["sent_count"] == 1
+    assert payload["failed_count"] == 0
+    assert "error" not in payload["notifications"][0]
 
 
 def test_wanwu_openapi_uses_openapi_30_exclusive_bounds() -> None:
@@ -352,7 +528,7 @@ def test_wanwu_file_adapter_requires_exactly_one_source() -> None:
         )
 
 
-def test_wanwu_check_can_verify_platform_and_eight_tools(tmp_path, monkeypatch) -> None:
+def test_wanwu_check_can_verify_platform_and_complete_toolset(tmp_path, monkeypatch) -> None:
     """接入自检应同时报告算法服务、完整工具、快速工具和万悟网页状态。"""
 
     schema = {
@@ -368,7 +544,13 @@ def test_wanwu_check_can_verify_platform_and_eight_tools(tmp_path, monkeypatch) 
                     "list_industrial_work_orders",
                     "update_industrial_work_order",
                     "list_industrial_feedback_cases",
-                ]
+                        "run_unattended_industrial_cycle",
+                        "get_unattended_monitoring_status",
+                        "dispatch_industrial_alerts",
+                        "list_industrial_data_sources",
+                        "configure_industrial_data_source",
+                        "verify_industrial_data_source",
+                    ]
             )
         },
         "servers": [{"url": "http://host.docker.internal:8000"}],
@@ -405,7 +587,7 @@ def test_wanwu_check_can_verify_platform_and_eight_tools(tmp_path, monkeypatch) 
         quick_output_path=tmp_path / "wanwu-quick.json",
     )
 
-    assert result["tool_count"] == 8
+    assert result["tool_count"] == 14
     assert result["platform_http_status"] == 200
     assert result["schema_server"] == "http://host.docker.internal:8000"
     assert result["quick_tool_count"] == 1
@@ -439,6 +621,53 @@ def test_wanwu_quick_schema_contains_only_one_demo_tool() -> None:
         "automatic_diagnosis",
     }.issubset(response_schema["properties"])
     assert all("const" not in item for item in response_schema["properties"].values())
+
+
+def test_wanwu_quick_payload_keeps_decision_ledger(monkeypatch) -> None:
+    """快速万悟协议也必须保留决策账本，避免平台只看到一段无依据的结论。"""
+
+    from app.api.server import _quick_analysis_payload
+
+    payload = {
+        "device_profile": {},
+        "data_profile": {},
+        "data_quality": {},
+        "visualization": {},
+        "anomaly_events": [],
+        "model_selection": {},
+        "detector_validation": {},
+        "operating_regimes": {},
+        "relationship_diagnostics": [],
+        "root_cause_diagnoses": [],
+        "historical_case_matches": {},
+        "work_order_drafts": [],
+        "forecast_results": {},
+        "risk_alerts": [],
+        "recommendations": [],
+        "execution_trace": [],
+        "agent_decisions": [
+            {
+                "decision_id": "model_routing",
+                "stage": "工具编排",
+                "title": "选择主异常检测模型",
+                "status": "已决策",
+                "trigger": "任务目标已确定",
+                "evidence": ["传感器数量：2"],
+                "rule": "冻结策略",
+                "action": "调用时频关系多路径检测器",
+                "target": "分析任务",
+                "confidence": "冻结规则",
+                "human_gate": "企业数据接入后复核",
+                "rollback_condition": "运行失败时回退",
+            }
+        ],
+        "summary": {},
+        "limitations": [],
+    }
+
+    monkeypatch.setattr(server, "_result_payload", lambda _run_id, _result: payload)
+    result = _quick_analysis_payload("run_test", object())
+    assert result["agent_decisions"][0]["decision_id"] == "model_routing"
 
 
 def test_wanwu_schema_declares_api_key_when_remote_auth_is_enabled() -> None:

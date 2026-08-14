@@ -122,6 +122,8 @@ class AnalysisResponse(StrictApiModel):
     optimization_recommendations: list[dict[str, Any]] = Field(default_factory=list)
     # 旧数据库结果没有执行轨迹，默认空列表保证历史任务仍能正常打开。
     execution_trace: list[dict[str, Any]] = Field(default_factory=list)
+    # 决策台账是后续版本新增字段；旧任务没有该字段时按空列表兼容读取。
+    agent_decisions: list[dict[str, Any]] = Field(default_factory=list)
     summary: dict[str, Any]
     limitations: list[str]
     automatic_diagnosis: dict[str, Any] | None = None
@@ -263,6 +265,192 @@ class RunIdRequest(StrictApiModel):
     """万悟工具不替换路径参数，因此统一在 JSON 中传递 run_id。"""
 
     run_id: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+
+
+class WanwuAutonomousCycleRequest(StrictApiModel):
+    """万悟无人值守工作流一次巡检周期的输入。"""
+
+    source_id: str | None = Field(
+        default=None,
+        min_length=4,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_-]+$",
+        description="留空时轮询到期数据源；填写时立即轮询指定数据源",
+    )
+    max_sources: int = Field(
+        default=1,
+        ge=1,
+        le=1,
+        description="当前工作流单轮固定处理一个数据源，保证每个任务完整追踪",
+    )
+
+
+class WanwuAutonomousCycleResponse(StrictApiModel):
+    """万悟选择器节点可直接读取的巡检周期结果。"""
+
+    status: Literal["success"]
+    cycle_status: Literal["no_data", "analysis_queued", "partial_failure", "busy"]
+    orchestrator: Literal["backend", "wanwu"]
+    polled_source_count: int
+    detected_count: int
+    submitted_count: int
+    duplicate_count: int
+    failed_count: int
+    run_ids: list[str]
+    primary_run_id: str | None = None
+    polls: list[dict[str, Any]]
+    next_action: str
+
+
+class WanwuMonitoringStatusRequest(StrictApiModel):
+    """限制万悟状态节点返回的审计记录数量。"""
+
+    limit: int = Field(default=20, ge=1, le=100)
+
+
+class WanwuMonitoringStatusResponse(StrictApiModel):
+    """万悟工作流和辅助智能体共用的无人值守运行状态。"""
+
+    status: Literal["success"]
+    orchestrator: Literal["backend", "wanwu"]
+    monitor: dict[str, Any]
+    notification_channels: dict[str, Any]
+    source_count: int
+    enabled_source_count: int
+    sources: list[dict[str, Any]]
+    ingestions: list[dict[str, Any]]
+    notifications: list[dict[str, Any]]
+
+
+class WanwuDataSourceListRequest(StrictApiModel):
+    """万悟查询工业数据源时使用的精简条件。"""
+
+    enabled_only: bool = Field(default=False, description="仅返回已启用的数据源")
+    source_type: Literal["directory", "http_csv"] | None = Field(
+        default=None,
+        description="按目录监控或 HTTP CSV 接口筛选；留空返回全部",
+    )
+
+
+class WanwuDataSourceView(StrictApiModel):
+    """不含鉴权请求头的数据源公开视图，字段可被万悟画布直接引用。"""
+
+    source_id: str
+    name: str
+    source_type: Literal["directory", "http_csv"]
+    endpoint: str
+    interval_seconds: float
+    enabled: bool
+    analysis_config: dict[str, Any]
+    routing: dict[str, Any]
+    initial_scan_mode: Literal["latest", "new_only", "all"]
+    timeout_seconds: float
+    last_poll_at: str | None = None
+    last_success_at: str | None = None
+    last_error: str | None = None
+    created_at: str
+    updated_at: str
+    request_header_count: int
+
+
+class WanwuDataSourceListResponse(StrictApiModel):
+    """万悟可直接展示或交给选择器使用的数据源清单。"""
+
+    status: Literal["success"]
+    orchestrator: Literal["backend", "wanwu"]
+    source_count: int
+    enabled_source_count: int
+    sources: list[WanwuDataSourceView]
+
+
+class WanwuDataSourceConfigureRequest(StrictApiModel):
+    """万悟配置数据源所需的最小业务字段，不接收密钥。"""
+
+    source_id: str | None = Field(
+        default=None,
+        min_length=6,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_-]+$",
+        description="留空时新建；填写已有编号时更新并保留分析、路由和鉴权配置",
+    )
+    name: str = Field(min_length=2, max_length=100, description="数据源名称")
+    source_type: Literal["directory", "http_csv"] = Field(
+        description="directory 为后端可访问目录，http_csv 为返回 CSV 的 HTTP 接口"
+    )
+    endpoint: str = Field(
+        min_length=1,
+        max_length=2000,
+        description="监控目录绝对路径或 HTTP CSV 地址",
+    )
+    interval_seconds: float = Field(
+        default=60,
+        ge=1,
+        le=86400,
+        description="数据源达到再次巡检条件的时间间隔",
+    )
+    enabled: bool = Field(default=True, description="是否允许无人值守工作流巡检")
+    timeout_seconds: float = Field(
+        default=15,
+        ge=1,
+        le=120,
+        description="HTTP 数据源连接超时；目录数据源保留该配置但不使用",
+    )
+    initial_scan_mode: Literal["latest", "new_only", "all"] = Field(
+        default="new_only",
+        description="首次巡检处理最新批次、只等待新批次或处理全部历史批次",
+    )
+
+
+class WanwuDataSourceConfigureResponse(StrictApiModel):
+    """数据源持久化结果，不回显请求头和外部通知密钥。"""
+
+    status: Literal["success"]
+    action: Literal["created", "updated"]
+    orchestrator: Literal["backend", "wanwu"]
+    source: WanwuDataSourceView
+    next_action: str
+
+
+class WanwuDataSourceVerifyRequest(StrictApiModel):
+    """验证一个已保存数据源，不采集、不分析也不改变轮询时间。"""
+
+    source_id: str = Field(
+        min_length=6,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
+
+
+class WanwuDataSourceVerifyResponse(StrictApiModel):
+    """万悟数据源验收节点使用的稳定响应。"""
+
+    status: Literal["success"]
+    source_id: str
+    source_type: Literal["directory", "http_csv"]
+    reachable: bool
+    csv_file_count: int | None = None
+    latest_file_name: str | None = None
+    latest_file_size_bytes: int | None = None
+    http_status: int | None = None
+    content_type: str | None = None
+    sample_bytes_read: int | None = None
+    checked_at: str
+    message: str
+
+
+class WanwuNotificationDispatchRequest(RunIdRequest):
+    """分析成功后由万悟工作流显式触发主动通知。"""
+
+
+class WanwuNotificationDispatchResponse(StrictApiModel):
+    """通知工具返回投递数量与各渠道状态，不包含企业微信密钥。"""
+
+    status: Literal["success"]
+    run_id: str
+    notification_count: int
+    sent_count: int
+    failed_count: int
+    notifications: list[dict[str, Any]]
 
 
 class WanwuWorkOrderListRequest(StrictApiModel):

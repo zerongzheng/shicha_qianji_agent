@@ -15,6 +15,7 @@ from app.config import get_settings
 from app.experiments import (
     analyze_skab_system_effectiveness,
     build_competition_report,
+    build_innovation_evidence,
     evaluate_detector_consensus,
     evaluate_event_policy,
     evaluate_forecast_effectiveness,
@@ -127,6 +128,16 @@ def main() -> None:
         help="重新运行固定划分实验后生成校赛汇总，耗时较长",
     )
     parser.add_argument(
+        "--innovation-evidence",
+        action="store_true",
+        help="生成总体、分场景、目标路由和路径消融创新证据矩阵",
+    )
+    parser.add_argument(
+        "--rerun-innovation-evidence",
+        action="store_true",
+        help="重新运行校赛实验和时频关系路径消融，再生成创新证据矩阵，耗时较长",
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="执行不依赖大模型和万悟的本地项目自检",
@@ -185,7 +196,24 @@ def main() -> None:
         contamination=args.contamination,
     )
 
-    if args.tune_event_policy:
+    if args.innovation_evidence or args.rerun_innovation_evidence:
+        evidence = build_innovation_evidence(
+            args.data_root,
+            rerun_experiments=args.rerun_innovation_evidence,
+            rerun_ablation=args.rerun_innovation_evidence,
+        )
+        summary = {
+            "report_path": str(evidence.report_path),
+            "overall_csv_path": str(evidence.overall_csv_path),
+            "scenario_csv_path": str(evidence.scenario_csv_path),
+            "routing_csv_path": str(evidence.routing_csv_path),
+            "ablation_csv_path": str(evidence.ablation_csv_path),
+            "ablation_source_path": str(evidence.ablation_source_path)
+            if evidence.ablation_source_path
+            else None,
+            "ablation_protocol_status": evidence.ablation_protocol_status,
+        }
+    elif args.tune_event_policy:
         evaluation = evaluate_event_policy(args.data_root)
         summary = {
             "recommended": evaluation.recommended,

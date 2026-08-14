@@ -12,15 +12,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import psycopg
@@ -76,7 +75,7 @@ class IndustrialRepository:
         self._initialize()
 
     @contextmanager
-    def _connect(self) -> Iterator["PostgresConnection"]:
+    def _connect(self) -> Iterator[PostgresConnection]:
         """为每次操作创建短连接，适配 FastAPI 多线程请求。"""
 
         raw = psycopg.connect(self.database_url, row_factory=dict_row, connect_timeout=10)
@@ -908,47 +907,6 @@ class IndustrialRepository:
                 ),
             )
 
-    def record_local_analysis(
-        self,
-        source_path: str | Path,
-        operation: str,
-        detector: str,
-        config: dict[str, Any],
-        result: Any,
-    ) -> str:
-        """把 Streamlit 直接完成的分析也写入任务表，形成可回写闭环。
-
-        FastAPI 异步任务天然会记录 ``analysis_runs``，但 Streamlit 为了交互速度会直接
-        调用分析流水线。若不在这里补一次持久化，页面上生成的工单无法被现场确认，也不会
-        沉淀为下一次分析可检索的历史案例。因此本方法复用同一套 PostgreSQL 表和工单结构。
-        """
-
-        source = Path(source_path).expanduser().resolve()
-        if not source.is_file():
-            raise FileNotFoundError(f"分析文件不存在：{source}")
-        file_id = f"local-{_sha256(source)[:24]}"
-        run_id = f"run-local-{uuid.uuid4().hex[:20]}"
-        self.register_file(file_id, source.name, source)
-        started = time.perf_counter()
-        self.start_run(run_id, file_id, operation, detector, config, status="running")
-        try:
-            payload = _analysis_result_record(run_id, result)
-            self.finish_run(
-                run_id,
-                status="success",
-                duration_ms=(time.perf_counter() - started) * 1000,
-                result=payload,
-            )
-        except Exception as exc:
-            self.finish_run(
-                run_id,
-                status="failed",
-                duration_ms=(time.perf_counter() - started) * 1000,
-                error=str(exc),
-            )
-            raise
-        return run_id
-
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         """读取单次任务及其完整结构化结果。"""
 
@@ -1739,6 +1697,10 @@ def _analysis_result_record(run_id: str, result: Any) -> dict[str, Any]:
         "forecast_results": result.forecast_results,
         "risk_alerts": result.risk_alerts,
         "recommendations": result.recommendations,
+        # 兼容升级前的分析结果替身和旧历史对象；新流水线会始终写入完整台账。
+        "agent_decisions": [
+            asdict(item) for item in getattr(result, "agent_decisions", [])
+        ],
         "summary": result.to_summary(),
     }
 

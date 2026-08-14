@@ -18,6 +18,12 @@ EXPECTED_OPERATION_IDS = {
     "list_industrial_work_orders",
     "update_industrial_work_order",
     "list_industrial_feedback_cases",
+    "run_unattended_industrial_cycle",
+    "get_unattended_monitoring_status",
+    "dispatch_industrial_alerts",
+    "list_industrial_data_sources",
+    "configure_industrial_data_source",
+    "verify_industrial_data_source",
 }
 
 

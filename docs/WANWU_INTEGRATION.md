@@ -6,10 +6,11 @@
 ## 调用链
 
 ```text
-万悟 Agent / Workflow
-    -> 文件节点获得 CSV 临时 URL，或将小文件转换为 Base64
-    -> 比赛演示：POST /api/v1/wanwu/quick-diagnosis，一次返回确定性分析和中文摘要
-    -> 正式工程：POST /api/v1/wanwu/jobs/submit，保存 run_id 后轮询状态和结果
+外部定时器（只提供时间信号）
+    -> 调用已发布的万悟工作流 OpenAPI
+    -> run_unattended_industrial_cycle 自动发现新数据并返回 run_id
+    -> 万悟循环查询任务状态并读取结构化结果
+    -> dispatch_industrial_alerts 完成分级路由和企业微信推送
     -> 万悟直接展示异常证据、趋势预警和处置顺序
     -> 查询 GET /api/v1/work-orders 展示待办工单
     -> PATCH /api/v1/work-orders/{record_id} 回写现场结果
@@ -29,8 +30,8 @@
 
 因此，万悟不应直接使用普通 `/api/v1/files` 和带路径参数的任务接口。项目新增的
 `/api/v1/wanwu/*` 全部使用 `POST + application/json`，文件通过临时下载 URL 或 Base64
-传入，`run_id` 和 `record_id` 也都放在 JSON 请求体中。普通接口仍为 Vue3 工作台、
-Streamlit 备用页面和其他标准客户端保留。
+传入，`run_id` 和 `record_id` 也都放在 JSON 请求体中。普通接口仍为 Vue3 工作台和
+其他标准客户端保留。
 
 精简 OpenAPI：
 
@@ -38,8 +39,9 @@ Streamlit 备用页面和其他标准客户端保留。
 http://host.docker.internal:8000/integrations/wanwu/openapi.json
 ```
 
-它包含八个万悟可稳定调用的工具，并为每个工具固定英文 `operationId`。其中
-`quick_industrial_diagnosis` 是低调用额度演示入口。
+它包含十四个万悟可稳定调用的工具，并为每个工具固定英文 `operationId`。其中三个数据源工具
+负责查询、配置和只读验收，三个无人值守工具负责巡检周期、运行状态和主动告警；
+`quick_industrial_diagnosis` 保留为人工上传调试入口。
 
 比赛演示专用 Schema：
 
@@ -48,7 +50,8 @@ http://host.docker.internal:8000/integrations/wanwu/quick-openapi.json
 ```
 
 该地址只暴露 `quick_industrial_diagnosis` 一个工具。创建比赛演示智能体时应优先导入这个地址；
-完整八工具 Schema 留给后续正式工作流，不要把两份 Schema 同时绑定到同一个演示智能体。
+完整十四工具 Schema 用于数据源配置和无人值守工作流；单工具 Schema 只用于人工上传调试，不要把两份
+Schema 同时绑定到同一个辅助智能体。
 
 ## 低调用额度快速诊断
 
@@ -75,7 +78,7 @@ POST /api/v1/wanwu/quick-diagnosis
 四模型严格多数共识会损失事件召回，因此当前只作为可信度证据，不直接抑制主模型告警。
 
 这不是删除大模型能力，而是把比赛现场的第一轮结果交给确定性算法完成；`/api/v1/diagnose`
-仍保留给 Streamlit 和需要高质量自然语言诊断的本地流程。
+仍保留给 Vue3 调试页和需要高质量自然语言诊断的受控流程。
 
 ## 启动本地分析服务
 
@@ -373,7 +376,7 @@ uv run python api_main.py
 uv run shichi-qianji-wanwu-check
 ```
 
-第二条命令会检查健康状态、完整八个万悟工具、快速单工具 Schema 和 OpenAPI 服务地址，并同时导出：
+第二条命令会检查健康状态、完整十四个万悟工具、快速单工具 Schema 和 OpenAPI 服务地址，并同时导出：
 
 ```text
 outputs/wanwu_openapi.json
@@ -437,7 +440,7 @@ bash scripts/check_wanwu_server.sh
 ## 比赛接口额度
 
 比赛方规定聊天、Embedding 等每个接口每分钟最多调用 5 次。项目已经在
-`outputs/rate_limits/` 中按接口维护跨进程请求间隔，避免 Vue3、Streamlit、FastAPI 和命令行
+`outputs/rate_limits/` 中按接口维护跨进程请求间隔，避免 Vue3、万悟、FastAPI 和命令行
 同时调用时互相抢占额度。`/api/v1/diagnose` 只使用一次聊天请求；多轮工具 Agent 通常包含
 两次以上聊天请求，因此仅适合用户后续追问。
 

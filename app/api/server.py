@@ -1,13 +1,15 @@
 """时察千机 REST API。
 
-接口使用受控 `file_id`，不接受任意服务器路径。万悟可通过 API 节点调用这些接口；本地
-Streamlit 仍然直接调用分析核心，方便开发阶段离线运行。
+接口使用受控 `file_id`，不接受任意服务器路径。Vue3 工作台和万悟工作流均通过这些接口
+调用统一的分析、任务、工单和审计能力。
 """
 
 from __future__ import annotations
 
 import hashlib
 import secrets
+import urllib.error
+import urllib.request
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -18,6 +20,8 @@ from typing import Annotated, Any
 from urllib.parse import urlparse
 
 import psycopg
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.analysis.detection import (
     DETECTOR_RECOMMENDED_THRESHOLDS,
@@ -46,9 +50,21 @@ from app.api.schemas import (
     ModelCompareRequest,
     NotificationAcknowledgeRequest,
     RunIdRequest,
+    WanwuAutonomousCycleRequest,
+    WanwuAutonomousCycleResponse,
     WanwuCaseListRequest,
+    WanwuDataSourceConfigureRequest,
+    WanwuDataSourceConfigureResponse,
+    WanwuDataSourceListRequest,
+    WanwuDataSourceListResponse,
+    WanwuDataSourceVerifyRequest,
+    WanwuDataSourceVerifyResponse,
     WanwuJobAcceptedResponse,
     WanwuJobCreateRequest,
+    WanwuMonitoringStatusRequest,
+    WanwuMonitoringStatusResponse,
+    WanwuNotificationDispatchRequest,
+    WanwuNotificationDispatchResponse,
     WanwuQuickDiagnosisRequest,
     WanwuQuickDiagnosisResponse,
     WanwuWorkOrderListRequest,
@@ -83,15 +99,6 @@ from app.security import (
 )
 from app.storage import get_repository
 
-try:
-    from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
-    from fastapi.middleware.cors import CORSMiddleware
-except ImportError:  # 让未安装 API 依赖时，核心分析和 Streamlit 仍可用。
-    FastAPI = None
-    Depends = File = Header = UploadFile = Any
-    CORSMiddleware = None
-
-
 settings = get_settings()
 UPLOAD_DIR = settings.output_dir / "api_uploads"
 # 快速诊断会按文件哈希复用历史结果。每当分析管线或返回证据发生实质升级时必须递增
@@ -115,7 +122,11 @@ async def _lifespan(_app: Any):
         if hasattr(repository, "list_data_sources")
         else []
     )
-    if getattr(settings, "automatic_monitor_enabled", False) or enabled_sources:
+    # 万悟编排模式下，定时脚本通过万悟工作流调用巡检工具。此处不能再启动后端轮询线程，
+    # 否则业务会绕过万悟执行，平台也看不到完整的自动化运行记录。
+    if settings.automation_orchestrator == "backend" and (
+        getattr(settings, "automatic_monitor_enabled", False) or enabled_sources
+    ):
         monitor.start()
     try:
         yield
@@ -375,7 +386,9 @@ def _parse_bool(value: Any) -> bool:
     raise ValueError("布尔配置只能使用 true/false、1/0 或 yes/no。")
 
 
-def _validate_data_source(payload: DataSourceRequest) -> None:
+def _validate_data_source(
+    payload: DataSourceRequest | WanwuDataSourceConfigureRequest,
+) -> None:
     """在保存前验证数据源端点，避免轮询线程长期重复报告固定配置错误。"""
 
     if payload.source_type == "directory":
@@ -386,6 +399,111 @@ def _validate_data_source(payload: DataSourceRequest) -> None:
     parsed = urlparse(payload.endpoint)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise HTTPException(status_code=400, detail="HTTP 数据源必须是有效的 http/https 地址")
+
+
+def _wanwu_data_source_config(
+    payload: WanwuDataSourceConfigureRequest,
+    existing: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """把万悟精简表单转换为完整配置，并保留后端维护的敏感字段。"""
+
+    existing_config = existing or {}
+    same_endpoint = bool(
+        existing
+        and existing.get("source_type") == payload.source_type
+        and existing.get("endpoint") == payload.endpoint.strip()
+    )
+    # 万悟工具不接收接口密钥。只有端点没有变化时才保留原鉴权头，避免把旧密钥
+    # 意外发送到新地址；新端点的密钥仍由受控前端或部署环境配置。
+    request_headers = existing_config.get("request_headers", {}) if same_endpoint else {}
+    return {
+        "timeout_seconds": payload.timeout_seconds,
+        "initial_scan_mode": payload.initial_scan_mode,
+        "request_headers": request_headers,
+        "analysis_config": existing_config.get("analysis_config", {}),
+        "routing": existing_config.get("routing", {}),
+    }
+
+
+def _verify_data_source_connection(source: dict[str, Any]) -> dict[str, Any]:
+    """只验证端点与 CSV 可读性，不登记批次、不改变轮询状态。"""
+
+    checked_at = datetime.now().astimezone().isoformat()
+    source_id = str(source["source_id"])
+    source_type = str(source["source_type"])
+    common = {
+        "status": "success",
+        "source_id": source_id,
+        "source_type": source_type,
+        "checked_at": checked_at,
+    }
+    if source_type == "directory":
+        directory = Path(str(source["endpoint"])).expanduser().resolve()
+        try:
+            if not directory.is_dir():
+                raise NotADirectoryError(f"监控目录不存在：{directory}")
+            csv_paths = sorted(
+                directory.glob("*.csv"),
+                key=lambda path: max(path.stat().st_mtime, path.stat().st_ctime),
+            )
+            latest = csv_paths[-1] if csv_paths else None
+            if latest is not None:
+                # 实际读取一个字节，确认不仅能列目录，也具备文件读取权限。
+                with latest.open("rb") as stream:
+                    stream.read(1)
+            return {
+                **common,
+                "reachable": True,
+                "csv_file_count": len(csv_paths),
+                "latest_file_name": latest.name if latest else None,
+                "latest_file_size_bytes": latest.stat().st_size if latest else None,
+                "message": (
+                    f"目录可访问，发现 {len(csv_paths)} 个 CSV 文件"
+                    if csv_paths
+                    else "目录可访问，当前没有 CSV；系统将等待新批次"
+                ),
+            }
+        except OSError as exc:
+            return {
+                **common,
+                "reachable": False,
+                "csv_file_count": 0,
+                "message": str(exc),
+            }
+
+    headers = {"Accept": "text/csv,application/csv,text/plain"}
+    headers.update(source.get("request_headers") or {})
+    request = urllib.request.Request(str(source["endpoint"]), headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=float(source.get("timeout_seconds", 15)),
+        ) as response:
+            sample = response.read(65536)
+            http_status = int(response.getcode())
+            content_type = str(response.headers.get("Content-Type", ""))
+        first_line = sample.splitlines()[0] if sample else b""
+        looks_like_csv = any(separator in first_line for separator in (b",", b";", b"\t"))
+        reachable = bool(sample) and looks_like_csv
+        return {
+            **common,
+            "reachable": reachable,
+            "http_status": http_status,
+            "content_type": content_type,
+            "sample_bytes_read": len(sample),
+            "message": (
+                "HTTP 接口可访问，响应内容符合 CSV 基本结构"
+                if reachable
+                else "HTTP 接口可访问，但响应为空或首行不符合 CSV 基本结构"
+            ),
+        }
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as exc:
+        return {
+            **common,
+            "reachable": False,
+            "http_status": getattr(exc, "code", None),
+            "message": f"HTTP 数据源连接失败：{exc.reason if hasattr(exc, 'reason') else exc}",
+        }
 
 
 def _public_data_source(source: dict[str, Any]) -> dict[str, Any]:
@@ -402,6 +520,34 @@ def _public_data_source(source: dict[str, Any]) -> dict[str, Any]:
     public_source["routing"] = routing
     public_source["request_header_count"] = len(source.get("request_headers") or {})
     return public_source
+
+
+def _monitoring_status_payload(*, limit: int = 100) -> dict[str, Any]:
+    """汇总无人值守链路状态，并统一移除快照路径和数据源密钥。"""
+
+    repository = get_repository()
+    sources = [_public_data_source(item) for item in repository.list_data_sources()]
+    ingestions = [
+        {key: value for key, value in item.items() if key != "storage_path"}
+        for item in repository.list_ingestions(limit=limit)
+    ]
+    notifications = repository.list_notifications(limit=limit)
+    return {
+        "status": "success",
+        "orchestrator": settings.automation_orchestrator,
+        "monitor": get_monitoring_service().status(),
+        "notification_channels": {
+            "wecom": {
+                "enabled": settings.wecom_enabled,
+                "configured": bool(settings.wecom_webhook_url),
+            }
+        },
+        "source_count": len(sources),
+        "enabled_source_count": sum(int(item["enabled"]) for item in sources),
+        "sources": sources,
+        "ingestions": ingestions,
+        "notifications": notifications,
+    }
 
 
 def _result_payload(run_id: str, result: Any) -> dict[str, Any]:
@@ -501,6 +647,7 @@ def _result_payload(run_id: str, result: Any) -> dict[str, Any]:
             asdict(item) for item in result.optimization_recommendations
         ],
         "execution_trace": [asdict(item) for item in result.execution_trace],
+        "agent_decisions": [asdict(item) for item in result.agent_decisions],
         "summary": summary,
         "limitations": [
             "预测模型由滚动回测自动选择，仍需结合现场工况、设备边界和人工复核确认。",
@@ -976,6 +1123,7 @@ def _quick_analysis_payload(run_id: str, result: Any) -> dict[str, Any]:
         "risk_alerts": full["risk_alerts"][:10],
         "recommendations": full["recommendations"][:10],
         "execution_trace": full["execution_trace"],
+        "agent_decisions": full["agent_decisions"],
         "summary": full["summary"],
         "limitations": full["limitations"],
     }
@@ -1087,17 +1235,19 @@ def _execute_analysis_job(
         output_summary,
     )
     _finish_persisted_run(log_record, response=response)
-    # 通知是分析后的主动动作。投递失败只进入通知审计，不覆盖已成功的分析和工单。
-    try:
-        dispatch_run_notifications(repository, run_id)
-    except Exception as exc:  # noqa: BLE001 - 通知通道故障不能改变分析任务事实状态。
-        source = repository.get_data_source_for_run(run_id)
-        if source is not None:
-            repository.record_source_poll(
-                str(source["source_id"]),
-                success=True,
-                error=f"通知投递失败：{exc}",
-            )
+    # 后端编排模式保持分析后自动通知；万悟编排模式由工作流的通知节点显式调用，
+    # 从而让评委能在平台执行记录中看到“分析完成 -> 分级路由 -> 主动推送”。
+    if settings.automation_orchestrator == "backend":
+        try:
+            dispatch_run_notifications(repository, run_id)
+        except Exception as exc:  # noqa: BLE001 - 通知故障不能改变分析任务事实状态。
+            source = repository.get_data_source_for_run(run_id)
+            if source is not None:
+                repository.record_source_poll(
+                    str(source["source_id"]),
+                    success=True,
+                    error=f"通知投递失败：{exc}",
+                )
 
 
 if app:
@@ -1784,6 +1934,213 @@ if app:
         return response
 
     @app.post(
+        "/api/v1/wanwu/data-sources/list",
+        operation_id="list_industrial_data_sources",
+        summary="查询工业自动数据源",
+        response_model=WanwuDataSourceListResponse,
+    )
+    def wanwu_list_data_sources(
+        payload: WanwuDataSourceListRequest,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """让万悟配置工作流读取当前数据源编号、启停状态和最近巡检结果。"""
+
+        _check_api_key(x_api_key)
+        sources = get_repository().list_data_sources(enabled_only=payload.enabled_only)
+        if payload.source_type:
+            sources = [
+                source for source in sources if source["source_type"] == payload.source_type
+            ]
+        public_sources = [_public_data_source(source) for source in sources]
+        return {
+            "status": "success",
+            "orchestrator": settings.automation_orchestrator,
+            "source_count": len(public_sources),
+            "enabled_source_count": sum(int(source["enabled"]) for source in public_sources),
+            "sources": public_sources,
+        }
+
+    @app.post(
+        "/api/v1/wanwu/data-sources/configure",
+        operation_id="configure_industrial_data_source",
+        summary="新建或修改工业自动数据源",
+        response_model=WanwuDataSourceConfigureResponse,
+        responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+    )
+    def wanwu_configure_data_source(
+        payload: WanwuDataSourceConfigureRequest,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """从万悟持久化精简配置，分析参数、路由和密钥仍由后端安全管理。"""
+
+        _check_api_key(x_api_key)
+        repository = get_repository()
+        existing = repository.get_data_source(payload.source_id) if payload.source_id else None
+        if payload.source_id and existing is None:
+            raise HTTPException(status_code=404, detail=f"找不到数据源：{payload.source_id}")
+        _validate_data_source(payload)
+        source = repository.upsert_data_source(
+            {
+                "source_id": payload.source_id,
+                "name": payload.name,
+                "source_type": payload.source_type,
+                "endpoint": payload.endpoint,
+                "interval_seconds": payload.interval_seconds,
+                "enabled": payload.enabled,
+                "config": _wanwu_data_source_config(payload, existing),
+            }
+        )
+        action = "updated" if existing else "created"
+        return {
+            "status": "success",
+            "action": action,
+            "orchestrator": settings.automation_orchestrator,
+            "source": _public_data_source(source),
+            "next_action": (
+                "调用 verify_industrial_data_source 验证连通性；验证成功后把 source_id "
+                "传给无人值守巡检工作流"
+            ),
+        }
+
+    @app.post(
+        "/api/v1/wanwu/data-sources/verify",
+        operation_id="verify_industrial_data_source",
+        summary="验证工业数据源连通性",
+        response_model=WanwuDataSourceVerifyResponse,
+        responses={404: {"model": ErrorResponse}},
+    )
+    def wanwu_verify_data_source(
+        payload: WanwuDataSourceVerifyRequest,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """只执行只读连通性检查，不登记批次，也不会抢先消费待分析数据。"""
+
+        _check_api_key(x_api_key)
+        source = get_repository().get_data_source(payload.source_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail=f"找不到数据源：{payload.source_id}")
+        return _verify_data_source_connection(source)
+
+    @app.post(
+        "/api/v1/wanwu/automation/cycle",
+        operation_id="run_unattended_industrial_cycle",
+        summary="执行一次无人值守工业数据巡检",
+        response_model=WanwuAutonomousCycleResponse,
+        responses={404: {"model": ErrorResponse}},
+    )
+    def wanwu_autonomous_cycle(
+        payload: WanwuAutonomousCycleRequest,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """由万悟工作流触发采集，只提交新批次，不在 HTTP 请求内等待分析完成。
+
+        此工具本身不调用大模型。工作流根据 ``primary_run_id`` 进入现有任务状态轮询，
+        因而采集、计算、判断、派单和通知各阶段都能在万悟运行记录中被观察。
+        """
+
+        _check_api_key(x_api_key)
+        monitor = get_monitoring_service()
+        if payload.source_id:
+            try:
+                polls = [monitor.poll_once(payload.source_id, max_submissions=1)]
+            except LookupError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+        else:
+            was_busy = bool(monitor.status().get("poll_in_progress"))
+            polls = monitor.poll_due_sources_detailed(
+                max_sources=payload.max_sources,
+                max_submissions_per_source=1,
+            )
+            if was_busy and not polls:
+                cycle_status = "busy"
+            else:
+                cycle_status = "no_data"
+
+        run_ids = [
+            str(run_id)
+            for poll in polls
+            for run_id in poll.get("run_ids", [])
+            if run_id
+        ]
+        detected = sum(int(item.get("detected", 0)) for item in polls)
+        submitted = sum(int(item.get("submitted", 0)) for item in polls)
+        duplicates = sum(int(item.get("duplicates", 0)) for item in polls)
+        failed = sum(int(item.get("failed", 0)) for item in polls)
+        if failed:
+            cycle_status = "partial_failure"
+        elif run_ids:
+            cycle_status = "analysis_queued"
+        elif "cycle_status" not in locals():
+            cycle_status = "no_data"
+        next_action = (
+            "使用 primary_run_id 查询任务状态，成功后获取结果并派发通知"
+            if run_ids
+            else "本轮没有新数据，结束工作流并等待下一次定时触发"
+        )
+        return {
+            "status": "success",
+            "cycle_status": cycle_status,
+            "orchestrator": settings.automation_orchestrator,
+            "polled_source_count": len(polls),
+            "detected_count": detected,
+            "submitted_count": submitted,
+            "duplicate_count": duplicates,
+            "failed_count": failed,
+            "run_ids": run_ids,
+            "primary_run_id": run_ids[0] if run_ids else None,
+            "polls": polls,
+            "next_action": next_action,
+        }
+
+    @app.post(
+        "/api/v1/wanwu/automation/status",
+        operation_id="get_unattended_monitoring_status",
+        summary="查询无人值守巡检与主动通知状态",
+        response_model=WanwuMonitoringStatusResponse,
+    )
+    def wanwu_monitoring_status(
+        payload: WanwuMonitoringStatusRequest,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """供万悟状态节点和辅助问答读取最近采集、任务与通知记录。"""
+
+        _check_api_key(x_api_key)
+        return _monitoring_status_payload(limit=payload.limit)
+
+    @app.post(
+        "/api/v1/wanwu/automation/notifications/dispatch",
+        operation_id="dispatch_industrial_alerts",
+        summary="按风险等级派发工业告警",
+        response_model=WanwuNotificationDispatchResponse,
+        responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+    )
+    def wanwu_dispatch_notifications(
+        payload: WanwuNotificationDispatchRequest,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """由万悟工作流在分析成功后主动调用；重复调用不会重复发送成功告警。"""
+
+        _check_api_key(x_api_key)
+        run = get_repository().get_run(payload.run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="找不到对应分析任务")
+        if run["status"] != "success":
+            raise HTTPException(status_code=409, detail="分析尚未成功，不能派发告警")
+        notifications = dispatch_run_notifications(get_repository(), payload.run_id)
+        public_notifications = [
+            {key: value for key, value in item.items() if key not in {"error"}}
+            for item in notifications
+        ]
+        return {
+            "status": "success",
+            "run_id": payload.run_id,
+            "notification_count": len(public_notifications),
+            "sent_count": sum(item.get("status") == "sent" for item in public_notifications),
+            "failed_count": sum(item.get("status") == "failed" for item in public_notifications),
+            "notifications": public_notifications,
+        }
+
+    @app.post(
         "/api/v1/wanwu/jobs/status",
         operation_id="get_industrial_analysis_status",
         summary="查询工业分析任务状态",
@@ -1950,29 +2307,7 @@ if app:
         """返回无人值守监测、采集批次和通知的统一看板数据。"""
 
         _check_api_key(x_api_key)
-        repository = get_repository()
-        sources = [_public_data_source(item) for item in repository.list_data_sources()]
-        # 本机快照路径只供后端复现分析，不通过看板接口暴露。
-        ingestions = [
-            {key: value for key, value in item.items() if key != "storage_path"}
-            for item in repository.list_ingestions(limit=100)
-        ]
-        notifications = repository.list_notifications(limit=100)
-        return {
-            "status": "success",
-            "monitor": get_monitoring_service().status(),
-            "notification_channels": {
-                "wecom": {
-                    "enabled": settings.wecom_enabled,
-                    "configured": bool(settings.wecom_webhook_url),
-                }
-            },
-            "source_count": len(sources),
-            "enabled_source_count": sum(int(item["enabled"]) for item in sources),
-            "sources": sources,
-            "ingestions": ingestions,
-            "notifications": notifications,
-        }
+        return _monitoring_status_payload(limit=100)
 
     @app.post("/api/v1/monitoring/sources")
     def save_monitoring_source(
@@ -2000,7 +2335,7 @@ if app:
                 },
             }
         )
-        if payload.enabled:
+        if payload.enabled and settings.automation_orchestrator == "backend":
             get_monitoring_service().start()
         return {"status": "success", "source": _public_data_source(source)}
 

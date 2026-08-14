@@ -99,8 +99,8 @@ class _AutoEncoderArtifacts:
     window_size: int
 
 
-# FastAPI 和 Streamlit 会在同一进程中连续分析多份文件。健康基线、传感器字段和模型参数
-# 相同时无需重复训练 AutoEncoder；小型 LRU 缓存可以显著降低批量分析耗时，又不会持久化
+# FastAPI 会在同一进程中连续分析多份文件。健康基线、传感器字段和模型参数相同时无需
+# 重复训练 AutoEncoder；小型 LRU 缓存可以显著降低批量分析耗时，又不会持久化
 # 用户原始数据。锁只保护缓存读写，耗时训练在锁外完成，避免阻塞其他请求。
 _AUTOENCODER_CACHE: OrderedDict[str, _AutoEncoderArtifacts] = OrderedDict()
 _AUTOENCODER_CACHE_LOCK = Lock()

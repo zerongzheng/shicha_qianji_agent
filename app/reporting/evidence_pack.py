@@ -23,6 +23,10 @@ from app.experiments.forecast_effectiveness import (
     ForecastEffectiveness,
     evaluate_forecast_effectiveness,
 )
+from app.experiments.innovation_evidence import (
+    InnovationEvidence,
+    build_innovation_evidence,
+)
 from app.experiments.optimization_effectiveness import (
     OptimizationEffectiveness,
     evaluate_optimization_effectiveness,
@@ -46,6 +50,7 @@ class EvidencePack:
     optimization_effectiveness: OptimizationEffectiveness
     false_positive_analysis: FalsePositiveAnalysis
     system_effectiveness: SystemEffectiveness
+    innovation_evidence: InnovationEvidence
     cases: tuple[CasePackage, ...]
 
 
@@ -94,6 +99,12 @@ def build_evidence_pack(
         output_dir=target / "experiments",
         detector="time_frequency_relation",
     )
+    innovation_evidence = build_innovation_evidence(
+        resolved_data_root,
+        output_dir=target / "experiments",
+        rerun_experiments=rerun_experiments,
+        rerun_ablation=False,
+    )
     case_files = _select_case_files(resolved_data_root, case_count)
     cases = tuple(
         build_case_package(file_path, output_dir=target / "cases")
@@ -109,6 +120,7 @@ def build_evidence_pack(
             optimization_effectiveness,
             false_positive_analysis,
             system_effectiveness,
+            innovation_evidence,
             cases,
         ),
         encoding="utf-8",
@@ -122,6 +134,7 @@ def build_evidence_pack(
         optimization_effectiveness,
         false_positive_analysis,
         system_effectiveness,
+        innovation_evidence,
         cases,
     )
 
@@ -174,6 +187,7 @@ def _build_index(
     optimization_effectiveness: OptimizationEffectiveness,
     false_positive_analysis: FalsePositiveAnalysis,
     system_effectiveness: SystemEffectiveness,
+    innovation_evidence: InnovationEvidence,
     cases: tuple[CasePackage, ...],
 ) -> str:
     """将成果包内容和答辩讲解顺序写成一页索引。"""
@@ -190,10 +204,11 @@ def _build_index(
         "2. 展示多模型共识实验，说明为什么交叉验证只增强可信度、不直接覆盖主告警。",
         "3. 展示趋势预测与提前预警实验，区分 SKAB 时间尾段结果和受控退化模拟。",
         "4. 展示受约束优化建议实验，说明建议如何限幅、观察、回退并保留人工确认。",
-        "5. 展示 `experiments/time_frequency_relation_false_positive_analysis.md`，说明 other 场景的误报来源。",
-        "6. 再展示典型案例中的风险图，说明异常如何从数据中被发现。",
-        "7. 打开案例摘要，沿着“异常事件 - 主导传感器 - 候选原因 - 排查动作”讲解。",
-        "8. 回到 Vue3 的“运维闭环”，演示工单确认、现场反馈和历史案例沉淀。",
+        "5. 展示 `experiments/INNOVATION_EVIDENCE.md`，说明多路径模型、目标路由和分场景证据。",
+        "6. 展示 `experiments/time_frequency_relation_false_positive_analysis.md`，说明 other 场景的误报来源。",
+        "7. 再展示典型案例中的风险图，说明异常如何从数据中被发现。",
+        "8. 打开案例摘要，沿着“异常事件 - 主导传感器 - 候选原因 - 排查动作”讲解。",
+        "9. 回到 Vue3 的“运维闭环”，演示工单确认、现场反馈和历史案例沉淀。",
         "",
         "## 实验材料",
         "",
@@ -202,6 +217,11 @@ def _build_index(
         f"- 数据划分：`{competition.split_path}`",
         f"- 最终评估说明：`{competition.report_path.parent / 'FINAL_EVALUATION.md'}`",
         f"- 能力对比表：`{competition.report_path.parent / 'CAPABILITY_COMPARISON.md'}`",
+        f"- 创新算法证据：`{innovation_evidence.report_path}`",
+        f"- 模型总体矩阵：`{innovation_evidence.overall_csv_path}`",
+        f"- 模型分场景矩阵：`{innovation_evidence.scenario_csv_path}`",
+        f"- 目标路由对照：`{innovation_evidence.routing_csv_path}`",
+        f"- 路径消融矩阵：`{innovation_evidence.ablation_csv_path}`",
         f"- 多模型共识报告：`{consensus_evaluation.report_path}`",
         f"- 多模型共识逐文件记录：`{consensus_evaluation.csv_path}`",
         f"- 共识实验成功记录：{len(consensus_evaluation.records)}；失败文件：{len(consensus_evaluation.failed_files)}",

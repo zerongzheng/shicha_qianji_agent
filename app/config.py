@@ -52,6 +52,7 @@ class Settings:
     forecast_holdout: int
     async_job_workers: int
     async_job_queue_size: int
+    automation_orchestrator: str
     automatic_monitor_enabled: bool
     automatic_monitor_tick_seconds: float
     automatic_monitor_storage_dir: Path
@@ -92,6 +93,10 @@ def _resolve_path(raw_path: str) -> Path:
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     """读取一次配置并缓存，保证整个程序使用同一份参数。"""
+
+    automation_orchestrator = os.getenv("AUTOMATION_ORCHESTRATOR", "backend").strip().lower()
+    if automation_orchestrator not in {"backend", "wanwu"}:
+        raise ValueError("AUTOMATION_ORCHESTRATOR 只能是 backend 或 wanwu")
 
     return Settings(
         project_root=PROJECT_ROOT,
@@ -152,6 +157,7 @@ def get_settings() -> Settings:
         forecast_holdout=int(os.getenv("FORECAST_HOLDOUT", "30")),
         async_job_workers=max(1, int(os.getenv("ASYNC_JOB_WORKERS", "2"))),
         async_job_queue_size=max(0, int(os.getenv("ASYNC_JOB_QUEUE_SIZE", "8"))),
+        automation_orchestrator=automation_orchestrator,
         automatic_monitor_enabled=os.getenv(
             "AUTOMATIC_MONITOR_ENABLED", "false"
         ).strip().lower()

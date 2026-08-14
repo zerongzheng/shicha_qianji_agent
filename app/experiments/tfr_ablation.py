@@ -19,6 +19,7 @@ from app.analysis.evaluation import evaluate_predictions
 from app.analysis.pipeline import analyze_file
 from app.config import get_settings
 from app.experiments.benchmark import BenchmarkResult, run_skab_benchmark
+from app.experiments.protocol import PROTOCOL_VERSION
 from app.experiments.split import ExperimentSplit, build_skab_split
 from app.experiments.tuning import DEFAULT_THRESHOLDS, ThresholdTrial, select_best_trial
 from app.models import AnalysisConfig
@@ -287,6 +288,7 @@ def _build_report(
     lines = [
         "# 时频关系多路径模型消融报告",
         "",
+        f"> 实验协议：`{PROTOCOL_VERSION}`。",
         f"> 数据目录：`{root}`",
         f"> 验证文件：{len(split.validation_files)}；独立测试文件：{len(split.test_files)}。",
         "> 健康基线只用于无监督模型训练和分数校准，异常标签只用于验证与测试评价。",

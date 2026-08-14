@@ -49,7 +49,23 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
         "",
         "> 每一步的输出均保留适用边界；候选根因和工单草案仍需运维人员现场确认。",
         "",
-        "## 3. 数据画像",
+        "## 3. 智能体决策记录",
+        "",
+        "以下内容只记录可核验的业务证据、冻结规则与执行动作，不展示大模型隐式推理。",
+        "",
+        "| 阶段 | 决策 | 状态 | 证据 | 执行动作 | 责任对象 |",
+        "| --- | --- | --- | --- | --- | --- |",
+        *[
+            (
+                f"| {item.stage} | {item.title} | {item.status} | "
+                f"{'；'.join(item.evidence)} | {item.action} | {item.target} |"
+            )
+            for item in result.agent_decisions
+        ],
+        "",
+        "> 每条决策均保留人工闸门和回退条件；系统不直接替代设备安全责任人。",
+        "",
+        "## 4. 数据画像",
         "",
         "| 传感器 | 缺失率 | 最小值 | 最大值 | 均值 | 标准差 |",
         "| --- | ---: | ---: | ---: | ---: | ---: |",
@@ -85,7 +101,7 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
             f"{action.get('method', '未记录')} | {action.get('reason', '未记录')} |"
         )
 
-    lines.extend(["", "## 4. 任务场景模型选择", ""])
+    lines.extend(["", "## 5. 任务场景模型选择", ""])
     selection = result.model_selection
     if not selection:
         lines.append("本次分析未记录模型选择证据。")
@@ -119,7 +135,7 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
                 )
         lines.append("\n> 自动路由只决定本次主模型；互补模型仍通过下一节进行独立交叉核验。")
 
-    lines.extend(["", "## 5. 异常诊断", ""])
+    lines.extend(["", "## 6. 异常诊断", ""])
     if not result.events:
         lines.append("当前参数下未识别到满足持续时长要求的异常事件。")
     else:
@@ -138,7 +154,7 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
                 f"{', '.join(event.dominant_sensors)} |"
             )
 
-    lines.extend(["", "## 6. 多模型交叉验证", ""])
+    lines.extend(["", "## 7. 多模型交叉验证", ""])
     validation = result.detector_validation
     if not validation:
         lines.append("本次未启用多模型交叉验证，主检测结果保持有效。")
@@ -181,7 +197,7 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
             ]
         )
 
-    lines.extend(["", "## 7. 标签评估", ""])
+    lines.extend(["", "## 8. 标签评估", ""])
     if result.metrics is None:
         lines.append("数据中没有 `anomaly` 标签，本次不计算监督评估指标。")
     else:
@@ -215,7 +231,7 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
             ]
         )
 
-    lines.extend(["", "## 8. 趋势与漂移", ""])
+    lines.extend(["", "## 9. 趋势与漂移", ""])
     if not result.trend_summary:
         lines.append("末段数据未出现明显趋势漂移。")
     else:
@@ -232,7 +248,7 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
                 f"{detail['均值偏移标准差']} |"
             )
 
-    lines.extend(["", "## 9. 工况识别与切换证据", ""])
+    lines.extend(["", "## 10. 工况识别与切换证据", ""])
     regimes = result.operating_regimes
     if regimes is None:
         lines.append("本次未执行无监督工况识别。")
@@ -261,7 +277,7 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
             ]
         )
 
-    lines.extend(["", "## 10. 多传感器关系证据", ""])
+    lines.extend(["", "## 11. 多传感器关系证据", ""])
     if not result.relationship_diagnostics:
         lines.append("当前异常事件不足以形成稳定的相关性或时滞判断。")
     else:
@@ -287,7 +303,7 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
                 )
             lines.append("")
 
-    lines.extend(["", "## 11. 候选根因与证据链", ""])
+    lines.extend(["", "## 12. 候选根因与证据链", ""])
     if not result.event_diagnoses:
         lines.append("当前没有异常事件需要生成候选根因。")
     else:
@@ -339,7 +355,7 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
                     ]
                 )
 
-    lines.extend(["", "## 12. 待确认工单草案", ""])
+    lines.extend(["", "## 13. 待确认工单草案", ""])
     if not result.work_order_drafts:
         lines.append("当前没有待生成的处置工单。")
     else:
@@ -362,7 +378,7 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
                 ]
             )
 
-    lines.extend(["", "## 13. 运维处置建议", ""])
+    lines.extend(["", "## 14. 运维处置建议", ""])
     for index, recommendation in enumerate(result.recommendations, start=1):
         lines.append(f"{index}. {recommendation}")
 
@@ -388,7 +404,7 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
             ]
         )
 
-    lines.extend(["", "## 14. 趋势预测与风险预警", ""])
+    lines.extend(["", "## 15. 趋势预测与风险预警", ""])
     if not result.forecast_results:
         lines.append("当前数据长度不足，未生成预测结果。")
     else:
@@ -419,7 +435,7 @@ def build_markdown_report(result: AnalysisResult, config: AnalysisConfig) -> str
     lines.extend(
         [
             "",
-            "## 15. 方法说明",
+            "## 16. 方法说明",
             "",
             (
                 "系统先自动判断采样规则、缺失模式和噪声水平，完成时间对齐与保守填补，"

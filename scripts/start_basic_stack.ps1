@@ -1,8 +1,9 @@
 param(
-    [switch]$SkipApi
+    [switch]$SkipApi,
+    [switch]$SkipTrigger
 )
 
-# Start the Wanwu basic stack and the Shichi Qianji API.
+# Start the Wanwu basic stack, the Shichi Qianji API, and the workflow trigger.
 # This script intentionally excludes ontology services for low-memory machines.
 # It never deletes containers, images, volumes, or database data.
 
@@ -24,10 +25,54 @@ $baseServices = @(
     "rag", "wga-sandbox", "nginx"
 )
 
-Write-Host "[1/3] Checking Docker engine..." -ForegroundColor Cyan
-docker version --format "Server={{.Server.Version}}" | Out-Host
+Write-Host "[1/5] Checking PostgreSQL service..." -ForegroundColor Cyan
+$postgresService = Get-Service -Name "postgresql*" -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+if (-not $postgresService) {
+    throw "PostgreSQL Windows service was not found."
+}
+if ($postgresService.Status -ne "Running") {
+    try {
+        Start-Service -Name $postgresService.Name
+        $postgresService.WaitForStatus("Running", (New-TimeSpan -Seconds 30))
+    }
+    catch {
+        throw "PostgreSQL is stopped and could not be started. Run this script as administrator once."
+    }
+}
+Write-Host "PostgreSQL service ready: $($postgresService.Name)" -ForegroundColor Green
 
-Write-Host "[2/3] Starting Wanwu basic services (ontology excluded)..." -ForegroundColor Cyan
+Write-Host "[2/5] Checking Docker engine..." -ForegroundColor Cyan
+$dockerVersion = docker version --format "{{.Server.Version}}" 2>$null
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($dockerVersion)) {
+    $dockerDesktopCandidates = @(
+        "E:\Tools\Docker\DockerDesktop\Docker Desktop.exe",
+        "C:\Program Files\Docker\Docker\Docker Desktop.exe"
+    )
+    $dockerDesktop = $dockerDesktopCandidates |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+        Select-Object -First 1
+    if (-not $dockerDesktop) {
+        throw "Docker engine is unavailable and Docker Desktop was not found."
+    }
+    Write-Host "Docker is not running; starting Docker Desktop..." -ForegroundColor Yellow
+    Start-Process -FilePath $dockerDesktop -WindowStyle Hidden | Out-Null
+    $dockerReady = $false
+    for ($attempt = 1; $attempt -le 60; $attempt++) {
+        Start-Sleep -Seconds 2
+        $dockerVersion = docker version --format "{{.Server.Version}}" 2>$null
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($dockerVersion)) {
+            $dockerReady = $true
+            break
+        }
+    }
+    if (-not $dockerReady) {
+        throw "Docker Desktop did not become ready within 120 seconds."
+    }
+}
+Write-Host "Docker engine ready: $dockerVersion" -ForegroundColor Green
+
+Write-Host "[3/5] Starting Wanwu basic services (ontology excluded)..." -ForegroundColor Cyan
 Push-Location $wanwuRoot
 try {
     docker compose @composeArgs up -d $baseServices
@@ -37,7 +82,7 @@ finally {
 }
 
 if (-not $SkipApi) {
-    Write-Host "[3/3] Starting Shichi Qianji API on port 8000..." -ForegroundColor Cyan
+    Write-Host "[4/5] Starting Shichi Qianji API on port 8000..." -ForegroundColor Cyan
     Push-Location $projectRoot
     try {
         if (Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue) {
@@ -53,4 +98,9 @@ if (-not $SkipApi) {
     }
 }
 
-Write-Host "Basic stack start command completed. Run check_basic_stack.ps1 next." -ForegroundColor Green
+if (-not $SkipTrigger) {
+    Write-Host "[5/5] Starting Wanwu workflow trigger..." -ForegroundColor Cyan
+    & (Join-Path $PSScriptRoot "start_wanwu_trigger.ps1")
+}
+
+Write-Host "Competition stack start command completed. Run check_basic_stack.ps1 next." -ForegroundColor Green

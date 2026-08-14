@@ -26,10 +26,12 @@ def build_wanwu_openapi(
     schema["info"] = {
         "title": "时察千机 - 元景万悟工具",
         "description": (
-            "比赛演示优先使用 quick_industrial_diagnosis，一次完成工业分析并返回中文摘要；"
-            "另提供异步任务、工单闭环与历史案例检索工具。"
+            "万悟先通过数据源查询、配置和验证工具完成工业接入，再使用 "
+            "run_unattended_industrial_cycle 自动发现新数据，"
+            "再完成任务追踪、结果读取和 dispatch_industrial_alerts 主动告警；"
+            "另提供人工上传诊断、工单闭环与历史案例检索工具。"
         ),
-        "version": "0.5.0",
+        "version": "0.7.0",
     }
     schema["servers"] = [
         {"url": public_base_url, "description": "时察千机工业分析服务"}

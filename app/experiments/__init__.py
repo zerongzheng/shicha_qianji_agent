@@ -10,6 +10,10 @@ from app.experiments.forecast_effectiveness import (
     evaluate_forecast_effectiveness,
 )
 from app.experiments.hybrid_ablation import run_hybrid_weight_ablation
+from app.experiments.innovation_evidence import (
+    InnovationEvidence,
+    build_innovation_evidence,
+)
 from app.experiments.optimization_effectiveness import (
     OptimizationEffectiveness,
     evaluate_optimization_effectiveness,
@@ -27,12 +31,14 @@ from app.experiments.tuning import tune_and_evaluate
 __all__ = [
     "EventPolicyEvaluation",
     "ForecastEffectiveness",
+    "InnovationEvidence",
     "OptimizationEffectiveness",
     "SystemEffectiveness",
     "analyze_skab_false_positives",
     "analyze_skab_system_effectiveness",
     "audit_result",
     "build_competition_report",
+    "build_innovation_evidence",
     "build_protocol_manifest",
     "build_skab_split",
     "evaluate_detector_consensus",

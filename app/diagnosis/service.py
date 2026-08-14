@@ -64,7 +64,7 @@ class AutomaticDiagnosis:
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        """转换为 Streamlit、FastAPI 和万悟都可直接读取的结构。"""
+        """转换为 FastAPI、Vue3 和万悟都可直接读取的结构。"""
 
         return asdict(self)
 

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import BinaryIO
 
 import pandas as pd
 
@@ -114,19 +113,6 @@ def get_label_columns(dataframe: pd.DataFrame) -> list[str]:
     """识别数据集自带的标签列，SKAB 通常包含 anomaly 和 changepoint。"""
 
     return [column for column in dataframe.columns if column.lower() in LABEL_COLUMNS]
-
-
-def save_uploaded_file(uploaded_file: BinaryIO, target_dir: Path) -> Path:
-    """保存 Streamlit 上传文件并返回本地路径。
-
-    文件名只保留最后一级名称，防止上传对象携带目录跳转字符。
-    """
-
-    target_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = Path(getattr(uploaded_file, "name", "uploaded.csv")).name
-    target_path = target_dir / safe_name
-    target_path.write_bytes(uploaded_file.getvalue())
-    return target_path
 
 
 def _detect_delimiter(path: Path) -> str:

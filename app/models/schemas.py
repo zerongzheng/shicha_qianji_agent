@@ -242,6 +242,24 @@ class ExecutionTraceStep:
     limitation: str = ""
 
 
+@dataclass(frozen=True)
+class AgentDecisionRecord:
+    """一条不包含隐式推理、可由业务事实复核的智能体决策记录。"""
+
+    decision_id: str
+    stage: str
+    title: str
+    status: str
+    trigger: str
+    evidence: tuple[str, ...]
+    rule: str
+    action: str
+    target: str
+    confidence: str
+    human_gate: str
+    rollback_condition: str
+
+
 @dataclass
 class AnalysisResult:
     """完整分析任务的输出，也是页面、报告和 Agent 的共同数据源。"""
@@ -275,6 +293,7 @@ class AnalysisResult:
         default_factory=dict
     )
     execution_trace: list[ExecutionTraceStep] = field(default_factory=list)
+    agent_decisions: list[AgentDecisionRecord] = field(default_factory=list)
     report_text: str = ""
 
     def to_summary(self) -> dict[str, Any]:
@@ -293,6 +312,7 @@ class AnalysisResult:
             "候选根因诊断数": len(self.event_diagnoses),
             "处置工单草案数": len(self.work_order_drafts),
             "智能体执行摘要": _execution_trace_summary(self.execution_trace),
+            "智能体决策摘要": _agent_decision_summary(self.agent_decisions),
             "最高风险等级": self.events[0].severity if self.events else "未发现明显异常",
             "重点异常传感器": _top_sensors(self.events),
             "评估指标": (
@@ -352,6 +372,26 @@ def _execution_trace_summary(
                 "核心输出": step.output_summary,
             }
             for step in execution_trace
+        ],
+    }
+
+
+def _agent_decision_summary(records: list[AgentDecisionRecord]) -> dict[str, Any]:
+    """向大模型提供可审计决策事实，不提供隐藏思维过程。"""
+
+    return {
+        "决策数量": len(records),
+        "待人工确认数量": sum("待" in item.status for item in records),
+        "决策结果": [
+            {
+                "阶段": item.stage,
+                "决策": item.title,
+                "状态": item.status,
+                "动作": item.action,
+                "责任对象": item.target,
+                "人工闸门": item.human_gate,
+            }
+            for item in records
         ],
     }
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
-from typing import ClassVar
 
 import pytest
 
@@ -396,56 +395,6 @@ def test_repository_records_failed_run(tmp_path: Path) -> None:
     assert stored["status"] == "failed"
     assert stored["error"] == "数据列不足"
     assert stored["result"] is None
-
-
-def test_repository_records_local_analysis_result(tmp_path: Path) -> None:
-    """Streamlit 直接分析的结果也应进入任务表并生成可回写工单。"""
-
-    repository = IndustrialRepository(tmp_path / "industrial.db")
-    csv_path = tmp_path / "local.csv"
-    csv_path.write_text("datetime;Pressure\n2026-01-01;1.0\n", encoding="utf-8")
-
-    class Profile:
-        source_name = "local.csv"
-        row_count = 1
-        sensor_columns: ClassVar[list[str]] = ["Pressure"]
-        missing_total = 0
-        start_time = "2026-01-01"
-        end_time = "2026-01-01"
-
-    class Event:
-        pass
-
-    class Result:
-        source_path = csv_path
-        detector_name = "mad"
-        profile = Profile()
-        events: ClassVar[list[object]] = []
-        operating_regimes = None
-        relationship_diagnostics: ClassVar[list[object]] = []
-        event_diagnoses: ClassVar[list[object]] = []
-        work_order_drafts: ClassVar[list[object]] = []
-        forecast_results: ClassVar[dict[str, object]] = {}
-        risk_alerts: ClassVar[list[object]] = []
-        recommendations: ClassVar[list[str]] = []
-
-        @staticmethod
-        def to_summary() -> dict[str, object]:
-            return {"异常事件数": 0}
-
-    run_id = repository.record_local_analysis(
-        csv_path,
-        operation="streamlit_analyze",
-        detector="mad",
-        config={"threshold": 5.5},
-        result=Result(),
-    )
-
-    stored = repository.get_run(run_id)
-    assert stored is not None
-    assert stored["status"] == "success"
-    assert stored["result"]["summary"]["异常事件数"] == 0
-    assert repository.list_work_orders(run_id=run_id) == []
 
 
 def test_repository_transitions_queued_job_and_recovers_interrupted_runs(

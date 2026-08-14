@@ -84,6 +84,14 @@ def test_pipeline_can_detect_injected_event(tmp_path, detector: str) -> None:
     assert len(result.event_diagnoses) == len(result.events)
     assert len(result.work_order_drafts) == len(result.event_diagnoses)
     assert "候选根因诊断" in result.to_summary()
+    decision_ids = [item.decision_id for item in result.agent_decisions]
+    assert decision_ids[:3] == [
+        "adaptive_preprocessing",
+        "model_routing",
+        "risk_assessment",
+    ]
+    assert all(item.human_gate and item.rollback_condition for item in result.agent_decisions)
+    assert "智能体决策摘要" in result.to_summary()
     assert isinstance(result.to_summary()["评估指标"], dict)
     assert "工业时序诊断报告" in result.report_text
 
@@ -131,7 +139,15 @@ def test_execution_trace_records_stable_automatic_chain(tmp_path) -> None:
     assert trace_by_id["forecast_analysis"].status == "skipped"
     assert trace_by_id["anomaly_detection"].output_summary["event_count"] == 0
     assert "智能体执行摘要" in result.to_summary()
+    decision_ids = [item.decision_id for item in result.agent_decisions]
+    assert decision_ids[:3] == [
+        "adaptive_preprocessing",
+        "model_routing",
+        "risk_assessment",
+    ]
+    assert decision_ids[-1] == "constrained_optimization"
     assert "智能体执行链" in result.report_text
+    assert "智能体决策记录" in result.report_text
 
 
 def test_pipeline_can_run_detector_cross_validation(tmp_path) -> None:

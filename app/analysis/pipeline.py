@@ -27,6 +27,7 @@ from app.analysis.trend import analyze_recent_trends
 from app.analysis.warning import build_risk_alerts
 from app.config import get_settings
 from app.data.loader import load_time_series, load_time_series_with_context
+from app.decisioning import build_agent_decision_ledger
 from app.diagnosis import diagnose_root_causes
 from app.models import (
     AnalysisConfig,
@@ -490,6 +491,17 @@ def analyze_file(
         )
     )
 
+    agent_decisions = build_agent_decision_ledger(
+        preprocessing=preprocessing,
+        model_selection=model_selection,
+        detector_validation=detector_validation,
+        events=events,
+        risk_alerts=risk_alerts,
+        event_diagnoses=event_diagnoses,
+        work_order_drafts=work_order_drafts,
+        optimization_recommendations=optimization_recommendations,
+    )
+
     result = AnalysisResult(
         source_path=source_path,
         detector_name=detection.detector_name,
@@ -516,6 +528,7 @@ def analyze_file(
         work_order_drafts=work_order_drafts,
         historical_case_matches=historical_case_matches,
         execution_trace=execution_trace,
+        agent_decisions=agent_decisions,
     )
     result.report_text = build_markdown_report(result, config)
 

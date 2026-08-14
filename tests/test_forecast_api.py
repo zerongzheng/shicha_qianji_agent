@@ -167,6 +167,10 @@ def test_api_payload_exposes_root_causes_and_work_orders(tmp_path) -> None:
     assert payload["work_order_drafts"][0]["record_id"].startswith("run_test:")
     assert payload["execution_trace"]
     assert payload["execution_trace"][0]["step_id"] == "data_ingestion"
+    assert payload["agent_decisions"]
+    assert payload["agent_decisions"][0]["decision_id"] == "adaptive_preprocessing"
+    assert payload["agent_decisions"][0]["human_gate"]
+    assert payload["agent_decisions"][0]["rollback_condition"]
     assert payload["raw_data_profile"]["row_count"] == rows
     assert payload["preprocessing"]["quality_gate"] == "passed"
     assert payload["optimization_recommendations"]
@@ -188,5 +192,6 @@ def test_openapi_exposes_wanwu_job_contract() -> None:
     assert {"raw_data_profile", "preprocessing", "optimization_recommendations"} <= set(
         analysis_schema["properties"]
     )
+    assert "agent_decisions" in analysis_schema["properties"]
     assert request_schema["properties"]["operation"]["enum"] == ["analyze", "diagnose"]
     assert schema["paths"]["/api/v1/jobs"]["post"]["responses"]["202"]
