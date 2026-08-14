@@ -50,6 +50,8 @@ from app.api.schemas import (
     ModelCompareRequest,
     NotificationAcknowledgeRequest,
     RunIdRequest,
+    WanwuAftercareCycleRequest,
+    WanwuAftercareCycleResponse,
     WanwuAutonomousCycleRequest,
     WanwuAutonomousCycleResponse,
     WanwuCaseListRequest,
@@ -73,7 +75,12 @@ from app.api.schemas import (
     WorkOrderUpdateRequest,
 )
 from app.api.wanwu_openapi import build_wanwu_openapi
-from app.automation import MonitoringService, dispatch_run_notifications
+from app.automation import (
+    AftercarePolicy,
+    MonitoringService,
+    dispatch_run_notifications,
+    run_aftercare_cycle,
+)
 from app.config import get_settings
 from app.data.device_profiles import load_device_profiles
 from app.data.loader import (
@@ -2091,6 +2098,27 @@ if app:
             "polls": polls,
             "next_action": next_action,
         }
+
+    @app.post(
+        "/api/v1/wanwu/automation/aftercare",
+        operation_id="run_industrial_aftercare_cycle",
+        summary="执行工单催办升级与维修后自动复检",
+        response_model=WanwuAftercareCycleResponse,
+    )
+    def wanwu_aftercare_cycle(
+        payload: WanwuAftercareCycleRequest,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """由万悟定时触发工单售后周期，不调用大模型也不直接控制工业设备。"""
+
+        _check_api_key(x_api_key)
+        result = run_aftercare_cycle(
+            get_repository(),
+            AftercarePolicy.from_settings(settings),
+            max_work_orders=payload.max_work_orders,
+            dry_run=payload.dry_run,
+        )
+        return {**result, "orchestrator": settings.automation_orchestrator}
 
     @app.post(
         "/api/v1/wanwu/automation/status",

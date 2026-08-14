@@ -118,6 +118,7 @@ def test_wanwu_openapi_only_exposes_json_tools() -> None:
         "/api/v1/wanwu/work-orders/list",
         "/api/v1/wanwu/work-orders/update",
         "/api/v1/wanwu/automation/cycle",
+        "/api/v1/wanwu/automation/aftercare",
         "/api/v1/wanwu/automation/status",
         "/api/v1/wanwu/automation/notifications/dispatch",
         "/api/v1/wanwu/data-sources/list",
@@ -550,6 +551,7 @@ def test_wanwu_check_can_verify_platform_and_complete_toolset(tmp_path, monkeypa
                         "list_industrial_data_sources",
                         "configure_industrial_data_source",
                         "verify_industrial_data_source",
+                        "run_industrial_aftercare_cycle",
                     ]
             )
         },
@@ -587,7 +589,7 @@ def test_wanwu_check_can_verify_platform_and_complete_toolset(tmp_path, monkeypa
         quick_output_path=tmp_path / "wanwu-quick.json",
     )
 
-    assert result["tool_count"] == 14
+    assert result["tool_count"] == 15
     assert result["platform_http_status"] == 200
     assert result["schema_server"] == "http://host.docker.internal:8000"
     assert result["quick_tool_count"] == 1

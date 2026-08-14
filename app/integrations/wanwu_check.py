@@ -24,6 +24,7 @@ EXPECTED_OPERATION_IDS = {
     "list_industrial_data_sources",
     "configure_industrial_data_source",
     "verify_industrial_data_source",
+    "run_industrial_aftercare_cycle",
 }
 
 

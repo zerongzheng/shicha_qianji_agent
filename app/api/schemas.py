@@ -302,6 +302,39 @@ class WanwuAutonomousCycleResponse(StrictApiModel):
     next_action: str
 
 
+class WanwuAftercareCycleRequest(StrictApiModel):
+    """万悟工单售后周期输入；定时触发时通常只需使用默认值。"""
+
+    max_work_orders: int = Field(default=100, ge=1, le=200)
+    dry_run: bool = Field(
+        default=False,
+        description="仅预览到期催办和复检结论，不修改工单或发送通知",
+    )
+
+
+class WanwuAftercareCycleResponse(StrictApiModel):
+    """SLA 催办、升级和维修复检的单周期审计结果。"""
+
+    status: Literal["success"]
+    cycle_status: Literal[
+        "no_action",
+        "actions_planned",
+        "actions_completed",
+        "waiting_for_data",
+    ]
+    orchestrator: Literal["backend", "wanwu"]
+    dry_run: bool
+    sla_checked_count: int
+    reminder_count: int
+    escalation_count: int
+    reinspection_checked_count: int
+    reinspection_passed_count: int
+    reinspection_failed_count: int
+    reinspection_waiting_count: int
+    actions: list[dict[str, Any]]
+    next_action: str
+
+
 class WanwuMonitoringStatusRequest(StrictApiModel):
     """限制万悟状态节点返回的审计记录数量。"""
 

@@ -69,6 +69,12 @@ class Settings:
     wecom_enabled: bool
     wecom_webhook_url: str
     wecom_timeout_seconds: float
+    sla_p1_reminder_seconds: int
+    sla_p1_escalation_seconds: int
+    sla_p2_reminder_seconds: int
+    sla_p2_escalation_seconds: int
+    sla_p3_reminder_seconds: int
+    sla_p3_escalation_seconds: int
 
     @property
     def llm_enabled(self) -> bool:
@@ -205,5 +211,18 @@ def get_settings() -> Settings:
         wecom_timeout_seconds=max(
             1.0,
             float(os.getenv("WECOM_TIMEOUT_SECONDS", "10")),
+        ),
+        # 校赛演示默认采用较短 SLA；正式企业部署时按班组制度在 .env 中调整。
+        sla_p1_reminder_seconds=max(1, int(os.getenv("SLA_P1_REMINDER_SECONDS", "300"))),
+        sla_p1_escalation_seconds=max(
+            1, int(os.getenv("SLA_P1_ESCALATION_SECONDS", "900"))
+        ),
+        sla_p2_reminder_seconds=max(1, int(os.getenv("SLA_P2_REMINDER_SECONDS", "900"))),
+        sla_p2_escalation_seconds=max(
+            1, int(os.getenv("SLA_P2_ESCALATION_SECONDS", "1800"))
+        ),
+        sla_p3_reminder_seconds=max(1, int(os.getenv("SLA_P3_REMINDER_SECONDS", "3600"))),
+        sla_p3_escalation_seconds=max(
+            1, int(os.getenv("SLA_P3_ESCALATION_SECONDS", "7200"))
         ),
     )

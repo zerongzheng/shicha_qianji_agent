@@ -468,8 +468,14 @@ class IndustrialRepository:
         title: str,
         message: str,
         recipient_user_id: str | None = None,
+        notification_kind: str = "initial",
+        escalation_level: int = 0,
     ) -> dict[str, Any]:
-        """创建或读取幂等通知记录。"""
+        """创建或读取幂等通知记录。
+
+        同一工单可以分别保留首次告警、SLA 催办、升级告警和复检结果；同一阶段重复调用
+        仍只会得到同一条记录，从而适配万悟定时工作流的重试语义。
+        """
 
         notification_id = f"ntf_{uuid.uuid4().hex[:12]}"
         with self._connect() as connection:
@@ -478,8 +484,11 @@ class IndustrialRepository:
                 INSERT INTO notifications (
                     notification_id, run_id, record_id, priority, recipient_name,
                     recipient_role, recipient_user_id, channel, title, message, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-                ON CONFLICT(record_id, recipient_name, channel) DO NOTHING
+                    , notification_kind, escalation_level
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                ON CONFLICT(
+                    record_id, recipient_name, channel, notification_kind, escalation_level
+                ) DO NOTHING
                 """,
                 (
                     notification_id,
@@ -493,14 +502,23 @@ class IndustrialRepository:
                     title,
                     message,
                     _now(),
+                    notification_kind,
+                    max(0, int(escalation_level)),
                 ),
             )
             row = connection.execute(
                 """
                 SELECT * FROM notifications
                 WHERE record_id = ? AND recipient_name = ? AND channel = ?
+                  AND notification_kind = ? AND escalation_level = ?
                 """,
-                (record_id, recipient_name, channel),
+                (
+                    record_id,
+                    recipient_name,
+                    channel,
+                    notification_kind,
+                    max(0, int(escalation_level)),
+                ),
             ).fetchone()
         if row is None:
             raise RuntimeError("通知创建后未能读取")
@@ -1373,8 +1391,18 @@ class IndustrialRepository:
                 if "confirmed_cause" in updates
                 else current["confirmed_cause"]
             )
-            if status in {"已确认", "已完成", "已关闭"} and not confirmed_cause:
-                raise ValueError("已确认、已完成或已关闭的工单必须填写确认根因")
+            if status in {"已确认", "待验证", "已完成", "已关闭"} and not confirmed_cause:
+                raise ValueError("已确认、待验证、已完成或已关闭的工单必须填写确认根因")
+            feedback_note = (
+                _optional_text(updates["feedback_note"])
+                if "feedback_note" in updates
+                else current["feedback_note"]
+            )
+            if status == "待验证" and not feedback_note:
+                raise ValueError("进入待验证前必须填写现场处置反馈")
+            timestamp = _now()
+            entering_reinspection = status == "待验证" and current["status"] != "待验证"
+            leaving_reinspection = status != "待验证" and current["status"] == "待验证"
             # PATCH 只修改请求中明确给出的字段，避免状态流转时清空既有现场反馈。
             values = {
                 "record_id": record_id,
@@ -1384,17 +1412,15 @@ class IndustrialRepository:
                     if "confirmed_cause" in updates
                     else current["confirmed_cause"]
                 ),
-                "feedback_note": (
-                    _optional_text(updates["feedback_note"])
-                    if "feedback_note" in updates
-                    else current["feedback_note"]
-                ),
+                "feedback_note": feedback_note,
                 "handled_by": (
                     _optional_text(updates["handled_by"])
                     if "handled_by" in updates
                     else current["handled_by"]
                 ),
-                "updated_at": _now(),
+                "updated_at": timestamp,
+                "entering_reinspection": entering_reinspection,
+                "leaving_reinspection": leaving_reinspection,
             }
             connection.execute(
                 """
@@ -1403,6 +1429,23 @@ class IndustrialRepository:
                     confirmed_cause = :confirmed_cause,
                     feedback_note = :feedback_note,
                     handled_by = :handled_by,
+                    reinspection_status = CASE
+                        WHEN :entering_reinspection THEN 'pending'
+                        WHEN :leaving_reinspection AND reinspection_status = 'pending' THEN 'cancelled'
+                        ELSE reinspection_status
+                    END,
+                    reinspection_scheduled_at = CASE
+                        WHEN :entering_reinspection THEN :updated_at
+                        ELSE reinspection_scheduled_at
+                    END,
+                    reinspection_run_id = CASE
+                        WHEN :entering_reinspection THEN NULL
+                        ELSE reinspection_run_id
+                    END,
+                    reinspection_summary = CASE
+                        WHEN :entering_reinspection THEN NULL
+                        ELSE reinspection_summary
+                    END,
                     updated_at = :updated_at
                 WHERE record_id = :record_id
                 """,
@@ -1415,6 +1458,86 @@ class IndustrialRepository:
         if row is None:
             raise LookupError(f"找不到工单：{record_id}")
         return _work_order_record(row)
+
+    def mark_work_order_sla(self, record_id: str, level: int) -> dict[str, Any] | None:
+        """原子提升未接单工单的 SLA 层级；重复或过期动作不会回退状态。"""
+
+        level = max(1, min(2, int(level)))
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE work_orders
+                SET sla_level = ?, last_sla_action_at = ?, updated_at = ?
+                WHERE record_id = ?
+                  AND archived_at IS NULL
+                  AND status = '待确认'
+                  AND accepted_at IS NULL
+                  AND sla_level < ?
+                """,
+                (level, _now(), _now(), record_id, level),
+            )
+        return self._get_work_order(record_id) if cursor.rowcount == 1 else None
+
+    def find_latest_successful_source_run(
+        self,
+        *,
+        source_id: str,
+        after: str,
+        exclude_run_id: str,
+    ) -> dict[str, Any] | None:
+        """读取同一数据源在复检开始后的最新成功任务及完整结构化结果。"""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT r.*, f.file_name, f.sha256, f.size_bytes
+                FROM analysis_runs AS r
+                JOIN uploaded_files AS f ON f.file_id = r.file_id
+                WHERE r.source_id = ?
+                  AND r.run_id <> ?
+                  AND r.status = 'success'
+                  AND r.started_at > ?
+                  AND r.result_json IS NOT NULL
+                ORDER BY r.started_at DESC
+                LIMIT 1
+                """,
+                (source_id, exclude_run_id, after),
+            ).fetchone()
+        return _run_record(row, include_result=True) if row else None
+
+    def finalize_reinspection(
+        self,
+        record_id: str,
+        *,
+        passed: bool,
+        reinspection_run_id: str,
+        summary: str,
+    ) -> dict[str, Any] | None:
+        """原子提交复检结论；仅待验证且 pending 的工单可被自动流转一次。"""
+
+        target_status = "已完成" if passed else "处理中"
+        reinspection_status = "passed" if passed else "failed"
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE work_orders
+                SET status = ?, reinspection_status = ?, reinspection_run_id = ?,
+                    reinspection_summary = ?, updated_at = ?
+                WHERE record_id = ?
+                  AND status = '待验证'
+                  AND reinspection_status = 'pending'
+                  AND archived_at IS NULL
+                """,
+                (
+                    target_status,
+                    reinspection_status,
+                    reinspection_run_id,
+                    summary,
+                    _now(),
+                    record_id,
+                ),
+            )
+        return self._get_work_order(record_id) if cursor.rowcount == 1 else None
 
     def list_confirmed_cases(
         self,
@@ -1731,6 +1854,24 @@ def _work_order_record(row: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "accepted_at": row["accepted_at"] if "accepted_at" in row_keys else None,
         "accepted_by": row["accepted_by"] if "accepted_by" in row_keys else None,
+        "sla_level": int(row["sla_level"]) if "sla_level" in row_keys else 0,
+        "last_sla_action_at": (
+            row["last_sla_action_at"] if "last_sla_action_at" in row_keys else None
+        ),
+        "reinspection_status": (
+            row["reinspection_status"] if "reinspection_status" in row_keys else None
+        ),
+        "reinspection_scheduled_at": (
+            row["reinspection_scheduled_at"]
+            if "reinspection_scheduled_at" in row_keys
+            else None
+        ),
+        "reinspection_run_id": (
+            row["reinspection_run_id"] if "reinspection_run_id" in row_keys else None
+        ),
+        "reinspection_summary": (
+            row["reinspection_summary"] if "reinspection_summary" in row_keys else None
+        ),
         "actions": _from_json(row["actions_json"], []),
         "evidence_summary": _from_json(row["evidence_json"], []),
         "required_feedback": _from_json(row["required_feedback_json"], []),

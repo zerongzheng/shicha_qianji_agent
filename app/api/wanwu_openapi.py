@@ -29,9 +29,10 @@ def build_wanwu_openapi(
             "万悟先通过数据源查询、配置和验证工具完成工业接入，再使用 "
             "run_unattended_industrial_cycle 自动发现新数据，"
             "再完成任务追踪、结果读取和 dispatch_industrial_alerts 主动告警；"
+            "run_industrial_aftercare_cycle 继续执行工单催办、升级和维修后复检；"
             "另提供人工上传诊断、工单闭环与历史案例检索工具。"
         ),
-        "version": "0.7.0",
+        "version": "0.8.0",
     }
     schema["servers"] = [
         {"url": public_base_url, "description": "时察千机工业分析服务"}

@@ -39,8 +39,8 @@
 http://host.docker.internal:8000/integrations/wanwu/openapi.json
 ```
 
-它包含十四个万悟可稳定调用的工具，并为每个工具固定英文 `operationId`。其中三个数据源工具
-负责查询、配置和只读验收，三个无人值守工具负责巡检周期、运行状态和主动告警；
+它包含十五个万悟可稳定调用的工具，并为每个工具固定英文 `operationId`。其中三个数据源工具
+负责查询、配置和只读验收，四个自动化工具负责巡检周期、运行状态、主动告警和工单售后；
 `quick_industrial_diagnosis` 保留为人工上传调试入口。
 
 比赛演示专用 Schema：
@@ -50,7 +50,7 @@ http://host.docker.internal:8000/integrations/wanwu/quick-openapi.json
 ```
 
 该地址只暴露 `quick_industrial_diagnosis` 一个工具。创建比赛演示智能体时应优先导入这个地址；
-完整十四工具 Schema 用于数据源配置和无人值守工作流；单工具 Schema 只用于人工上传调试，不要把两份
+完整十五工具 Schema 用于数据源配置和无人值守工作流；单工具 Schema 只用于人工上传调试，不要把两份
 Schema 同时绑定到同一个辅助智能体。
 
 ## 低调用额度快速诊断
@@ -313,6 +313,12 @@ POST /api/v1/forecast-compare
 8. 将 `work_order_drafts[].record_id` 传给工单卡片，现场确认后调用 `update_industrial_work_order` 回写结果。
 9. 调用 `list_industrial_feedback_cases` 展示已沉淀案例；后续分析结果中的 `historical_case_matches` 会自动引用相似案例。
 
+无人值守主工作流应在巡检节点前调用 `run_industrial_aftercare_cycle`。该工具不调用大模型，
+会在每次定时触发时检查未接单 SLA，并处理状态为 `待验证` 的工单。复检必须找到同一
+`source_id` 在处置后的新成功任务：原异常主导测点不再出现才自动完成，仍出现则退回处理中；
+没有新数据时保持等待，不会把空结果误判为设备恢复。通知以“工单 + 接收人 + 渠道 + 通知类型 +
+升级层级”幂等，万悟重试不会重复发送同阶段消息。
+
 异步任务请求示例：
 
 ```json
@@ -376,7 +382,7 @@ uv run python api_main.py
 uv run shichi-qianji-wanwu-check
 ```
 
-第二条命令会检查健康状态、完整十四个万悟工具、快速单工具 Schema 和 OpenAPI 服务地址，并同时导出：
+第二条命令会检查健康状态、完整十五个万悟工具、快速单工具 Schema 和 OpenAPI 服务地址，并同时导出：
 
 ```text
 outputs/wanwu_openapi.json
