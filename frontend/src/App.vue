@@ -43,6 +43,7 @@ import WorkOrderPanel from "./components/WorkOrderPanel.vue";
 import HistoryPanel from "./components/HistoryPanel.vue";
 import OverviewPanel from "./components/OverviewPanel.vue";
 import EvidencePanel from "./components/EvidencePanel.vue";
+import ModelEvidencePanel from "./components/ModelEvidencePanel.vue";
 import ForecastPanel from "./components/ForecastPanel.vue";
 import MonitoringPanel from "./components/MonitoringPanel.vue";
 import DebugAnalysisPanel from "./components/DebugAnalysisPanel.vue";
@@ -1157,15 +1158,25 @@ async function saveFeedback() {
     });
     if (!confirmed) return;
   }
-  const requiresCause = ["已确认", "已完成", "已关闭"].includes(feedback.status);
+  const requiresCause = ["已确认", "待验证", "已完成", "已关闭"].includes(feedback.status);
   if (requiresCause && !feedback.confirmed_cause.trim()) {
     feedbackNotice.value = {
       type: "warning",
       title: "还不能生成历史案例",
-      detail: "请先填写现场确认根因，再保存为已确认、已完成或已关闭。",
+      detail: "请先填写现场确认根因，再保存为已确认、待验证、已完成或已关闭。",
     };
     showToast(feedbackNotice.value, 0);
-    errorMessage.value = "已确认状态必须填写现场确认根因。";
+    errorMessage.value = "该状态必须填写现场确认根因。";
+    return;
+  }
+  if (feedback.status === "待验证" && !feedback.feedback_note.trim()) {
+    feedbackNotice.value = {
+      type: "warning",
+      title: "还不能开始自动复检",
+      detail: "请先填写已经执行的现场处置动作，再进入待验证。系统会等待同一数据源的新批次自动复检。",
+    };
+    showToast(feedbackNotice.value, 0);
+    errorMessage.value = "进入待验证前必须填写现场处置反馈。";
     return;
   }
   savingFeedback.value = true;
@@ -1183,9 +1194,15 @@ async function saveFeedback() {
     }
     await refreshHistory();
     const caseCreated = cases.value.some((item) => item.source_record_id === savedRecordId);
-    feedbackNotice.value = caseCreated
-      ? { type: "success", title: "现场确认已保存", detail: "该工单已生成历史案例，可在“历史记录”中查看。" }
-      : { type: "success", title: "工单状态已保存", detail: "当前还未形成历史案例；填写确认根因并保存为已确认或已完成后即可沉淀。" };
+    feedbackNotice.value = savedOrder?.reinspection_status === "pending"
+      ? {
+          type: "success",
+          title: "已进入自动复检队列",
+          detail: "系统将等待同一数据源产生新的成功分析任务，并自动判断原异常主导测点是否仍然出现。",
+        }
+      : caseCreated
+        ? { type: "success", title: "现场确认已保存", detail: "该工单已生成历史案例，可在“历史记录”中查看。" }
+        : { type: "success", title: "工单状态已保存", detail: "当前还未形成历史案例；填写确认根因并保存为已确认或已完成后即可沉淀。" };
     showToast(feedbackNotice.value);
     successMessage.value = caseCreated ? "现场确认已保存，历史案例已生成。" : "工单状态已保存。";
     // 保存按钮可能位于长页面下方，保存后把用户带回状态提示位置。
@@ -1562,6 +1579,7 @@ function contributionWidth(item) {
             @toggle-event="toggleEvidenceEvent"
             @open-work-order="openRelatedWorkOrder"
           />
+          <ModelEvidencePanel v-if="analysis" :analysis="analysis" />
         </section>
 
         <section v-else-if="activeTab === 'forecast'" class="content-stack">

@@ -18,6 +18,7 @@ from math import isfinite
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import psycopg
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
@@ -61,6 +62,7 @@ from app.api.schemas import (
     WanwuDataSourceListResponse,
     WanwuDataSourceVerifyRequest,
     WanwuDataSourceVerifyResponse,
+    WanwuDecisionBriefResponse,
     WanwuJobAcceptedResponse,
     WanwuJobCreateRequest,
     WanwuMonitoringStatusRequest,
@@ -69,6 +71,8 @@ from app.api.schemas import (
     WanwuNotificationDispatchResponse,
     WanwuQuickDiagnosisRequest,
     WanwuQuickDiagnosisResponse,
+    WanwuShiftBriefRequest,
+    WanwuShiftBriefResponse,
     WanwuWorkOrderListRequest,
     WanwuWorkOrderUpdateRequest,
     WorkOrderAssignmentRequest,
@@ -79,7 +83,8 @@ from app.automation import (
     AftercarePolicy,
     MonitoringService,
     dispatch_run_notifications,
-    run_aftercare_cycle,
+    run_reinspection_cycle,
+    run_sla_cycle,
 )
 from app.config import get_settings
 from app.data.device_profiles import load_device_profiles
@@ -110,7 +115,7 @@ settings = get_settings()
 UPLOAD_DIR = settings.output_dir / "api_uploads"
 # 快速诊断会按文件哈希复用历史结果。每当分析管线或返回证据发生实质升级时必须递增
 # 此版本，防止同一份演示 CSV 长期命中旧结果而看不到新能力。
-QUICK_DIAGNOSIS_VERSION = "0.8.0"
+QUICK_DIAGNOSIS_VERSION = "0.9.0"
 _monitoring_service: MonitoringService | None = None
 
 
@@ -972,6 +977,471 @@ def _job_result_payload(run_id: str) -> dict[str, Any]:
     return {"status": "success", "run_id": run_id, "result": run["result"]}
 
 
+def _model_audit_payload(run_id: str, limit: int = 20) -> dict[str, Any]:
+    """读取与任务关联的脱敏模型审计；审计故障不能阻断业务结果。"""
+
+    try:
+        calls = get_repository().list_model_calls(limit=limit, run_id=run_id)
+    except Exception:  # noqa: BLE001 - 审计旁路不可阻断已完成的分析。
+        calls = []
+    return {
+        "call_count": len(calls),
+        "content_stored": False,
+        "calls": calls,
+    }
+
+
+def _wanwu_decision_brief_payload(run_id: str) -> dict[str, Any]:
+    """从已落库结果提取万悟可直接编排的决策证据，不重复执行算法。"""
+
+    result = _job_result_payload(run_id)["result"]
+    selection = result.get("model_selection") or {}
+    validation = result.get("detector_validation") or {}
+    agreement = validation.get("agreement") or {}
+    forecasts = result.get("forecast_results") or {}
+    alerts = result.get("risk_alerts") or []
+    optimizations = result.get("optimization_recommendations") or []
+    work_orders = result.get("work_order_drafts") or []
+
+    supporting_models = [
+        str(item.get("detector_name") or item.get("detector"))
+        for item in validation.get("models", [])
+        if item.get("detector_name") or item.get("detector")
+    ]
+    model_details = [
+        {
+            "detector": item.get("detector"),
+            "detector_name": item.get("detector_name") or item.get("detector"),
+            "model_family": item.get("model_family"),
+            "is_primary": bool(item.get("is_primary", False)),
+            "threshold": item.get("threshold"),
+            "anomaly_point_count": int(item.get("anomaly_point_count") or 0),
+            "event_count": int(item.get("event_count") or 0),
+            "peak_score": item.get("peak_score"),
+            "agreement_with_primary": item.get("agreement_with_primary") or {},
+            "evaluation": item.get("evaluation"),
+        }
+        for item in validation.get("models", [])[:8]
+        if isinstance(item, dict)
+    ]
+    forecast_summaries = [
+        {
+            "sensor": sensor,
+            "model": detail.get("模型名称") or detail.get("模型"),
+            "direction": detail.get("方向"),
+            "risk": detail.get("风险"),
+            "confidence": (detail.get("不确定度") or {}).get("预测可信度"),
+            "current_value": detail.get("当前值"),
+            "forecast_end_value": detail.get("预测末值"),
+            "backtest_rmse": (detail.get("回测") or {}).get("RMSE"),
+        }
+        for sensor, detail in list(forecasts.items())[:8]
+    ]
+    alert_summaries = [
+        {
+            "alert_id": item.get("alert_id"),
+            "type": item.get("类型"),
+            "level": item.get("等级"),
+            "confidence": item.get("可信度"),
+            "sensors": item.get("传感器") or [],
+            "recommended_action": item.get("建议动作"),
+        }
+        for item in alerts[:8]
+    ]
+    optimization_summaries = [
+        {
+            "recommendation_id": item.get("recommendation_id"),
+            "category": item.get("category"),
+            "target": item.get("target"),
+            "action": item.get("action"),
+            "adjustment_direction": item.get("adjustment_direction"),
+            "suggested_range": item.get("suggested_range"),
+            "confidence": item.get("confidence"),
+            "evidence": list(item.get("evidence") or [])[:4],
+            "observation_window": item.get("observation_window"),
+            "rollback_condition": item.get("rollback_condition"),
+            "status": item.get("status", "待人工确认"),
+        }
+        for item in optimizations[:6]
+    ]
+
+    risk_order = {"高风险": 4, "需关注": 3, "中风险": 3, "低风险": 2, "正常": 1}
+    risk_levels = [str(item.get("等级") or "正常") for item in alerts]
+    risk_levels.extend(str(item.get("风险") or "正常") for item in forecasts.values())
+    highest_risk = max(risk_levels or ["正常"], key=lambda item: risk_order.get(item, 0))
+
+    priority_order = {"P1": 3, "P2": 2, "P3": 1}
+    priorities = [str(item.get("priority")) for item in work_orders if item.get("priority")]
+    highest_priority = (
+        max(priorities, key=lambda item: priority_order.get(item, 0))
+        if priorities
+        else None
+    )
+    profile = result.get("data_profile") or {}
+    device_profile = result.get("device_profile") or {}
+    source_name = str(profile.get("source_name") or "未知来源")
+    source_hints = " ".join(
+        str(value)
+        for value in (
+            source_name,
+            device_profile.get("profile_id"),
+            device_profile.get("display_name"),
+        )
+        if value
+    ).casefold()
+    source_label = (
+        f"公开 SKAB 验证数据：{source_name}"
+        if "skab" in source_hints
+        else f"待现场确认的数据源：{source_name}"
+    )
+    diagnoses = result.get("root_cause_diagnoses") or []
+    automatic_diagnosis = result.get("automatic_diagnosis") or {}
+    diagnosis_evidence = automatic_diagnosis.get("evidence") or {}
+    knowledge_records = diagnosis_evidence.get("knowledge") or []
+    rag_sources = [
+        {
+            "source": str(item.get("source") or "未知资料"),
+            "score": item.get("score"),
+            "retrieval_mode": str(item.get("retrieval_mode") or "unknown"),
+        }
+        for item in knowledge_records[:8]
+        if isinstance(item, dict)
+    ]
+    retrieval_modes = {
+        str(item.get("retrieval_mode"))
+        for item in rag_sources
+        if item.get("retrieval_mode")
+    }
+    retrieval_mode = (
+        "mixed"
+        if len(retrieval_modes) > 1
+        else next(iter(retrieval_modes), "not_run")
+    )
+    model_audit = _model_audit_payload(run_id)
+    sensor_terms = sorted(
+        {
+            str(sensor).strip()
+            for item in alerts[:8]
+            for sensor in item.get("传感器", [])
+            if str(sensor).strip()
+        }
+    )[:12]
+    candidate_causes: list[str] = []
+    evidence_gaps: list[str] = []
+    for diagnosis in diagnoses[:6]:
+        candidate = diagnosis.get("primary_candidate") or {}
+        name = str(candidate.get("name") or "").strip()
+        if name and name not in candidate_causes:
+            candidate_causes.append(name)
+        for gap in candidate.get("missing_evidence") or []:
+            gap_text = str(gap).strip()
+            if gap_text and gap_text not in evidence_gaps:
+                evidence_gaps.append(gap_text)
+    query_parts = [*sensor_terms[:6], *candidate_causes[:4], *evidence_gaps[:3]]
+    primary_alert = alert_summaries[0] if alert_summaries else {}
+    primary_sensors = "、".join(str(item) for item in primary_alert.get("sensors") or [])
+    primary_alert_text = str(primary_alert.get("type") or "未形成风险预警")
+    if primary_sensors:
+        primary_alert_text = f"{primary_alert_text}（测点：{primary_sensors}）"
+    primary_action = str(primary_alert.get("recommended_action") or "继续观察并核对现场工况")
+    primary_optimization = optimization_summaries[0] if optimization_summaries else {}
+    optimization_action = str(primary_optimization.get("action") or "暂无新增优化建议")
+    work_order_ids = [
+        str(item["record_id"])
+        for item in work_orders[:3]
+        if item.get("record_id")
+    ]
+    work_order_text = (
+        f"已生成 {len(work_orders)} 张工单"
+        + (f"，最高优先级 {highest_priority}" if highest_priority else "")
+        + (f"（{'; '.join(work_order_ids)}）" if work_order_ids else "")
+        if work_orders
+        else "本次未生成工单"
+    )
+    presentation_lines = [
+        "【时察千机自动巡检结果】",
+        f"数据来源：{source_label}",
+        f"任务编号：{run_id}",
+        f"风险等级：{highest_risk}；发现 {len(alerts)} 条风险预警。",
+        f"异常摘要：{primary_alert_text}",
+        (
+            "模型依据："
+            f"主模型为 {selection.get('selected_detector_name') or result.get('detector') or '未知模型'}；"
+            f"{len(supporting_models)} 个模型参与交叉验证，"
+            f"一致性为 {agreement.get('level') or '不可用'}。"
+        ),
+        (
+            "模型明细："
+            + "；".join(
+                f"{item['detector_name']} {item['event_count']} 个事件"
+                for item in model_details[:4]
+            )
+            if model_details
+            else "模型明细：暂无可用结果"
+        ),
+        f"工单状态：{work_order_text}",
+        f"建议处置：{primary_action}；{optimization_action}。",
+        "安全边界：所有优化建议须经人工确认，系统不直接下发控制指令。",
+    ]
+    limitations = list(result.get("limitations") or [])[:6]
+    if limitations:
+        presentation_lines.append(f"说明：{limitations[0]}")
+    presentation = "\n".join(presentation_lines)
+
+    return {
+        "status": "success",
+        "run_id": run_id,
+        "decision_status": "evidence_ready",
+        "data_source_label": source_label,
+        "model_selection": {
+            "selected_detector": str(
+                selection.get("selected_detector") or result.get("detector") or "unknown"
+            ),
+            "selected_detector_name": str(
+                selection.get("selected_detector_name")
+                or result.get("detector")
+                or "未知模型"
+            ),
+            "analysis_goal_name": str(
+                selection.get("analysis_goal_name") or "未记录任务目标"
+            ),
+            "selected_threshold": selection.get("selected_threshold"),
+            "selection_mode": str(selection.get("mode") or "unknown"),
+            "reason": str(selection.get("reason") or "历史任务未记录模型选择依据"),
+            "candidate_count": len(selection.get("candidate_ranking") or []),
+        },
+        "cross_validation": {
+            "enabled": bool(validation),
+            "status": str(validation.get("status") or "not_available"),
+            "model_count": int(validation.get("model_count") or 0),
+            "agreement_level": str(agreement.get("level") or "不可用"),
+            "conclusion": str(validation.get("conclusion") or "未形成交叉验证结论"),
+            "supporting_models": supporting_models[:8],
+            "failed_model_count": len(validation.get("failed_models") or []),
+            "model_details": model_details,
+            "agreement_metrics": agreement,
+            "failed_models": list(validation.get("failed_models") or [])[:8],
+        },
+        "trend_risk": {
+            "forecast_sensor_count": len(forecasts),
+            "alert_count": len(alerts),
+            "highest_risk": highest_risk,
+            "alert_summaries": alert_summaries,
+            "forecast_summaries": forecast_summaries,
+        },
+        "optimization": {
+            "recommendation_count": len(optimizations),
+            "recommendations": optimization_summaries,
+            "human_gate": "所有优化建议均须由工艺、设备和安全人员确认，系统不直接下发控制指令。",
+        },
+        "work_order_summary": {
+            "count": len(work_orders),
+            "highest_priority": highest_priority,
+            "record_ids": [
+                str(item["record_id"])
+                for item in work_orders[:20]
+                if item.get("record_id")
+            ],
+        },
+        "rag_context": {
+            "query": str(
+                diagnosis_evidence.get("retrieval_query")
+                or "；".join(query_parts)
+                or "工业时序异常诊断与现场验证流程"
+            ),
+            "sensor_terms": sensor_terms,
+            "candidate_causes": candidate_causes[:6],
+            "evidence_gaps": evidence_gaps[:8],
+            "usage_rule": (
+                "万悟知识库只补充故障机理、验证步骤和处置规程；不得覆盖结构化候选排序，"
+                "不得把检索文本当作故障确诊。"
+            ),
+            "retrieval_mode": retrieval_mode,
+            "result_count": len(rag_sources),
+            "sources": rag_sources,
+        },
+        "model_audit": {
+            **model_audit,
+        },
+        "limitations": limitations,
+        "next_action": (
+            "按风险等级派发告警，并由现场人员确认候选根因和优化建议。"
+            if alerts or work_orders
+            else "本次未形成告警工单，继续无人值守监测并积累同工况基线。"
+        ),
+        "presentation": presentation,
+    }
+
+
+def _record_time(value: Any) -> datetime | None:
+    """兼容 PostgreSQL datetime 和旧文本时间，统一用于班次窗口筛选。"""
+
+    if isinstance(value, datetime):
+        parsed = value
+    elif value:
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+    else:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+
+
+def _within_period(value: Any, start: datetime, end: datetime) -> bool:
+    """只统计时间明确落在窗口内的记录，缺失或未来时间不进入班次简报。"""
+
+    timestamp = _record_time(value)
+    return timestamp is not None and start <= timestamp <= end
+
+
+def _wanwu_shift_brief_payload(*, hours: int, max_records: int) -> dict[str, Any]:
+    """聚合任务、工单与通知审计，生成无需大模型的班次运行简报。"""
+
+    repository = get_repository()
+    period_end = datetime.now(ZoneInfo("Asia/Shanghai"))
+    period_start = period_end - timedelta(hours=hours)
+    runs = [
+        item
+        for item in repository.list_runs(
+            limit=max_records,
+            include_archived=True,
+        )
+        if _within_period(item.get("started_at"), period_start, period_end)
+    ]
+    work_orders = repository.list_work_orders(
+        limit=max_records,
+        include_archived=False,
+    )
+    period_orders = [
+        item
+        for item in work_orders
+        if _within_period(item.get("created_at"), period_start, period_end)
+    ]
+    notifications = [
+        item
+        for item in repository.list_notifications(limit=max_records)
+        if _within_period(item.get("created_at"), period_start, period_end)
+    ]
+
+    successful_details = [
+        repository.get_run(item["run_id"])
+        for item in runs
+        if item.get("status") == "success"
+    ]
+    anomaly_event_count = 0
+    high_risk_run_count = 0
+    for run in successful_details:
+        result = (run or {}).get("result") or {}
+        analysis = result.get("analysis") if isinstance(result.get("analysis"), dict) else result
+        events = analysis.get("anomaly_events") or []
+        alerts = analysis.get("risk_alerts") or []
+        anomaly_event_count += len(events)
+        if any(str(item.get("等级")) == "高风险" for item in alerts) or any(
+            str(item.get("severity")) == "高风险" for item in events
+        ):
+            high_risk_run_count += 1
+
+    unresolved = [
+        item for item in work_orders if item.get("status") not in {"已完成", "已关闭"}
+    ]
+    priority_counts = {
+        priority: sum(item.get("priority") == priority for item in period_orders)
+        for priority in ("P1", "P2", "P3")
+    }
+    kind_counts = {
+        kind: sum(item.get("notification_kind") == kind for item in notifications)
+        for kind in (
+            "sla_reminder",
+            "sla_escalation",
+            "reinspection_passed",
+            "reinspection_failed",
+        )
+    }
+    unresolved_items = [
+        {
+            "record_id": item.get("record_id"),
+            "priority": item.get("priority"),
+            "status": item.get("status"),
+            "title": item.get("title"),
+            "assigned_role": item.get("assigned_role"),
+            "sla_level": item.get("sla_level", 0),
+            "reinspection_status": item.get("reinspection_status"),
+        }
+        for item in unresolved[:10]
+    ]
+    failed_runs = sum(item.get("status") == "failed" for item in runs)
+    presentation = "\n".join(
+        [
+            f"班次窗口：{period_start.isoformat()} 至 {period_end.isoformat()}。",
+            (
+                f"分析任务 {len(runs)} 个，成功 {sum(item.get('status') == 'success' for item in runs)} 个，"
+                f"失败 {failed_runs} 个；共形成异常事件 {anomaly_event_count} 个。"
+            ),
+            (
+                f"新建工单 {len(period_orders)} 张，其中 P1/P2/P3 为 "
+                f"{priority_counts['P1']}/{priority_counts['P2']}/{priority_counts['P3']}；"
+                f"当前未闭环 {len(unresolved)} 张。"
+            ),
+            (
+                f"本窗口催办 {kind_counts['sla_reminder']} 次、超时升级 "
+                f"{kind_counts['sla_escalation']} 次、复检通过 {kind_counts['reinspection_passed']} 次、"
+                f"复检未通过 {kind_counts['reinspection_failed']} 次。"
+            ),
+            "说明：简报来自系统审计记录，公开 SKAB 演示结果不代表企业现场收益。",
+        ]
+    )
+    return {
+        "status": "success",
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "hours": hours,
+        "run_summary": {
+            "total": len(runs),
+            "success": sum(item.get("status") == "success" for item in runs),
+            "failed": failed_runs,
+            "running_or_queued": sum(
+                item.get("status") in {"running", "queued"} for item in runs
+            ),
+            "anomaly_event_count": anomaly_event_count,
+            "high_risk_run_count": high_risk_run_count,
+            "latest_run_ids": [str(item["run_id"]) for item in runs[:10]],
+        },
+        "work_order_summary": {
+            "created_count": len(period_orders),
+            "priority_counts": priority_counts,
+            "unresolved_count": len(unresolved),
+            "unresolved_p1_count": sum(item.get("priority") == "P1" for item in unresolved),
+            "waiting_reinspection_count": sum(
+                item.get("reinspection_status") == "pending" for item in unresolved
+            ),
+        },
+        "aftercare_summary": {
+            "reminder_count": kind_counts["sla_reminder"],
+            "escalation_count": kind_counts["sla_escalation"],
+            "reinspection_passed_count": kind_counts["reinspection_passed"],
+            "reinspection_failed_count": kind_counts["reinspection_failed"],
+        },
+        "notification_summary": {
+            "total": len(notifications),
+            "sent": sum(item.get("status") == "sent" for item in notifications),
+            "failed": sum(item.get("status") == "failed" for item in notifications),
+            "pending": sum(item.get("status") == "pending" for item in notifications),
+        },
+        "unresolved_items": unresolved_items,
+        "presentation": presentation,
+        "limitations": [
+            "当前按滚动小时窗口统计，企业部署后应对接正式班次日历。",
+            "简报只汇总系统可见记录，线下处置必须及时回写工单才能进入统计。",
+        ],
+        "next_action": (
+            "优先处理未闭环 P1 工单和复检未通过事项。"
+            if any(item.get("priority") == "P1" for item in unresolved)
+            else "按未闭环工单优先级继续处置，并在下一班次复核趋势变化。"
+        ),
+    }
+
+
 def _cancel_job_payload(run_id: str) -> dict[str, Any]:
     """取消排队任务，供路径参数接口和万悟 JSON 接口共同调用。"""
 
@@ -1129,6 +1599,7 @@ def _quick_analysis_payload(run_id: str, result: Any) -> dict[str, Any]:
         "forecast_results": full["forecast_results"],
         "risk_alerts": full["risk_alerts"][:10],
         "recommendations": full["recommendations"][:10],
+        "optimization_recommendations": full["optimization_recommendations"][:8],
         "execution_trace": full["execution_trace"],
         "agent_decisions": full["agent_decisions"],
         "summary": full["summary"],
@@ -1219,6 +1690,7 @@ def _execute_analysis_job(
             automatic = AutomaticDiagnosisService().diagnose(result, run_id=run_id)
             response["automatic_diagnosis"] = automatic.to_dict()
             diagnosis_status = automatic.status
+        response["model_audit"] = _model_audit_payload(run_id)
     except Exception as exc:  # noqa: BLE001  后台任务必须自行落库，不能依赖 FastAPI。
         log_record = logger.finish(
             "failed",
@@ -1893,7 +2365,7 @@ if app:
                 run_detector_validation=True,
                 case_matcher=get_repository().find_similar_cases,
             )
-            # 快速工具不向 GLM-5 发起请求，避免“外层万悟调用 + 内部诊断调用”叠加限流。
+# 快速工具不向后端辅助聊天模型发起请求，避免“外层万悟调用 + 内部诊断调用”叠加限流。
             automatic = AutomaticDiagnosisService(
                 settings,
                 allow_external_calls=False,
@@ -2100,21 +2572,41 @@ if app:
         }
 
     @app.post(
-        "/api/v1/wanwu/automation/aftercare",
-        operation_id="run_industrial_aftercare_cycle",
-        summary="执行工单催办升级与维修后自动复检",
+        "/api/v1/wanwu/automation/sla",
+        operation_id="run_industrial_sla_cycle",
+        summary="执行工单 SLA 督办与超时升级",
         response_model=WanwuAftercareCycleResponse,
     )
-    def wanwu_aftercare_cycle(
+    def wanwu_sla_cycle(
         payload: WanwuAftercareCycleRequest,
         x_api_key: Annotated[str | None, Header()] = None,
     ) -> dict[str, Any]:
-        """由万悟定时触发工单售后周期，不调用大模型也不直接控制工业设备。"""
+        """供万悟独立 SLA 工作流定时调用，不执行维修复检。"""
 
         _check_api_key(x_api_key)
-        result = run_aftercare_cycle(
+        result = run_sla_cycle(
             get_repository(),
             AftercarePolicy.from_settings(settings),
+            max_work_orders=payload.max_work_orders,
+            dry_run=payload.dry_run,
+        )
+        return {**result, "orchestrator": settings.automation_orchestrator}
+
+    @app.post(
+        "/api/v1/wanwu/automation/reinspection",
+        operation_id="run_industrial_reinspection_cycle",
+        summary="执行维修后同源数据自动复检",
+        response_model=WanwuAftercareCycleResponse,
+    )
+    def wanwu_reinspection_cycle(
+        payload: WanwuAftercareCycleRequest,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """供万悟独立复检工作流定时调用，不执行 SLA 督办。"""
+
+        _check_api_key(x_api_key)
+        result = run_reinspection_cycle(
+            get_repository(),
             max_work_orders=payload.max_work_orders,
             dry_run=payload.dry_run,
         )
@@ -2203,6 +2695,44 @@ if app:
 
         _check_api_key(x_api_key)
         return _job_result_payload(payload.run_id)
+
+    @app.post(
+        "/api/v1/wanwu/jobs/decision-brief",
+        operation_id="get_industrial_decision_brief",
+        summary="获取模型、交叉验证、趋势风险与优化决策摘要",
+        response_model=WanwuDecisionBriefResponse,
+        responses={
+            404: {"model": ErrorResponse},
+            409: {"model": ErrorResponse},
+            422: {"model": ErrorResponse},
+        },
+    )
+    def wanwu_decision_brief(
+        payload: RunIdRequest,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """把完整任务结果压缩为万悟选择器和结束节点可直接引用的证据。"""
+
+        _check_api_key(x_api_key)
+        return _wanwu_decision_brief_payload(payload.run_id)
+
+    @app.post(
+        "/api/v1/wanwu/reports/shift-brief",
+        operation_id="generate_industrial_shift_brief",
+        summary="生成工业巡检班次简报",
+        response_model=WanwuShiftBriefResponse,
+    )
+    def wanwu_shift_brief(
+        payload: WanwuShiftBriefRequest,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """供万悟按班次定时触发，汇总审计记录而不调用大模型。"""
+
+        _check_api_key(x_api_key)
+        return _wanwu_shift_brief_payload(
+            hours=payload.hours,
+            max_records=payload.max_records,
+        )
 
     @app.post(
         "/api/v1/wanwu/jobs/cancel",

@@ -14,6 +14,8 @@ EXPECTED_OPERATION_IDS = {
     "submit_industrial_analysis",
     "get_industrial_analysis_status",
     "get_industrial_analysis_result",
+    "get_industrial_decision_brief",
+    "generate_industrial_shift_brief",
     "cancel_industrial_analysis",
     "list_industrial_work_orders",
     "update_industrial_work_order",
@@ -24,7 +26,8 @@ EXPECTED_OPERATION_IDS = {
     "list_industrial_data_sources",
     "configure_industrial_data_source",
     "verify_industrial_data_source",
-    "run_industrial_aftercare_cycle",
+    "run_industrial_sla_cycle",
+    "run_industrial_reinspection_cycle",
 }
 
 

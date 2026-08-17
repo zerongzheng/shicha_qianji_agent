@@ -28,6 +28,7 @@ class KnowledgeChunk:
     source: str
     text: str
     score: float = 0.0
+    retrieval_mode: str = "keyword"
 
 
 def search_knowledge(
@@ -35,6 +36,7 @@ def search_knowledge(
     top_k: int = 4,
     *,
     use_embeddings: bool = True,
+    audit_run_id: str | None = None,
 ) -> list[KnowledgeChunk]:
     """检索工业知识；确定性模式可显式关闭外部 Embedding 请求。"""
 
@@ -48,11 +50,24 @@ def search_knowledge(
 
     keyword_scores = _keyword_scores(clean_query, chunks)
     if not use_embeddings or not settings.embedding_enabled:
-        return _rank_chunks(chunks, keyword_scores, top_k, require_positive=True)
+        return _rank_chunks(
+            chunks,
+            keyword_scores,
+            top_k,
+            require_positive=True,
+            retrieval_mode="keyword",
+        )
 
     try:
         index = load_or_build_index(chunks, settings)
-        query_vectors = embed_texts([clean_query], settings)
+        if audit_run_id:
+            query_vectors = embed_texts(
+                [clean_query],
+                settings,
+                run_id=audit_run_id,
+            )
+        else:
+            query_vectors = embed_texts([clean_query], settings)
         if len(query_vectors) != 1:
             raise ValueError("Embedding 接口未返回查询向量。")
         vector_scores = cosine_similarities(query_vectors[0], index.vectors)
@@ -60,10 +75,22 @@ def search_knowledge(
             KEYWORD_WEIGHT * _min_max_normalize(keyword_scores)
             + VECTOR_WEIGHT * _min_max_normalize(vector_scores)
         )
-        return _rank_chunks(chunks, combined, top_k, require_positive=True)
+        return _rank_chunks(
+            chunks,
+            combined,
+            top_k,
+            require_positive=True,
+            retrieval_mode="hybrid_embedding",
+        )
     # RAG 是辅助能力。网络、限流、鉴权或缓存异常不能阻断 Agent 的确定性分析工具。
     except (OpenAIError, OSError, RuntimeError, TypeError, ValueError):
-        return _rank_chunks(chunks, keyword_scores, top_k, require_positive=True)
+        return _rank_chunks(
+            chunks,
+            keyword_scores,
+            top_k,
+            require_positive=True,
+            retrieval_mode="keyword_fallback",
+        )
 
 
 def format_knowledge_context(query: str, top_k: int = 4) -> str:
@@ -99,6 +126,7 @@ def _rank_chunks(
     top_k: int,
     *,
     require_positive: bool,
+    retrieval_mode: str,
 ) -> list[KnowledgeChunk]:
     """按分数稳定排序，并保留分数用于后续调试和评测。"""
 
@@ -108,7 +136,14 @@ def _rank_chunks(
         score = float(scores[index])
         if require_positive and score <= 0:
             continue
-        results.append(KnowledgeChunk(chunks[index].source, chunks[index].text, score))
+        results.append(
+            KnowledgeChunk(
+                chunks[index].source,
+                chunks[index].text,
+                score,
+                retrieval_mode,
+            )
+        )
         if len(results) >= top_k:
             break
     return results

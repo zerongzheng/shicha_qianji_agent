@@ -9,17 +9,17 @@
 外部定时器（只提供时间信号）
     -> 调用已发布的万悟工作流 OpenAPI
     -> run_unattended_industrial_cycle 自动发现新数据并返回 run_id
-    -> 万悟循环查询任务状态并读取结构化结果
+    -> 万悟循环查询任务状态并读取决策摘要
     -> dispatch_industrial_alerts 完成分级路由和企业微信推送
-    -> 万悟直接展示异常证据、趋势预警和处置顺序
-    -> 查询 GET /api/v1/work-orders 展示待办工单
-    -> PATCH /api/v1/work-orders/{record_id} 回写现场结果
-    -> 已确认根因自动沉淀为历史案例
-    -> 下一次相似事件检索案例并参与候选根因排序
+    -> 独立 SLA 工作流催办和升级未接单工单
+    -> 现场人员回写处置结果并将工单改为待验证
+    -> 独立复检工作流只使用同一数据源的处置后新批次复检
+    -> 独立班次简报工作流汇总最近 8 小时运行和闭环状态
 ```
 
-小文件本地调试仍可直接调用 `/api/v1/analyze` 或 `/api/v1/diagnose`。万悟比赛演示优先使用
-快速诊断接口，避免低 QPM 模型被多轮工具编排消耗；正式部署再使用异步链路。
+竞赛主流程不要求用户上传 CSV，也不使用 `quick_industrial_diagnosis` 发起分析。该接口以及
+`/api/v1/analyze`、`/api/v1/diagnose` 只保留给本地调试和受控问题复现。辅助智能体负责查询状态、
+解释结构化证据和按需使用 RAG，不承担周期巡检、算法判断、工单生成、通知、SLA 或复检。
 
 ## 为什么增加万悟专用接口
 
@@ -39,21 +39,20 @@
 http://host.docker.internal:8000/integrations/wanwu/openapi.json
 ```
 
-它包含十五个万悟可稳定调用的工具，并为每个工具固定英文 `operationId`。其中三个数据源工具
-负责查询、配置和只读验收，四个自动化工具负责巡检周期、运行状态、主动告警和工单售后；
+它包含 18 个万悟可稳定调用的工具，并为每个工具固定英文 `operationId`。其中三个数据源工具
+负责查询、配置和只读验收；无人值守巡检、SLA 督办、维修后复检和班次简报分别由独立工具负责；
 `quick_industrial_diagnosis` 保留为人工上传调试入口。
 
-比赛演示专用 Schema：
+人工上传调试专用 Schema：
 
 ```text
 http://host.docker.internal:8000/integrations/wanwu/quick-openapi.json
 ```
 
-该地址只暴露 `quick_industrial_diagnosis` 一个工具。创建比赛演示智能体时应优先导入这个地址；
-完整十五工具 Schema 用于数据源配置和无人值守工作流；单工具 Schema 只用于人工上传调试，不要把两份
-Schema 同时绑定到同一个辅助智能体。
+该地址只暴露 `quick_industrial_diagnosis` 一个工具。竞赛主流程和现有辅助智能体使用完整 18 工具
+Schema；单工具 Schema 只用于独立的人工上传调试，不应替换、覆盖或重复绑定现有完整工具集。
 
-## 低调用额度快速诊断
+## 历史调试入口：低调用额度快速诊断
 
 ```text
 POST /api/v1/wanwu/quick-diagnosis
@@ -77,8 +76,8 @@ POST /api/v1/wanwu/quick-diagnosis
 万悟未指定 `detector` 时默认自动路由；显式传入 `detector` 时保持人工配置。SKAB 独立测试表明
 四模型严格多数共识会损失事件召回，因此当前只作为可信度证据，不直接抑制主模型告警。
 
-这不是删除大模型能力，而是把比赛现场的第一轮结果交给确定性算法完成；`/api/v1/diagnose`
-仍保留给 Vue3 调试页和需要高质量自然语言诊断的受控流程。
+该接口不属于当前竞赛主流程。`/api/v1/diagnose` 仍保留给 Vue3 调试页和需要高质量自然语言
+诊断的受控流程；大模型不可用时也不能影响已经完成的工业分析和工单事实。
 
 ## 启动本地分析服务
 
@@ -94,9 +93,9 @@ uv run python api_main.py
 Invoke-RestMethod http://127.0.0.1:8000/health
 ```
 
-## 接口协议
+## 人工调试接口协议
 
-### 上传 CSV
+### 上传 CSV（仅调试）
 
 ```text
 POST /api/v1/files
@@ -136,6 +135,69 @@ Content-Type: multipart/form-data
 - `risk_alerts`：当前异常与趋势预测形成的结构化预警；
 - `recommendations`：处置建议；
 - `run_id`：用于日志和后续结果追踪。
+
+### 获取决策证据摘要
+
+```text
+POST /api/v1/wanwu/jobs/decision-brief
+```
+
+请求体只传成功任务的 `run_id`。该工具复用 PostgreSQL 中的已落库结果，不重新执行算法，
+也不调用大模型。返回值将完整结果压缩为 `model_selection`、`cross_validation`、
+`trend_risk`、`optimization` 和 `work_order_summary` 五组稳定字段，便于万悟选择器、结束节点
+和辅助智能体直接引用。任务尚未成功时返回 `409`，失败任务继续沿用结果接口的 `422`。
+
+`optimization` 中每条建议均保留证据、观察窗口和回退条件，且顶层 `human_gate` 明确要求人工
+确认；该接口不提供自动控制或参数下发能力。公开 SKAB 数据会在 `data_source_label` 中标识，
+避免把公开数据验证误写为企业现场成效。
+
+`rag_context` 是给万悟知识库节点准备的最小检索输入，只包含测点名、候选原因和证据缺口。
+不要把原始 CSV、完整预测数组或整份分析结果传入 RAG。知识库用于补充故障机理、验证步骤和
+处置规程，不能替代结构化候选排序或现场确诊。当前摘要还会返回 `retrieval_mode`、命中文档
+来源、检索分数和命中数量；`hybrid_embedding` 表示 DashScope Embedding 与关键词混合检索，
+`keyword_fallback` 表示向量接口异常时的可解释降级，`not_run` 表示本次任务没有执行自然语言
+诊断层检索。这样可以向评委证明 RAG 实际引用了什么，也能说明网络或限流故障没有阻断确定性分析。
+
+`model_audit` 返回本次任务关联的大模型和 Embedding 调用元数据，包括调用类型、模型、状态、耗时
+和 Token 统计；永远不保存提示词、回答正文、API Key 或原始 CSV。模型调用也可以通过
+`GET /api/v1/model-calls?run_id=...` 单独查询。模型审计是旁路能力，数据库暂时不可用时不会改变
+分析结果。
+
+## OpenClaw 式 Skill 与权限
+
+本项目仍只有一个“时察千机工业时序智能体”。五个工作流以 Skill 形式组织，机器可读契约位于
+`wanwu/skills/catalog.json`，说明文件位于 `wanwu/skills/README.md`。万悟导入的工具描述会同时
+标注“只读查询”或“会产生副作用”。聊天默认只读；数据源配置、立即巡检、主动通知、SLA 督办和
+人工复检必须先明确确认，四个已发布周期工作流则属于部署时预授权的后台任务。该确认规则由
+`wanwu/agent_prompt.md` 和导入后的工具描述共同约束，不把确认逻辑交给大模型自由发挥。
+
+### 生成班次简报
+
+```text
+POST /api/v1/wanwu/reports/shift-brief
+```
+
+默认汇总最近 8 小时 PostgreSQL 审计记录，包括任务状态、异常事件数、P1/P2/P3 工单、未闭环
+事项、SLA 催办、超时升级、复检结果和通知投递。接口返回结构化字段及可直接展示的
+`presentation`，不调用大模型。当前是滚动时间窗口；企业部署后应替换为正式班次日历。
+
+### 自动化验收
+
+`scripts/accept_wanwu_workflows.ps1` 默认只检查后端健康状态、PostgreSQL、18 个工具、万悟网关验证码
+接口和四个运行工作流配置。传入 `-RunWorkflows` 才调用已发布工作流，传入 `-InjectSample` 才从
+公开 SKAB 向模拟目录投递一个新批次。验收报告位于
+`outputs/wanwu_acceptance_report.json`，不包含密钥和 Webhook。
+
+本机一键启动和停止：
+
+```powershell
+.\scripts\start_basic_stack.ps1
+.\scripts\stop_basic_stack.ps1
+```
+
+启动脚本会校验四份 `outputs/wanwu_*_workflow.local.json`，并分别启动无人值守巡检、
+SLA 督办、维修后复检、班次简报触发器。后端 PID 与四个触发器 PID 都写入 `outputs/`；
+重复启动按 PID 和命令行复用已有进程，停止脚本只停止本项目拥有的进程。
 
 `work_order_drafts` 中的 `record_id` 是数据库全局唯一工单编号。后续万悟工单节点应保存并
 传递这个字段，不要只使用可能在不同任务间重复的 `work_order_id`。
@@ -189,14 +251,15 @@ POST /api/v1/diagnose
 ```
 
 请求体与 `/api/v1/analyze` 相同。该端点先运行完整工业分析，再根据异常传感器、趋势预警
-和关系证据生成确定性候选根因与工单草案，再检索本地工业知识，最后只调用一次 GLM-5
+和关系证据生成确定性候选根因与工单草案，再检索本地工业知识，最后只调用一次项目配置的
+DashScope 聊天模型
 生成以下结构：
 
 ```text
 诊断结论 → 关键证据 → 可能原因及来源 → 处置顺序 → 使用边界
 ```
 
-返回的 `automatic_diagnosis.status` 为 `generated` 时表示 GLM-5 已生成诊断；为
+返回的 `automatic_diagnosis.status` 为 `generated` 时表示 DashScope 聊天模型已生成诊断；为
 `fallback` 时表示接口未配置、限流或网络异常，系统已返回不依赖大模型的确定性降级诊断。
 两种状态都保留完整工业分析结果，原始 CSV 均不会发送给大模型。
 
@@ -260,105 +323,55 @@ POST /api/v1/forecast-compare
 
 ## 万悟工作流建议
 
-### 比赛演示不要使用普通智能体链路
+### 当前竞赛主流程
 
-普通智能体的执行方式是“ChatModel 判断 -> 工具 -> ChatModel 组织最终回复”。即使
-`quick_industrial_diagnosis` 已经返回 `model_call_count=0`，智能体仍可能在工具成功后
-再次请求平台 ChatModel；截图中 `node_1, ChatModel` 的 429 就属于这次二次请求，而不是
-时察千机 API 失败。
+现有配置由一个手动数据源配置工作流、四个周期工作流和一个辅助智能体组成，不再创建人工上传
+工作流，也不需要把工作流转换为 Skill：
 
-比赛演示建议创建一个**工作流**，将最终回复交给结束节点：
+| 入口 | 触发方式 | 核心工具 | 是否依赖大模型 |
+| --- | --- | --- | --- |
+| 工业数据源接入配置 | 首次配置或修改时手动运行 | `configure_industrial_data_source`、`verify_industrial_data_source` | 否 |
+| 无人值守工业巡检 | 每 60 秒 | `run_unattended_industrial_cycle`、状态查询、决策摘要、主动告警 | 否 |
+| 工单 SLA 督办 | 每 300 秒 | `run_industrial_sla_cycle` | 否 |
+| 维修后自动复检 | 每 300 秒 | `run_industrial_reinspection_cycle` | 否 |
+| 工业班次简报 | 每 28800 秒 | `generate_industrial_shift_brief` | 否 |
+| 辅助智能体 | 人员按需提问 | 只读查询、明确确认后的工单操作、知识库 | 仅解释和问答时使用 |
+
+无人值守巡检画布固定为：
 
 ```text
-开始节点（File 类型 CSV）
-    -> 工具节点（quick_industrial_diagnosis）
-    -> 结束节点（返回变量或返回文本）
+开始
+  -> run_unattended_industrial_cycle
+  -> 按 cycle_status 分支
+  -> analysis_queued 时循环 get_industrial_analysis_status
+  -> success 时调用 get_industrial_decision_brief
+  -> dispatch_industrial_alerts
+  -> 终态输出 presentation
 ```
 
-工作流中不要放大模型节点，也不要把工作流再包装成普通智能体后让智能体负责二次总结。
-这样一次演示只产生平台入口所需的最少模型调用；工具返回后的最终输出由结束节点直接完成。
+`no_data`、`partial_failure` 和 `busy` 都应输出明确状态并等待下一周期，不得静默伪装为正常分析。
+主工作流读取的是监测目录或 HTTP 数据源发现的新批次，不要求用户在万悟对话框上传文件。
 
-#### 工作流页面配置
+无人值守主工作流只负责新数据发现、分析、证据读取和主动告警；不要把 SLA 和复检塞进这条链路。
+工单 SLA 督办工作流单独调用 `run_industrial_sla_cycle`，维修后自动复检工作流单独调用
+`run_industrial_reinspection_cycle`。两个工具都不调用大模型：前者检查未接单工单并按时限催办或升级，
+后者检查状态为 `待验证` 的工单是否产生同一 `source_id` 的处置后新任务。原异常主导测点不再出现
+才自动完成，仍出现则退回处理中；没有新数据时保持等待。通知以“工单 + 接收人 + 渠道 + 通知类型 +
+升级层级”幂等，万悟重试不会重复发送同阶段消息。两个工具均返回 `presentation` 短文本，消息输出
+节点直接引用该字段，不需要经过变量聚合节点或大模型二次改写。
 
-1. 在万悟进入“工作流”，新建工作流，不要进入“智能体”页面继续修改当前智能体。
-2. 开始节点添加参数 `industrial_file`，类型选择 `File`，描述填写“工业时序 CSV 文件”，设为必填。
-3. 从自定义工具中添加 `quick_industrial_diagnosis` 工具节点。
-4. 工具节点参数映射建议如下：
-   - `file_url`：引用开始节点 `industrial_file` 的文件 URL 输出；
-   - `file_name`：引用开始节点文件名输出，或填写固定值 `industrial_sample.csv`；
-   - `file_base64`：留空，不要与 `file_url` 同时传入；
-   - `config`：留空，使用时察千机默认参数。
-5. 添加结束节点，选择“返回变量”模式，输出变量引用工具节点的：
-   - `presentation`：面向评委的中文诊断摘要；
-   - `analysis`：结构化证据，可用于卡片展示；
-   - `automatic_diagnosis`：规则诊断和使用边界；
-   - `cache_hit`：是否复用已有结果。
-6. 不添加“大模型节点”。结束节点文档明确支持直接返回上游节点的结构化变量。
-7. 点击“试运行”，上传 CSV，确认工具节点成功且结束节点能直接返回结果。
-8. 试运行成功后发布工作流。之后通过工作流入口或发布后的工作流 API 调用。
+### 辅助解释、RAG 与模型日志
 
-如果工作流界面不允许直接把 File 类型映射为 `file_url`，改用开始节点的字符串参数
-`file_url`，让文件节点先提供平台可访问的临时下载地址，再映射到工具节点的 `file_url`。
-不要把 Windows 路径 `E:\\...` 传给服务端。
+辅助智能体与五个工作流属于同一个“时察千机工业时序智能体”能力体系，不需要创建第二个智能体。
+它可以查询任务、结果、工单和历史案例，并基于万悟知识库补充机理、验证步骤和规程来源。RAG 和
+聊天模型只能解释后端已经形成的结构化证据，不能修改异常事件、风险等级、工单编号或复检结论。
 
-比赛演示优先使用异步工作流，避免工业分析超过万悟 HTTP 节点超时时间：
+在对话中调用会产生副作用的工具前必须得到用户明确确认；后台周期工作流视为预授权。模型调用日志
+只记录提供方、模型、状态、耗时、Token 和输入输出规模，不保存 API Key、完整提示词、回答正文或
+原始 CSV。主工作流即使遇到模型限流或网络错误也必须继续完成确定性分析和业务闭环。
 
-1. 文件输入节点接收用户 CSV，并取得平台临时下载 URL；小文件也可传 Base64；
-2. 工具节点调用 `submit_industrial_analysis`，保存返回的 `run_id`；
-3. 循环节点调用 `get_industrial_analysis_status`；
-4. 选择器判断 `job_status`：`queued/running` 继续等待，`success` 进入结果节点，`failed` 展示错误，`cancelled` 结束流程；
-5. 工具节点调用 `get_industrial_analysis_result`；
-6. 展示 `root_cause_diagnoses`、`work_order_drafts` 和结构化风险证据；
-7. 由一个万悟大模型节点生成面向运维人员的解释文本；
-8. 将 `work_order_drafts[].record_id` 传给工单卡片，现场确认后调用 `update_industrial_work_order` 回写结果。
-9. 调用 `list_industrial_feedback_cases` 展示已沉淀案例；后续分析结果中的 `historical_case_matches` 会自动引用相似案例。
-
-无人值守主工作流应在巡检节点前调用 `run_industrial_aftercare_cycle`。该工具不调用大模型，
-会在每次定时触发时检查未接单 SLA，并处理状态为 `待验证` 的工单。复检必须找到同一
-`source_id` 在处置后的新成功任务：原异常主导测点不再出现才自动完成，仍出现则退回处理中；
-没有新数据时保持等待，不会把空结果误判为设备恢复。通知以“工单 + 接收人 + 渠道 + 通知类型 +
-升级层级”幂等，万悟重试不会重复发送同阶段消息。
-
-异步任务请求示例：
-
-```json
-{
-  "file_url": "文件节点返回的临时 HTTPS 下载地址",
-  "file_name": "industrial_sample.csv",
-  "operation": "analyze",
-  "config": {
-    "detector": "time_frequency_relation",
-    "threshold": 4.5,
-    "rolling_window": 61,
-    "min_event_length": 3
-  }
-}
-```
-
-提交成功返回 HTTP 202：
-
-```json
-{
-  "status": "queued",
-  "run_id": "run_xxxxxxxxxxxx",
-  "file_id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-  "file_source": "url",
-  "operation": "analyze",
-  "status_url": "/api/v1/jobs/run_xxxxxxxxxxxx",
-  "result_url": "/api/v1/jobs/run_xxxxxxxxxxxx/result"
-}
-```
-
-建议循环间隔设置为 2 至 5 秒，并设置最大循环次数。不要毫秒级连续查询 PostgreSQL。
-用户撤回分析或工作流达到最大等待次数时，可调用 `cancel_industrial_analysis` 取消仍在
-排队的任务。已经进入 `running` 的计算不会被强制中断，接口会返回 HTTP 409，此时应继续
-查询最终状态，避免算法仍在运行而数据库被错误标记为取消。
-
-若比赛平台要求使用万悟知识库和大模型节点，可改用 `/api/v1/analyze`，再由万悟完成知识
-检索和最终解释。两种模式不要在同一次请求中重复调用大模型。
-
-新的异步工作流中将 `operation` 设为 `analyze`，再使用一个万悟大模型节点；若设为
-`diagnose`，Python 会自行调用 GLM-5，万悟只负责展示，两种模式同样不要叠加。
+人工上传、`quick_industrial_diagnosis`、`submit_industrial_analysis` 和 `/api/v1/diagnose` 仍可用于
+开发排错，但不得出现在竞赛主流程图、答辩主演示步骤或无人值守能力表述中。
 
 ## 导入 OpenAPI
 
@@ -382,7 +395,7 @@ uv run python api_main.py
 uv run shichi-qianji-wanwu-check
 ```
 
-第二条命令会检查健康状态、完整十五个万悟工具、快速单工具 Schema 和 OpenAPI 服务地址，并同时导出：
+第二条命令会检查健康状态、完整 18 个万悟工具、快速单工具 Schema 和 OpenAPI 服务地址，并同时导出：
 
 ```text
 outputs/wanwu_openapi.json
@@ -450,9 +463,9 @@ bash scripts/check_wanwu_server.sh
 同时调用时互相抢占额度。`/api/v1/diagnose` 只使用一次聊天请求；多轮工具 Agent 通常包含
 两次以上聊天请求，因此仅适合用户后续追问。
 
-万悟工作流侧也应减少不必要的大模型节点：工业数值计算只调用时察千机 API，知识检索按需
-触发，最终解释集中在一个大模型节点完成。若平台侧还有其他应用共用同一 API Key，它们的
-请求不会进入本项目的本地限流记录，需要在万悟网关侧再配置全局限流。
+四条周期工作流不配置大模型节点：工业数值计算只调用时察千机 API，`presentation` 直接进入
+终态输出。知识检索和自然语言解释只由辅助智能体按需触发。若平台侧还有其他应用共用同一
+API Key，它们的请求不会进入本项目的本地限流记录，需要在万悟网关侧再配置全局限流。
 
 ## 安全约束
 

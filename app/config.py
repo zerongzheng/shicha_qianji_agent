@@ -128,25 +128,25 @@ def get_settings() -> Settings:
                 "../SKAB/data/anomaly-free/anomaly-free.csv",
             )
         ),
-        llm_provider=os.getenv("LLM_PROVIDER", "yuanjing_maas"),
+        llm_provider=os.getenv("LLM_PROVIDER", "dashscope"),
         llm_api_key=os.getenv("LLM_API_KEY", os.getenv("DASHSCOPE_API_KEY", "")),
         llm_base_url=os.getenv(
             "LLM_BASE_URL",
             os.getenv(
                 "DASHSCOPE_BASE_URL",
-                "https://maas-api.ai-yuanjing.com/openapi/compatible-mode/v1",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
             ),
         ).rstrip("/"),
         llm_chat_model=os.getenv(
             "LLM_CHAT_MODEL",
-            os.getenv("DASHSCOPE_CHAT_MODEL", "glm-5"),
+            os.getenv("DASHSCOPE_CHAT_MODEL", "qwen3.5-plus"),
         ),
-        llm_embedding_model=os.getenv("LLM_EMBEDDING_MODEL", "qwen3-embed-0.6b"),
-        llm_ocr_model=os.getenv("LLM_OCR_MODEL", "glm-ocr"),
-        llm_vision_model=os.getenv("LLM_VISION_MODEL", "YuanjingVL"),
+        llm_embedding_model=os.getenv("LLM_EMBEDDING_MODEL", "text-embedding-v4"),
+        llm_ocr_model=os.getenv("LLM_OCR_MODEL", ""),
+        llm_vision_model=os.getenv("LLM_VISION_MODEL", "qwen3.5-plus"),
         document_parser_url=os.getenv(
             "DOCUMENT_PARSER_URL",
-            "https://maas-api.ai-yuanjing.com/openapi/v1/rag/model_parser_file",
+            "",
         ),
         llm_requests_per_minute=int(os.getenv("LLM_REQUESTS_PER_MINUTE", "5")),
         embedding_requests_per_minute=int(

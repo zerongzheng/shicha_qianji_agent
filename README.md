@@ -78,7 +78,7 @@ flowchart LR
     B --> C["工业时序分析引擎"]
     B --> D["PostgreSQL 数据源、任务、工单与通知仓储"]
     B --> E["本地工业知识库"]
-    B --> F["比赛方 MaaS 大模型"]
+B --> F["阿里云百炼 DashScope 可选模型"]
 ```
 
 三部分职责不同：
@@ -159,9 +159,20 @@ Docker 引擎就绪：
 .\scripts\start_basic_stack.ps1
 ```
 
-脚本会检查 PostgreSQL、启动低内存万悟基础容器、时察千机后端和唯一的万悟定时触发器；重复执行会跳过
-已经运行的后端和触发器。Vue3 前端仅用于查看图表和处置工单，不是自动巡检的启动条件。
-需要整体停止时执行 `.\scripts\stop_basic_stack.ps1`，数据库卷和业务数据会保留。
+脚本会检查 PostgreSQL、启动低内存万悟基础容器、时察千机后端、Vue3 运维工作台和四个独立的万悟定时触发器：
+无人值守巡检、SLA 督办、维修后复检、班次简报。四份 `outputs/wanwu_*_workflow.local.json`
+会在启动前校验 JSON、已发布 UUID 和 API Key 配置；重复执行会按 PID 与进程命令行复用已有服务。
+Vue3 前端用于查看图表和处置工单，但不是自动巡检的运行依赖；默认随基础栈一起启动。需要整体停止时执行
+`.\scripts\stop_basic_stack.ps1`，它会停止后端、四个触发器和基础容器，数据库卷与业务数据会保留。
+
+只有在纯后端调试或需要进一步节省内存时，才显式跳过 Vue3：
+
+```powershell
+.\scripts\start_basic_stack.ps1 -SkipFrontend
+```
+
+启动脚本默认管理 `shichi_qianji_frontend.pid`，统一停止命令不变。旧的 `-IncludeFrontend`
+参数仍可使用，但已不再需要。
 
 数据源既可在 Vue3“自动监测”页面配置，也可由万悟的“数据源接入配置”工作流调用
 `configure_industrial_data_source` 保存，再调用 `verify_industrial_data_source` 做只读验收。
@@ -169,18 +180,25 @@ Docker 引擎就绪：
 演示数据源参数如下：
 
 ```text
-名称：SKAB valve1 自动监测目录
+名称：SKAB 演示实时目录
 方式：监控目录
-目录：E:\大学课程\竞赛\SKAB\data\valve1
-周期：60 秒
+目录：E:\大学课程\竞赛\shichi_qianji_agent\outputs\demo_feed\skab_valve1
+周期：30 秒（后台无人值守工作流触发频率为 60 秒）
 P1：生产值班负责人
 P2：设备工程师
 P3：运行值班员
 ```
 
-保存并启用后无需再上传或下达分析指令。竞赛配置使用 `AUTOMATION_ORCHESTRATOR=wanwu`：外部定时器只调用已发布的万悟工作流，工作流先执行工单售后周期，再通过无人值守工具检测目录中的 CSV，并以 SHA-256 内容指纹跳过已处理数据、保存不可变快照、提交异步分析、判断任务状态、读取结果并调用通知工具。售后周期会继续执行未接单催办、超时升级和维修后同源数据复检。启用企业微信群机器人后，风险等级、责任岗位、接收人员、数据来源和工单编号会被主动推送至运维群；整个业务链可在万悟运行记录中查看。
+保存并启用后无需再上传或下达分析指令。竞赛配置使用 `AUTOMATION_ORCHESTRATOR=wanwu`：
+外部定时器分别调用已发布的四个万悟工作流。无人值守巡检工作流以 SHA-256 内容指纹跳过已处理数据、
+保存不可变快照、提交异步分析、读取结果并调用通知工具；SLA 督办和维修后复检由各自独立周期推进，
+班次简报汇总最近 8 小时状态。启用企业微信群机器人后，风险等级、责任岗位、接收人员、数据来源和工单
+编号会被主动推送至运维群；整个业务链可在万悟运行记录中查看。
 
-万悟当前随附文档提供工作流 OpenAPI，但未发现画布内置 Cron 节点，因此时间信号由 Windows 任务计划程序、Linux cron 或 `wanwu/scripts/trigger_wanwu_workflow.ps1` 提供。触发器不读取工业数据也不运行算法，业务编排仍由万悟完成。完整配置见 `wanwu/WORKFLOW_SETUP.md`。
+万悟当前随附文档提供工作流 OpenAPI，但未发现画布内置 Cron 节点，因此时间信号由
+Windows 任务计划程序、Linux cron 或 `wanwu/scripts/trigger_wanwu_workflow.ps1` 提供。
+`start_basic_stack.ps1` 会为四个已发布工作流分别维护 PID 和日志文件；触发器不读取工业数据也不运行算法，
+业务编排仍由万悟完成。完整配置见 `wanwu/WORKFLOW_SETUP.md`。
 
 企业微信 Webhook 包含机器人访问密钥，只能写入被 Git 忽略的 `.env`，不能放入源码、前端表单或 `.env.example`：
 
@@ -193,6 +211,24 @@ WECOM_TIMEOUT_SECONDS=10
 校赛演示使用一个运维群即可：系统仍按 P1/P2/P3 在 PostgreSQL 中完成责任岗位与接收人路由，同一个机器人负责实际送达，消息正文会明确标注应由谁处理。若企业后续要求分别推送到多个群，可在通知适配层增加“岗位到机器人”的部署配置，不需要修改异常检测和工单逻辑。
 
 比赛演示可使用 `scripts/simulate_skab_live_feed.ps1` 将下一份公开 SKAB 样本投递到独立模拟目录，再展示万悟自动处理记录和分级通知。该脚本只模拟“新批次到达”，不修改原始数据，也不把公开数据包装成企业成效。当前目录轮询与 HTTP 轮询属于秒级或分钟级准实时采集，不宣称为 Kafka/MQTT 流式计算。企业后续提供消息队列、时序数据库或 CDC 接口时，只需新增采集适配器。
+
+后台正式频率为 60 秒，单独执行 `-RunOnce` 可能额外等待 0 至 60 秒。录制演示视频时可在
+投递后立即调用已发布的无人值守工作流，不修改正式频率：
+
+```powershell
+.\scripts\simulate_skab_live_feed.ps1 -RunOnce -TriggerAutonomousWorkflow
+```
+
+该命令可能发送企业微信通知，只在受控演示时执行；普通机制检查仍只使用 `-RunOnce`。
+如果 SKAB 样本已经全部投完，需要重新从第一份开始，可使用：
+
+```powershell
+.\scripts\simulate_skab_live_feed.ps1 -Replay -RunOnce -TriggerAutonomousWorkflow
+```
+
+`-Replay` 只重置模拟器进度，并平移复制样本的时间列以形成新的演示批次，不删除历史任务、工单、
+报告或 PostgreSQL 数据。本轮时间偏移会写入 `.feed_state.json`，后续不带 `-Replay` 的
+`-RunOnce` 会自动继承，确保整轮样本都生成新的内容指纹。
 
 设备配置采用“显式指定、自动匹配、通用回退”三层机制：
 
@@ -232,9 +268,11 @@ Copy-Item .env.example .env
 ```dotenv
 DATABASE_URL=postgresql://shichi_qianji_app:你的数据库密码@127.0.0.1:5432/shichi_qianji
 DATABASE_SCHEMA=public
-LLM_API_KEY=你的比赛方接口密钥
-LLM_BASE_URL=https://maas-api.ai-yuanjing.com/openapi/compatible-mode/v1
-LLM_CHAT_MODEL=glm-5
+LLM_PROVIDER=dashscope
+LLM_API_KEY=你的阿里云百炼 DashScope API Key
+LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+LLM_CHAT_MODEL=qwen3.5-plus
+LLM_EMBEDDING_MODEL=text-embedding-v4
 FRONTEND_ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
 # 校赛演示需要展示真实人员责任闭环时启用；密码只写本地 .env。
 AUTH_ENABLED=true
@@ -244,9 +282,14 @@ AUTH_BOOTSTRAP_PASSWORD=请设置一个校赛演示密码
 
 真实密钥只能写入本地 `.env`，不要写进代码、截图、前端源码或 GitHub。
 
+模型配置分为两层：万悟智能体页面中的聊天模型和知识库向量模型由万悟单独管理，当前均使用
+阿里云百炼 DashScope；项目 `.env` 中的 `LLM_*` 是时察千机后端的可选辅助模型配置，仅用于
+人工诊断或受控解释，不参与无人值守巡检、算法计算、工单生成、通知和复检主链。若不启用后端
+大模型，可留空 `LLM_API_KEY`，核心自动化仍可运行。
+
 ## 启动方式
 
-### A. 启动 Vue3 正式前端
+### A. 单独启动 Vue3 调试前端
 
 先开一个终端启动后端：
 
@@ -322,19 +365,21 @@ docs/WANWU_INTEGRATION.md
 http://localhost:8081
 ```
 
-万悟调用时察千机 API 使用：
+万悟调用时察千机完整工具集使用：
 
 ```text
-http://host.docker.internal:8000/integrations/wanwu/quick-openapi.json
+http://host.docker.internal:8000/integrations/wanwu/openapi.json
 ```
 
-比赛演示优先使用工作流：
+比赛演示使用无人值守主工作流：
 
 ```text
-文件输入 -> quick_industrial_diagnosis -> 结束节点直接返回 presentation
+定时触发 -> 自动发现新批次 -> 异步分析 -> 决策摘要 -> 主动告警
 ```
 
-不要在快速工作流后再叠加普通智能体大模型总结，否则容易产生额外调用和限流。
+SLA 督办、维修后复检和班次简报分别由独立周期工作流执行。四条周期工作流不放大模型节点，
+工具的 `presentation` 直接进入终态输出；大模型和 RAG 只供同一个辅助智能体按需解释。
+`quick_industrial_diagnosis` 及快速 OpenAPI 只保留给人工上传调试。
 
 未显式填写 `detector` 时，产品 API 默认采用自动模型选择；显式填写模型时进入手动模式，
 用于固定实验和人工复核。可通过 `analysis_goal` 指定 `balanced`、`high_recall`、
@@ -362,7 +407,8 @@ http://host.docker.internal:8000/integrations/wanwu/quick-openapi.json
 | `GET /api/v1/cases` | 查询历史确认案例 |
 | `POST /api/v1/wanwu/quick-diagnosis` | 万悟快速诊断入口 |
 | `POST /api/v1/wanwu/jobs/submit` | 万悟异步任务入口 |
-| `POST /api/v1/wanwu/automation/aftercare` | 万悟工单 SLA、升级与维修复检周期 |
+| `POST /api/v1/wanwu/automation/sla` | 万悟工单 SLA 督办与超时升级 |
+| `POST /api/v1/wanwu/automation/reinspection` | 万悟维修后同源数据自动复检 |
 
 完整万悟接口说明见 `docs/WANWU_INTEGRATION.md`。
 
@@ -506,7 +552,7 @@ cd "E:\大学课程\竞赛\shichi_qianji_agent\frontend"
 
 1. 固定 SKAB 文件划分、阈值调优、独立测试和消融实验；
 2. 生成实验协议、模型横向对比和相对 MAD 基线的竞赛成效表；
-3. 完成 Vue3 + FastAPI 的上传、分析、证据查看、工单确认和历史案例闭环；
+3. 完成万悟无人值守接入、FastAPI 自动分析、Vue3 证据查看、工单确认和历史案例闭环；
 4. 建立小而可靠的通用工业知识库，并保留后续企业文档替换入口；
 5. 完成独立测试集误报审计，并将 `other → valve1 → valve2` 三类案例纳入成果包。
 6. 完成 SKAB 时间尾段预测评估和受控退化提前预警实验，并纳入成果包。
@@ -514,13 +560,19 @@ cd "E:\大学课程\竞赛\shichi_qianji_agent\frontend"
 8. 完成带设备边界、观察指标、人工确认和回退条件的参数/能耗优化建议。
 9. 完成受约束优化机制实验，以及不保存提示词正文的模型调用审计。
 10. 完成 PostgreSQL 人员身份、分级通知、个人工单、接单签收和操作审计闭环。
+11. 完成 SLA 自动催办、超时升级、维修后同源数据自动复检和工单重新升级。
+12. 完成万悟决策证据摘要工具，使模型选择、交叉验证、趋势风险和受约束优化建议可直接进入工作流节点。
+13. 完成万悟知识库最小检索上下文和确定性班次简报工具，避免把原始 CSV 或大结果对象交给 RAG。
+14. 完成四个独立工作流的本地 UUID/API Key 配置和一键自动化验收报告，区分只读检查、样本投递与真实工作流调用。
 
 下一步按优先级推进：
 
 1. 获取企业时序数据后，按设备配置重新标定阈值、模型和设备专属根因规则；
 2. 用企业时序数据和运行日志复核误报分类，形成可引用的企业案例证据；
-3. 根据比赛方万悟配置确定公网部署和工作流发布方式；
-4. 接入企业统一身份平台或万悟登录，并用企业真实组织架构替换校赛预置账号。
+3. 在万悟原生知识库中导入设备说明、故障机理和处置规程，并把 `rag_context` 接入 RAG 辅助研判节点；
+4. 在万悟发布独立班次简报工作流，并按交接班时间配置定时触发与推送；
+5. 根据比赛方万悟配置确定公网部署和工作流发布方式；
+6. 接入企业统一身份平台或万悟登录，并用企业真实组织架构替换校赛预置账号。
 
 稳定的 GitHub 可公开实验摘要见 [`docs/competition/SKAB_RESULTS.md`](docs/competition/SKAB_RESULTS.md)。
 

@@ -1,4 +1,10 @@
-# SKAB 固定划分实验结论
+# SKAB 固定划分实验结论（历史实验归档）
+
+> **引用说明：本文件保留早期实验分析，不能作为当前竞赛材料的数据来源。** 当前唯一
+> 权威批次为 `outputs/competition/independent_test_20260813_164115.csv`：时频关系多路径
+> 检测器阈值为 `3.50`、事件级 F1 为 `0.6196`、事件召回为 `0.9412`。请统一引用
+> `docs/EXPERIMENT_RESULTS_CURRENT.md`、`outputs/competition/SKAB_EXPERIMENT_PROTOCOL.md`
+> 与 `outputs/competition/SKAB_EXPERIMENT_RUN_MANIFEST.json`。
 
 > 本文档是稳定的实验解读；每次重新运行后的逐文件结果、文件哈希协议和竞赛成效表，
 > 统一生成在 `outputs/competition/`。运行命令见 `scripts/run_skab_competition.ps1`。

@@ -127,6 +127,8 @@ class AnalysisResponse(StrictApiModel):
     summary: dict[str, Any]
     limitations: list[str]
     automatic_diagnosis: dict[str, Any] | None = None
+    # 模型和 Embedding 的脱敏调用审计；旧任务没有该字段时保持兼容。
+    model_audit: dict[str, Any] | None = None
 
 
 class FileUploadResponse(StrictApiModel):
@@ -267,6 +269,218 @@ class RunIdRequest(StrictApiModel):
     run_id: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
 
 
+class WanwuModelSelectionBrief(StrictApiModel):
+    """万悟画布可直接展示的主模型选择证据。"""
+
+    selected_detector: str
+    selected_detector_name: str
+    analysis_goal_name: str
+    selected_threshold: float | None = None
+    selection_mode: str
+    reason: str
+    candidate_count: int
+
+
+class WanwuCrossValidationBrief(StrictApiModel):
+    """互补检测器交叉核验摘要，不把当前标签用于在线切换模型。"""
+
+    enabled: bool
+    status: str
+    model_count: int
+    agreement_level: str
+    conclusion: str
+    supporting_models: list[str]
+    failed_model_count: int
+    model_details: list[dict[str, Any]]
+    agreement_metrics: dict[str, Any]
+    failed_models: list[dict[str, Any]]
+
+
+class WanwuAlertSummary(StrictApiModel):
+    """万悟告警分支需要读取的有限字段。"""
+
+    alert_id: str | None = None
+    type: str | None = None
+    level: str | None = None
+    confidence: str | None = None
+    sensors: list[str]
+    recommended_action: str | None = None
+
+
+class WanwuForecastSummary(StrictApiModel):
+    """单个测点的预测选模和未来风险摘要。"""
+
+    sensor: str
+    model: str | None = None
+    direction: str | None = None
+    risk: str | None = None
+    confidence: str | None = None
+    current_value: float | None = None
+    forecast_end_value: float | None = None
+    backtest_rmse: float | None = None
+
+
+class WanwuTrendRiskBrief(StrictApiModel):
+    """未来趋势和当前风险的有限摘要，省略完整预测曲线。"""
+
+    forecast_sensor_count: int
+    alert_count: int
+    highest_risk: str
+    alert_summaries: list[WanwuAlertSummary]
+    forecast_summaries: list[WanwuForecastSummary]
+
+
+class WanwuOptimizationRecommendationBrief(StrictApiModel):
+    """单条受约束优化建议，始终保留观察与回退条件。"""
+
+    recommendation_id: str | None = None
+    category: str | None = None
+    target: str | None = None
+    action: str | None = None
+    adjustment_direction: str | None = None
+    suggested_range: str | None = None
+    confidence: str | None = None
+    evidence: list[str]
+    observation_window: str | None = None
+    rollback_condition: str | None = None
+    status: str
+
+
+class WanwuOptimizationBrief(StrictApiModel):
+    """仅供人工确认的参数、能耗和数据质量优化建议摘要。"""
+
+    recommendation_count: int
+    recommendations: list[WanwuOptimizationRecommendationBrief]
+    human_gate: str
+
+
+class WanwuWorkOrderBrief(StrictApiModel):
+    """本次分析形成的工单概要。"""
+
+    count: int
+    highest_priority: str | None = None
+    record_ids: list[str]
+
+
+class WanwuRagContextBrief(StrictApiModel):
+    """万悟知识库节点的最小检索输入，不包含原始时序或大数组。"""
+
+    query: str
+    sensor_terms: list[str]
+    candidate_causes: list[str]
+    evidence_gaps: list[str]
+    usage_rule: str
+    retrieval_mode: str
+    result_count: int
+    sources: list[dict[str, Any]]
+
+
+class WanwuModelAuditBrief(StrictApiModel):
+    """本次任务的大模型/Embedding 脱敏调用审计，不包含提示词和回答正文。"""
+
+    call_count: int
+    content_stored: Literal[False]
+    calls: list[dict[str, Any]]
+
+
+class WanwuDecisionBriefResponse(StrictApiModel):
+    """供万悟工作流展示和分支判断的工业决策证据摘要。"""
+
+    status: Literal["success"]
+    run_id: str
+    decision_status: Literal["evidence_ready"]
+    data_source_label: str
+    model_selection: WanwuModelSelectionBrief
+    cross_validation: WanwuCrossValidationBrief
+    trend_risk: WanwuTrendRiskBrief
+    optimization: WanwuOptimizationBrief
+    work_order_summary: WanwuWorkOrderBrief
+    rag_context: WanwuRagContextBrief
+    model_audit: WanwuModelAuditBrief
+    limitations: list[str]
+    next_action: str
+    presentation: str
+
+
+class WanwuShiftBriefRequest(StrictApiModel):
+    """按滚动时间窗口生成班次简报；后续可映射企业正式班次。"""
+
+    hours: int = Field(default=8, ge=1, le=72, description="向前统计的小时数")
+    max_records: int = Field(
+        default=200,
+        ge=20,
+        le=200,
+        description="每类审计记录的最大读取数量",
+    )
+
+
+class WanwuShiftRunSummary(StrictApiModel):
+    total: int
+    success: int
+    failed: int
+    running_or_queued: int
+    anomaly_event_count: int
+    high_risk_run_count: int
+    latest_run_ids: list[str]
+
+
+class WanwuPriorityCounts(StrictApiModel):
+    """班次内三类工单数量，使用显式字段适配万悟变量选择器。"""
+
+    P1: int
+    P2: int
+    P3: int
+
+
+class WanwuShiftWorkOrderSummary(StrictApiModel):
+    created_count: int
+    priority_counts: WanwuPriorityCounts
+    unresolved_count: int
+    unresolved_p1_count: int
+    waiting_reinspection_count: int
+
+
+class WanwuShiftAftercareSummary(StrictApiModel):
+    reminder_count: int
+    escalation_count: int
+    reinspection_passed_count: int
+    reinspection_failed_count: int
+
+
+class WanwuShiftNotificationSummary(StrictApiModel):
+    total: int
+    sent: int
+    failed: int
+    pending: int
+
+
+class WanwuUnresolvedWorkOrderBrief(StrictApiModel):
+    record_id: str | None = None
+    priority: str | None = None
+    status: str | None = None
+    title: str | None = None
+    assigned_role: str | None = None
+    sla_level: int
+    reinspection_status: str | None = None
+
+
+class WanwuShiftBriefResponse(StrictApiModel):
+    """万悟定时工作流可直接发布的确定性班次简报。"""
+
+    status: Literal["success"]
+    period_start: str
+    period_end: str
+    hours: int
+    run_summary: WanwuShiftRunSummary
+    work_order_summary: WanwuShiftWorkOrderSummary
+    aftercare_summary: WanwuShiftAftercareSummary
+    notification_summary: WanwuShiftNotificationSummary
+    unresolved_items: list[WanwuUnresolvedWorkOrderBrief]
+    presentation: str
+    limitations: list[str]
+    next_action: str
+
+
 class WanwuAutonomousCycleRequest(StrictApiModel):
     """万悟无人值守工作流一次巡检周期的输入。"""
 
@@ -316,6 +530,7 @@ class WanwuAftercareCycleResponse(StrictApiModel):
     """SLA 催办、升级和维修复检的单周期审计结果。"""
 
     status: Literal["success"]
+    presentation: str
     cycle_status: Literal[
         "no_action",
         "actions_planned",
@@ -406,6 +621,18 @@ class WanwuDataSourceConfigureRequest(StrictApiModel):
         pattern=r"^[A-Za-z0-9_-]+$",
         description="留空时新建；填写已有编号时更新并保留分析、路由和鉴权配置",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_blank_source_id(cls, value: Any) -> Any:
+        """兼容万悟表单把未填写的可选编号发送为空字符串。"""
+
+        if isinstance(value, dict) and value.get("source_id") == "":
+            normalized = dict(value)
+            normalized["source_id"] = None
+            return normalized
+        return value
+
     name: str = Field(min_length=2, max_length=100, description="数据源名称")
     source_type: Literal["directory", "http_csv"] = Field(
         description="directory 为后端可访问目录，http_csv 为返回 CSV 的 HTTP 接口"

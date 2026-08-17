@@ -15,6 +15,10 @@ from statistics import mean
 from zoneinfo import ZoneInfo
 
 from app.config import get_settings
+from app.experiments.artifact_validation import (
+    validate_independent_test_artifacts,
+    write_run_manifest,
+)
 from app.experiments.protocol import (
     PROTOCOL_VERSION,
     build_protocol_manifest,
@@ -35,6 +39,7 @@ class CompetitionReport:
     protocol_json_path: Path
     protocol_markdown_path: Path
     effectiveness_csv_path: Path
+    run_manifest_path: Path
 
 
 def build_competition_report(
@@ -110,6 +115,18 @@ def build_competition_report(
         protocol,
         target_dir,
     )
+    validation = validate_independent_test_artifacts(records, protocol, csv_source)
+    if not validation.passed:
+        details = "\n".join(f"- {item}" for item in validation.errors)
+        raise ValueError(f"独立测试产物与实验协议不一致，拒绝生成竞赛汇总：\n{details}")
+    run_manifest_path = write_run_manifest(
+        validation,
+        target_dir,
+        benchmark_csv=csv_source,
+        benchmark_report=benchmark_path,
+        split_csv=split_path,
+        protocol_json=protocol_json_path,
+    )
     effectiveness_rows = _build_effectiveness_rows(summary_rows)
     effectiveness_csv_path = target_dir / "skab_competition_effectiveness.csv"
     _write_effectiveness_csv(effectiveness_csv_path, effectiveness_rows)
@@ -122,6 +139,7 @@ def build_competition_report(
         summary_rows,
         benchmark_path,
         split_path,
+        run_manifest_path,
     )
     comparison_path.write_text(
         _build_capability_comparison(summary_rows),
@@ -138,6 +156,7 @@ def build_competition_report(
             effectiveness_rows,
             protocol_json_path,
             protocol_markdown_path,
+            run_manifest_path,
         ),
         encoding="utf-8",
     )
@@ -149,6 +168,7 @@ def build_competition_report(
         protocol_json_path,
         protocol_markdown_path,
         effectiveness_csv_path,
+        run_manifest_path,
     )
 
 
@@ -160,6 +180,7 @@ def _write_final_evaluation(
     rows: list[dict[str, object]],
     benchmark_path: Path,
     split_path: Path,
+    run_manifest_path: Path,
 ) -> None:
     """生成面向评委的最终评估说明，固定实验口径并保留结果边界。"""
 
@@ -180,6 +201,7 @@ def _write_final_evaluation(
         f"- 数据目录：`{root}`",
         f"- 实验逐文件记录：`{benchmark_path}`",
         f"- 固定数据划分：`{split_path}`",
+        f"- 实验运行清单：`{run_manifest_path}`",
         f"- 健康基线文件：{len(getattr(split, 'healthy_files', []))} 个",
         f"- 验证文件：{len(getattr(split, 'validation_files', []))} 个",
         f"- 独立测试文件：{len(getattr(split, 'test_files', []))} 个",
@@ -195,14 +217,15 @@ def _write_final_evaluation(
         "",
         "## 3. 独立测试结果",
         "",
-        "| 模型 | 文件数 | 点级 F1 | PR-AUC | 事件级 F1 | 事件召回 | 平均误报事件 | 单文件耗时/秒 |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| 模型 | 文件数 | 点级 F1 | PR-AUC | 事件级 F1 | 事件召回 | 平均误报事件 | 单文件耗时/秒 | 吞吐量/点每秒 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in model_rows:
         lines.append(
             f"| {row['detector_name']} | {row['file_count']} | {row['point_f1']:.4f} | "
             f"{row['pr_auc']:.4f} | {row['event_f1']:.4f} | {row['event_recall']:.4f} | "
-            f"{row['false_positive_events']:.2f} | {row['inference_seconds']:.4f} |"
+            f"{row['false_positive_events']:.2f} | {row['inference_seconds']:.4f} | "
+            f"{float(row.get('throughput_rows_per_second', 0.0)):.1f} |"
         )
     lines.extend(
         [
@@ -322,6 +345,9 @@ def _summarize(records: list[dict[str, str]]) -> list[dict[str, object]]:
                 "event_recall": _average(items, "event_recall"),
                 "false_positive_events": _average(items, "false_positive_events"),
                 "inference_seconds": _average(items, "inference_seconds"),
+                "total_rows": _sum(items, "row_count"),
+                "total_inference_seconds": _sum(items, "inference_seconds"),
+                "throughput_rows_per_second": _throughput(items),
             }
         )
     return rows
@@ -332,6 +358,20 @@ def _average(records: list[dict[str, str]], field: str) -> float:
 
     values = [float(item[field]) for item in records if item.get(field) not in {"", None}]
     return round(mean(values), 6) if values else 0.0
+
+
+def _sum(records: list[dict[str, str]], field: str) -> float:
+    """累加实验明细字段，兼容早期缺少行数的历史产物。"""
+
+    return round(sum(float(item.get(field) or 0.0) for item in records), 6)
+
+
+def _throughput(records: list[dict[str, str]]) -> float:
+    """按总采样点/总推理时间计算吞吐量，避免简单平均造成短文件偏差。"""
+
+    total_rows = _sum(records, "row_count")
+    total_seconds = _sum(records, "inference_seconds")
+    return round(total_rows / total_seconds, 3) if total_rows > 0 and total_seconds > 0 else 0.0
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -348,6 +388,9 @@ def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
         "event_recall",
         "false_positive_events",
         "inference_seconds",
+        "total_rows",
+        "total_inference_seconds",
+        "throughput_rows_per_second",
     ]
     with path.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fields)
@@ -365,6 +408,7 @@ def _build_report(
     effectiveness_rows: list[dict[str, object]],
     protocol_json_path: Path,
     protocol_markdown_path: Path,
+    run_manifest_path: Path,
 ) -> str:
     """生成中文校赛报告，明确实验边界，避免夸大为企业实测成效。"""
 
@@ -391,14 +435,15 @@ def _build_report(
         "",
         "## 二、独立测试模型对比",
         "",
-        "| 检测器 | 文件数 | 点级 F1 | PR-AUC | 事件级 F1 | 事件召回 | 平均误报事件 | 单文件耗时/秒 |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| 检测器 | 文件数 | 点级 F1 | PR-AUC | 事件级 F1 | 事件召回 | 平均误报事件 | 单文件耗时/秒 | 吞吐量/点每秒 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in model_rows:
         lines.append(
             f"| {row['detector_name']} | {row['file_count']} | {row['point_f1']:.4f} | "
             f"{row['pr_auc']:.4f} | {row['event_f1']:.4f} | {row['event_recall']:.4f} | "
-            f"{row['false_positive_events']:.2f} | {row['inference_seconds']:.4f} |"
+            f"{row['false_positive_events']:.2f} | {row['inference_seconds']:.4f} | "
+            f"{float(row.get('throughput_rows_per_second', 0.0)):.1f} |"
         )
 
     lines.extend(
@@ -408,8 +453,8 @@ def _build_report(
             "",
             "> 这里的“提升”是相对 SKAB 独立测试中的 MAD 基线计算，不是企业现场提升率。",
             "",
-            "| 模型 | 事件级 F1 | 相对 MAD | 事件召回 | 点级 F1 | 平均误报事件 | 单文件耗时/秒 |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| 模型 | 事件级 F1 | 相对 MAD | 事件召回 | 点级 F1 | 平均误报事件 | 单文件耗时/秒 | 吞吐量/点每秒 |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for row in effectiveness_rows:
@@ -417,7 +462,7 @@ def _build_report(
             f"| {row['detector_name']} | {row['event_f1']:.4f} | "
             f"{_format_delta(row['event_f1_delta_vs_mad'])} | {row['event_recall']:.4f} | "
             f"{row['point_f1']:.4f} | {row['false_positive_events']:.2f} | "
-            f"{row['inference_seconds']:.4f} |"
+            f"{row['inference_seconds']:.4f} | {float(row.get('throughput_rows_per_second', 0.0)):.1f} |"
         )
     best_event = max(model_rows, key=lambda row: (row["event_f1"], row["event_recall"]))
     main_model = next(
@@ -454,6 +499,7 @@ def _build_report(
             "",
             f"- 机器可读实验协议：`{protocol_json_path}`",
             f"- 中文实验协议：`{protocol_markdown_path}`",
+            f"- 实验运行清单：`{run_manifest_path}`",
             "- 逐文件独立测试结果和汇总 CSV 与本报告位于同一目录。",
         ]
     )
@@ -517,6 +563,7 @@ def _build_effectiveness_rows(rows: list[dict[str, object]]) -> list[dict[str, o
                 "point_f1": row["point_f1"],
                 "false_positive_events": row["false_positive_events"],
                 "inference_seconds": row["inference_seconds"],
+                "throughput_rows_per_second": row.get("throughput_rows_per_second", 0.0),
             }
         )
     return output
@@ -535,6 +582,7 @@ def _write_effectiveness_csv(path: Path, rows: list[dict[str, object]]) -> None:
         "point_f1",
         "false_positive_events",
         "inference_seconds",
+        "throughput_rows_per_second",
     ]
     with path.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fields)
@@ -557,11 +605,20 @@ def _summarize_by_model(rows: list[dict[str, object]]) -> list[dict[str, object]
     output: list[dict[str, object]] = []
     for detector, items in grouped.items():
         total_files = sum(int(item["file_count"]) for item in items)
+        total_rows = sum(float(item.get("total_rows", 0.0)) for item in items)
+        total_seconds = sum(float(item.get("total_inference_seconds", 0.0)) for item in items)
         output.append(
             {
                 "detector": detector,
                 "detector_name": items[0]["detector_name"],
                 "file_count": total_files,
+                "total_rows": total_rows,
+                "total_inference_seconds": total_seconds,
+                "throughput_rows_per_second": (
+                    round(total_rows / total_seconds, 3)
+                    if total_rows > 0 and total_seconds > 0
+                    else 0.0
+                ),
                 **{
                     field: round(
                         sum(float(item[field]) * int(item["file_count"]) for item in items)
