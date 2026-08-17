@@ -37,6 +37,15 @@ defineProps({
 // 这样工单从处置完成到最终关闭之间有明确的验收环节，不会把两个业务状态压成一步。
 const statusSteps = ["待确认", "已确认", "处理中", "待验证", "已完成", "已关闭"];
 
+function aftercareLabel(order) {
+  if (order.reinspection_status === "pending") return "等待自动复检";
+  if (order.reinspection_status === "passed") return "自动复检通过";
+  if (order.reinspection_status === "failed") return "自动复检未通过";
+  if (Number(order.sla_level) >= 2) return "已超时升级";
+  if (Number(order.sla_level) === 1) return "已催办";
+  return "";
+}
+
 const emit = defineEmits([
   "update:workOrderSearch",
   "update:workOrderStatusFilter",
@@ -124,6 +133,11 @@ const emit = defineEmits([
             <span class="work-order-row-main">
               <b>{{ order.title }}</b>
               <small>{{ order.status }} · {{ order.assigned_user_name || order.assigned_role }}</small>
+              <span
+                v-if="aftercareLabel(order)"
+                class="aftercare-badge"
+                :class="`aftercare-${order.reinspection_status || `sla-${order.sla_level}`}`"
+              >{{ aftercareLabel(order) }}</span>
               <em :title="order.run_id">来源：{{ order.source_file_name || "历史分析任务" }}</em>
             </span>
             <button v-if="showArchived" class="row-action" :disabled="workOrderActionId === order.record_id" title="恢复工单" @click.stop="emit('restore-order', order)">恢复</button>
@@ -149,6 +163,25 @@ const emit = defineEmits([
                 @click="emit('accept-order')"
               >{{ workOrderActionId === selectedWorkOrder.record_id ? "接收中..." : "确认接单" }}</button>
             </div>
+            <div v-if="aftercareLabel(selectedWorkOrder)" class="aftercare-strip" :class="`aftercare-${selectedWorkOrder.reinspection_status || `sla-${selectedWorkOrder.sla_level}`}`">
+              <div>
+                <label>智能售后状态</label>
+                <b>{{ aftercareLabel(selectedWorkOrder) }}</b>
+                <span v-if="selectedWorkOrder.reinspection_status === 'pending'">
+                  已于 {{ formatDate(selectedWorkOrder.reinspection_scheduled_at) }} 进入待验证，系统将在同一数据源产生新批次后自动复检。
+                </span>
+                <span v-else-if="selectedWorkOrder.reinspection_status === 'passed'">
+                  复检任务 {{ selectedWorkOrder.reinspection_run_id }}：{{ selectedWorkOrder.reinspection_summary }}
+                </span>
+                <span v-else-if="selectedWorkOrder.reinspection_status === 'failed'">
+                  复检任务 {{ selectedWorkOrder.reinspection_run_id }}：{{ selectedWorkOrder.reinspection_summary }}
+                </span>
+                <span v-else-if="Number(selectedWorkOrder.sla_level) >= 2">
+                  工单在规定时间内未接单，已自动升级至生产负责人。
+                </span>
+                <span v-else>工单在规定时间内未接单，系统已自动发送催办通知。</span>
+              </div>
+            </div>
             <div class="status-timeline" aria-label="工单处理进度">
               <div v-for="(step, index) in statusSteps" :key="step" class="status-step" :class="{ current: selectedWorkOrder.status === step, complete: statusSteps.indexOf(selectedWorkOrder.status) > index }">
                 <span class="status-step-marker">{{ statusSteps.indexOf(selectedWorkOrder.status) > index ? "✓" : index + 1 }}</span>
@@ -161,7 +194,7 @@ const emit = defineEmits([
             <div class="form-stack">
               <label>状态<select v-model="feedback.status" class="control-input" :disabled="showArchived"><option>待确认</option><option>已确认</option><option>处理中</option><option>待验证</option><option>已完成</option><option>已关闭</option></select></label>
               <label>确认根因<input v-model="feedback.confirmed_cause" class="control-input" :disabled="showArchived" placeholder="填写现场确认结果" /></label>
-              <label>处置与复测<textarea v-model="feedback.feedback_note" class="control-input" rows="5" :disabled="showArchived" placeholder="填写处理动作和复测结果"></textarea></label>
+              <label>处置与复测<textarea v-model="feedback.feedback_note" class="control-input" rows="5" :disabled="showArchived" placeholder="填写已执行的处理动作；进入待验证后由同源新批次自动完成复检"></textarea></label>
               <label>处理人员<input v-model="feedback.handled_by" class="control-input" :disabled="showArchived" /></label>
               <div class="form-actions">
                 <button v-if="!showArchived" class="primary-button" :disabled="savingFeedback || !feedbackDirty" @click="emit('save-feedback')">{{ savingFeedback ? "保存中..." : feedbackDirty ? "保存反馈" : "已保存" }}</button>

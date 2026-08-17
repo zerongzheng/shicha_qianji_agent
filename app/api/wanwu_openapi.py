@@ -11,6 +11,26 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+_READ_ONLY_OPERATIONS = {
+    "list_industrial_data_sources",
+    "verify_industrial_data_source",
+    "get_unattended_monitoring_status",
+    "get_industrial_analysis_status",
+    "get_industrial_analysis_result",
+    "get_industrial_decision_brief",
+    "list_industrial_work_orders",
+    "list_industrial_feedback_cases",
+    "generate_industrial_shift_brief",
+}
+
+_SIDE_EFFECT_OPERATIONS = {
+    "configure_industrial_data_source",
+    "run_unattended_industrial_cycle",
+    "dispatch_industrial_alerts",
+    "run_industrial_sla_cycle",
+    "run_industrial_reinspection_cycle",
+}
+
 
 def build_wanwu_openapi(
     full_schema: dict[str, Any],
@@ -29,10 +49,14 @@ def build_wanwu_openapi(
             "万悟先通过数据源查询、配置和验证工具完成工业接入，再使用 "
             "run_unattended_industrial_cycle 自动发现新数据，"
             "再完成任务追踪、结果读取和 dispatch_industrial_alerts 主动告警；"
-            "run_industrial_aftercare_cycle 继续执行工单催办、升级和维修后复检；"
+            "get_industrial_decision_brief 将模型选择、交叉验证、趋势风险和受约束优化建议"
+            "转换为画布可直接引用的证据字段；"
+            "generate_industrial_shift_brief 按时间窗口生成任务、工单、SLA 与复检简报；"
+            "run_industrial_sla_cycle 独立执行工单催办和超时升级，"
+            "run_industrial_reinspection_cycle 独立执行维修后同源数据复检；"
             "另提供人工上传诊断、工单闭环与历史案例检索工具。"
         ),
-        "version": "0.8.0",
+        "version": "1.0.0",
     }
     schema["servers"] = [
         {"url": public_base_url, "description": "时察千机工业分析服务"}
@@ -84,6 +108,14 @@ def build_wanwu_openapi(
                 operation.get("responses", {}),
                 schema,
             )
+            operation_id = str(operation.get("operationId") or "")
+            permission_note = _permission_note(operation_id)
+            if permission_note:
+                operation["description"] = (
+                    str(operation.get("description") or operation.get("summary") or "")
+                    + "\n\n权限规则："
+                    + permission_note
+                ).strip()
             request_body = operation.get("requestBody")
             if request_body:
                 operation["requestBody"] = _simplify_request_body(request_body, schema)
@@ -99,6 +131,19 @@ def build_wanwu_openapi(
         }
     }
     return schema
+
+
+def _permission_note(operation_id: str) -> str:
+    """把工具的副作用边界直接带入万悟导入后的工具说明。"""
+
+    if operation_id in _READ_ONLY_OPERATIONS:
+        return "只读查询，不改变数据源、任务、工单或通知状态。"
+    if operation_id in _SIDE_EFFECT_OPERATIONS:
+        return (
+            "会改变状态、推进工单或产生通知；聊天调用前必须取得用户明确确认，"
+            "已发布的周期工作流属于部署时预授权的后台运行。"
+        )
+    return ""
 
 
 def _simplify_request_body(request_body: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:

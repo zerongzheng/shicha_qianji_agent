@@ -113,12 +113,15 @@ def test_wanwu_openapi_only_exposes_json_tools() -> None:
         "/api/v1/wanwu/jobs/submit",
         "/api/v1/wanwu/jobs/status",
         "/api/v1/wanwu/jobs/result",
+        "/api/v1/wanwu/jobs/decision-brief",
+        "/api/v1/wanwu/reports/shift-brief",
         "/api/v1/wanwu/jobs/cancel",
         "/api/v1/wanwu/cases/list",
         "/api/v1/wanwu/work-orders/list",
         "/api/v1/wanwu/work-orders/update",
         "/api/v1/wanwu/automation/cycle",
-        "/api/v1/wanwu/automation/aftercare",
+        "/api/v1/wanwu/automation/sla",
+        "/api/v1/wanwu/automation/reinspection",
         "/api/v1/wanwu/automation/status",
         "/api/v1/wanwu/automation/notifications/dispatch",
         "/api/v1/wanwu/data-sources/list",
@@ -541,6 +544,8 @@ def test_wanwu_check_can_verify_platform_and_complete_toolset(tmp_path, monkeypa
                     "submit_industrial_analysis",
                     "get_industrial_analysis_status",
                     "get_industrial_analysis_result",
+                    "get_industrial_decision_brief",
+                    "generate_industrial_shift_brief",
                     "cancel_industrial_analysis",
                     "list_industrial_work_orders",
                     "update_industrial_work_order",
@@ -551,7 +556,8 @@ def test_wanwu_check_can_verify_platform_and_complete_toolset(tmp_path, monkeypa
                         "list_industrial_data_sources",
                         "configure_industrial_data_source",
                         "verify_industrial_data_source",
-                        "run_industrial_aftercare_cycle",
+                    "run_industrial_sla_cycle",
+                    "run_industrial_reinspection_cycle",
                     ]
             )
         },
@@ -589,7 +595,7 @@ def test_wanwu_check_can_verify_platform_and_complete_toolset(tmp_path, monkeypa
         quick_output_path=tmp_path / "wanwu-quick.json",
     )
 
-    assert result["tool_count"] == 15
+    assert result["tool_count"] == 18
     assert result["platform_http_status"] == 200
     assert result["schema_server"] == "http://host.docker.internal:8000"
     assert result["quick_tool_count"] == 1
@@ -646,6 +652,7 @@ def test_wanwu_quick_payload_keeps_decision_ledger(monkeypatch) -> None:
         "forecast_results": {},
         "risk_alerts": [],
         "recommendations": [],
+        "optimization_recommendations": [],
         "execution_trace": [],
         "agent_decisions": [
             {
@@ -670,6 +677,203 @@ def test_wanwu_quick_payload_keeps_decision_ledger(monkeypatch) -> None:
     monkeypatch.setattr(server, "_result_payload", lambda _run_id, _result: payload)
     result = _quick_analysis_payload("run_test", object())
     assert result["agent_decisions"][0]["decision_id"] == "model_routing"
+
+
+def test_wanwu_decision_brief_exposes_compact_algorithm_evidence(monkeypatch) -> None:
+    """决策摘要应显式返回选模、交叉验证、趋势风险、优化建议和工单信息。"""
+
+    stored_result = {
+        "detector": "time_frequency_relation",
+        "device_profile": {
+            "profile_id": "skab_water_loop_valve",
+            "display_name": "SKAB 水循环阀门测试台",
+        },
+        "data_profile": {"source_name": "valve1/0.csv"},
+        "model_selection": {
+            "mode": "automatic",
+            "analysis_goal_name": "综合平衡",
+            "selected_detector": "time_frequency_relation",
+            "selected_detector_name": "时频关系多路径",
+            "selected_threshold": 3.5,
+            "reason": "设备冻结配置与任务目标共同选择",
+            "candidate_ranking": [{"detector": "time_frequency_relation"}],
+        },
+        "detector_validation": {
+            "status": "completed",
+            "model_count": 4,
+            "models": [
+                {"detector": "mad", "detector_name": "稳健 MAD"},
+                {
+                    "detector": "time_frequency_relation",
+                    "detector_name": "时频关系多路径",
+                },
+            ],
+            "agreement": {"level": "中"},
+            "conclusion": "两类互补模型支持当前告警，仍需现场确认。",
+            "failed_models": [],
+        },
+        "forecast_results": {
+            "Pressure": {
+                "模型名称": "时频特征增强岭回归模型",
+                "方向": "持续上升",
+                "风险": "高风险",
+                "当前值": 1.2,
+                "预测末值": 1.8,
+                "回测": {"RMSE": 0.12},
+                "不确定度": {"预测可信度": "中"},
+            }
+        },
+        "risk_alerts": [
+            {
+                "alert_id": "forecast-risk-001",
+                "类型": "趋势预测预警",
+                "等级": "高风险",
+                "可信度": "中",
+                "传感器": ["Pressure"],
+                "建议动作": "提前安排人工复核",
+            }
+        ],
+        "optimization_recommendations": [
+            {
+                "recommendation_id": "OPT-PARAM-001",
+                "category": "参数稳定",
+                "target": "Pressure",
+                "action": "核对工况后分级调整",
+                "adjustment_direction": "抑制继续上升",
+                "suggested_range": "待企业确认",
+                "confidence": "中",
+                "evidence": ["预测持续上升", "风险等级高"],
+                "observation_window": "连续观察 30 个采样点",
+                "rollback_condition": "风险继续上升时立即回退",
+                "status": "待人工确认",
+            }
+        ],
+        "work_order_drafts": [
+            {"record_id": "run_decision001:WO-001", "priority": "P1"}
+        ],
+        "limitations": ["公开数据验证不代表企业现场成效。"],
+    }
+    monkeypatch.setattr(
+        server,
+        "_job_result_payload",
+        lambda run_id: {"status": "success", "run_id": run_id, "result": stored_result},
+    )
+
+    payload = server._wanwu_decision_brief_payload("run_decision001")
+
+    assert payload["data_source_label"].startswith("公开 SKAB 验证数据")
+    assert payload["model_selection"]["selected_threshold"] == 3.5
+    assert payload["cross_validation"]["model_count"] == 4
+    assert payload["trend_risk"]["highest_risk"] == "高风险"
+    assert payload["trend_risk"]["forecast_summaries"][0]["backtest_rmse"] == 0.12
+    assert payload["optimization"]["recommendation_count"] == 1
+    assert "不直接下发控制指令" in payload["optimization"]["human_gate"]
+    assert payload["work_order_summary"]["highest_priority"] == "P1"
+    assert payload["rag_context"]["sensor_terms"] == ["Pressure"]
+    assert "知识库只补充" in payload["rag_context"]["usage_rule"]
+    assert "【时察千机自动巡检结果】" in payload["presentation"]
+    assert "风险等级：高风险" in payload["presentation"]
+    assert "系统不直接下发控制指令" in payload["presentation"]
+
+
+def test_wanwu_decision_brief_reuses_job_state_errors(monkeypatch) -> None:
+    """任务未成功时应沿用结果接口的 409，而不是返回不完整证据。"""
+
+    from fastapi import HTTPException
+
+    def unfinished(_run_id: str) -> dict:
+        raise HTTPException(status_code=409, detail="任务尚未完成")
+
+    monkeypatch.setattr(server, "_job_result_payload", unfinished)
+    with pytest.raises(HTTPException) as exc_info:
+        server._wanwu_decision_brief_payload("run_waiting001")
+    assert exc_info.value.status_code == 409
+
+
+def test_wanwu_shift_brief_aggregates_runs_orders_and_aftercare(monkeypatch) -> None:
+    """班次简报应从数据库审计记录聚合任务、工单、SLA、复检和通知结果。"""
+
+    now = pd.Timestamp.now(tz="Asia/Shanghai")
+
+    class FakeRepository:
+        def list_runs(self, **_kwargs):
+            return [
+                {
+                    "run_id": "run_shift_success",
+                    "status": "success",
+                    "started_at": now.isoformat(),
+                },
+                {
+                    "run_id": "run_shift_failed",
+                    "status": "failed",
+                    "started_at": now.isoformat(),
+                },
+            ]
+
+        def get_run(self, run_id: str):
+            assert run_id == "run_shift_success"
+            return {
+                "result": {
+                    "anomaly_events": [{"severity": "高风险"}],
+                    "risk_alerts": [{"等级": "高风险"}],
+                }
+            }
+
+        def list_work_orders(self, **_kwargs):
+            return [
+                {
+                    "record_id": "run_shift_success:WO-001",
+                    "priority": "P1",
+                    "status": "待确认",
+                    "title": "核查压力异常",
+                    "assigned_role": "设备运维",
+                    "sla_level": 2,
+                    "reinspection_status": None,
+                    "created_at": now.isoformat(),
+                },
+                {
+                    "record_id": "run_old:WO-002",
+                    "priority": "P2",
+                    "status": "已完成",
+                    "title": "历史工单",
+                    "assigned_role": "工艺人员",
+                    "sla_level": 0,
+                    "reinspection_status": "passed",
+                    "created_at": (now - pd.Timedelta(hours=20)).isoformat(),
+                },
+            ]
+
+        def list_notifications(self, **_kwargs):
+            return [
+                {
+                    "status": "sent",
+                    "notification_kind": "sla_reminder",
+                    "created_at": now.isoformat(),
+                },
+                {
+                    "status": "sent",
+                    "notification_kind": "sla_escalation",
+                    "created_at": now.isoformat(),
+                },
+                {
+                    "status": "failed",
+                    "notification_kind": "reinspection_failed",
+                    "created_at": now.isoformat(),
+                },
+            ]
+
+    monkeypatch.setattr(server, "get_repository", lambda: FakeRepository())
+    payload = server._wanwu_shift_brief_payload(hours=8, max_records=100)
+
+    assert payload["run_summary"]["total"] == 2
+    assert payload["run_summary"]["anomaly_event_count"] == 1
+    assert payload["work_order_summary"]["created_count"] == 1
+    assert payload["work_order_summary"]["unresolved_p1_count"] == 1
+    assert payload["aftercare_summary"]["reminder_count"] == 1
+    assert payload["aftercare_summary"]["escalation_count"] == 1
+    assert payload["aftercare_summary"]["reinspection_failed_count"] == 1
+    assert payload["notification_summary"]["failed"] == 1
+    assert "公开 SKAB 演示结果不代表企业现场收益" in payload["presentation"]
 
 
 def test_wanwu_schema_declares_api_key_when_remote_auth_is_enabled() -> None:

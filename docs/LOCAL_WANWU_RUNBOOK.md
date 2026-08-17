@@ -115,10 +115,13 @@ outputs/wanwu_openapi.json
 外部定时触发万悟工作流 API
   -> run_unattended_industrial_cycle
   -> 有新数据时循环 get_industrial_analysis_status
-  -> get_industrial_analysis_result
+  -> get_industrial_decision_brief
   -> dispatch_industrial_alerts
-  -> 结束节点返回巡检、分析和通知状态
+  -> 结束节点返回 presentation 和通知状态
 ```
+
+SLA 督办、维修后复检和班次简报使用各自独立工作流；人工上传快速协议只用于调试，不属于
+竞赛主流程。辅助智能体可以按需解释结果和检索知识库，但不承担周期自动化。
 
 逐节点变量映射、发布和触发脚本见 `wanwu/WORKFLOW_SETUP.md`。快速上传诊断只作为算法联调
 和现场备用入口：

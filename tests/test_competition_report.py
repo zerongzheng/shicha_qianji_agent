@@ -130,6 +130,7 @@ def test_competition_report_mentions_dynamic_main_model_metrics(tmp_path: Path) 
         _build_effectiveness_rows(rows),
         tmp_path / "protocol.json",
         tmp_path / "protocol.md",
+        tmp_path / "run_manifest.json",
     )
 
     assert "事件召回为 0.7300" in report

@@ -92,6 +92,7 @@ class AutomaticDiagnosisService:
         evidence = build_diagnosis_evidence(
             result,
             use_embeddings=self.allow_external_calls,
+            run_id=run_id,
         )
         limitations = (
             "异常检测表示数据偏离健康模式，不等于设备故障已经确诊。",
@@ -165,6 +166,7 @@ def build_diagnosis_evidence(
     top_k: int = 4,
     *,
     use_embeddings: bool = True,
+    run_id: str | None = None,
 ) -> DiagnosisEvidence:
     """构造检索问题并收集带来源的知识片段。"""
 
@@ -174,6 +176,7 @@ def build_diagnosis_evidence(
         retrieval_query,
         top_k=top_k,
         use_embeddings=use_embeddings,
+        audit_run_id=run_id,
     )
     knowledge = tuple(_knowledge_record(chunk) for chunk in chunks)
     return DiagnosisEvidence(
@@ -291,6 +294,7 @@ def _knowledge_record(chunk: KnowledgeChunk) -> dict[str, Any]:
         "source": chunk.source,
         "text": chunk.text[:1200],
         "score": round(chunk.score, 6),
+        "retrieval_mode": chunk.retrieval_mode,
     }
 
 

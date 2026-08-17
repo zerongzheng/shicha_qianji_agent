@@ -14,7 +14,7 @@ button { cursor: pointer; }
 .app-shell { min-height: 100vh; background: #f5f7f8; }
 .topbar { height: 72px; display: flex; align-items: center; justify-content: space-between; padding: 0 34px; background: #ffffff; border-bottom: 1px solid #dbe2e6; }
 .brand-block { display: flex; align-items: center; gap: 12px; }
-.brand-mark { width: 34px; height: 34px; display: grid; place-items: center; background: #176b73; color: white; font-weight: 750; font-size: 12px; letter-spacing: .04em; }
+.brand-mark { width: 38px; height: 38px; display: block; flex: 0 0 auto; }
 .brand-name { font-size: 18px; font-weight: 760; color: #13242b; }
 .brand-subtitle { margin-top: 3px; color: #7a8890; font-size: 12px; }
 .topbar-meta { color: #77858d; font-size: 12px; display: flex; align-items: center; gap: 8px; }
@@ -75,7 +75,7 @@ input[type="range"] { width: 100%; accent-color: #63b4aa; }
 .app-starting { min-height: 100vh; display: grid; place-items: center; background: #eef2f2; color: #496268; font-size: 13px; }
 .login-page { min-height: 100vh; display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(380px, .85fr); background: #edf2f2; }
 .login-brand { display: flex; flex-direction: column; justify-content: center; min-height: 100vh; padding: 70px clamp(46px, 8vw, 130px); background: #21363b; color: #eef7f5; }
-.login-mark { width: 48px; height: 48px; display: grid; place-items: center; margin-bottom: 42px; border: 1px solid #73a8a1; color: #9ed6cd; font-weight: 800; }
+.login-mark { width: 58px; height: 58px; display: block; margin-bottom: 32px; }
 .login-brand > span { color: #8eb2ae; font-size: 12px; }
 .login-brand h1 { margin: 12px 0 18px; color: white; font-size: 42px; letter-spacing: 0; }
 .login-brand p { max-width: 580px; margin: 0; color: #b9cecc; font-size: 15px; line-height: 1.9; }
@@ -306,6 +306,11 @@ h1, h2, p { margin-top: 0; }
 .priority, .case-id { min-width: 34px; color: #b4504c; font-weight: 750; font-size: 12px; }
 .work-order-row-main { min-width: 0; flex: 1; }
 .work-order-row-main em { display: block; margin-top: 5px; color: #2c8580; font-size: 10px; font-style: normal; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.aftercare-badge { display: inline-flex; width: fit-content; margin-top: 6px; padding: 3px 7px; border: 1px solid #d7e3e2; background: #f3f7f6; color: #607679; font-size: 10px; font-weight: 700; }
+.aftercare-badge.aftercare-sla-1, .aftercare-strip.aftercare-sla-1 { border-color: #ead4a4; background: #fff8e9; color: #806020; }
+.aftercare-badge.aftercare-sla-2, .aftercare-strip.aftercare-sla-2, .aftercare-badge.aftercare-failed, .aftercare-strip.aftercare-failed { border-color: #e6bdb8; background: #fff0ee; color: #8d4944; }
+.aftercare-badge.aftercare-pending, .aftercare-strip.aftercare-pending { border-color: #bfded8; background: #eef8f5; color: #256d68; }
+.aftercare-badge.aftercare-passed, .aftercare-strip.aftercare-passed { border-color: #badbc6; background: #edf8f1; color: #33704f; }
 .source-run-detail { display: block; margin-top: 7px; color: #7c9094; font-size: 10px; overflow-wrap: anywhere; }
 .priority.large { min-width: 42px; font-size: 16px; }
 .work-order-detail { padding-bottom: 6px; }
@@ -381,6 +386,11 @@ h1, h2, p { margin-top: 0; }
 .status-step-marker { position: relative; z-index: 1; display: grid; width: 24px; height: 24px; place-items: center; border: 1px solid #cbd8d8; border-radius: 50%; background: #ffffff; color: #8d9b9f; font-size: 10px; font-weight: 750; }
 .status-step.complete { color: #28775f; }.status-step.complete::before { background: #55a892; }.status-step.complete .status-step-marker { border-color: #55a892; background: #e6f3ed; color: #28775f; }
 .status-step.current { color: #246f72; font-weight: 750; }.status-step.current .status-step-marker { border-color: #258785; background: #e4f4f1; color: #176e70; box-shadow: 0 0 0 4px rgba(37, 135, 133, .12); }
+.aftercare-strip { margin: 14px 20px 0; padding: 13px 15px; border: 1px solid #d7e3e2; }
+.aftercare-strip div { display: flex; flex-direction: column; gap: 5px; }
+.aftercare-strip label { font-size: 10px; font-weight: 750; text-transform: uppercase; }
+.aftercare-strip b { font-size: 13px; }
+.aftercare-strip span { font-size: 11px; line-height: 1.55; overflow-wrap: anywhere; }
 .view-action:hover { background: #dcefeb; }
 .row-action:disabled { cursor: wait; opacity: .65; }
 .form-stack { display: flex; flex-direction: column; gap: 14px; padding: 20px; }.form-stack label { color: #6d7d83; font-size: 12px; }.form-stack .control-input { display: block; margin-top: 7px; }

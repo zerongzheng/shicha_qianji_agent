@@ -66,6 +66,7 @@ try {
 }
 catch {
     Write-Host ("Captcha endpoint failed: {0}" -f $_.Exception.Message) -ForegroundColor Red
+    Write-Host "If the page shows Bad Gateway after a reboot, run: docker restart nginx-wanwu" -ForegroundColor Yellow
 }
 
 Write-Host "`n=== Resource note ===" -ForegroundColor Cyan

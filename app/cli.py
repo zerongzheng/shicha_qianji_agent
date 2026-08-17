@@ -325,6 +325,7 @@ def main() -> None:
             "protocol_json_path": str(report.protocol_json_path),
             "protocol_markdown_path": str(report.protocol_markdown_path),
             "effectiveness_csv_path": str(report.effectiveness_csv_path),
+            "run_manifest_path": str(report.run_manifest_path),
         }
     elif args.evaluate_regimes:
         evaluation = evaluate_regime_strategy(args.data_root)
