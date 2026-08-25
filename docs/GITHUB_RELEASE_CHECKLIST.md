@@ -10,7 +10,7 @@
 - `tests/`：后端回归测试；
 - `resources/knowledge/`：当前校赛阶段的正式通用知识库；
 - `resources/device_profiles/`：SKAB 设备配置和企业接入模板；
-- `docs/`、`scripts/`、`.github/workflows/`：运行说明、实验协议、启动脚本和 CI；
+- `docs/`、`scripts/`：运行说明、实验协议和启动脚本；
 - `README.md`、`pyproject.toml`、`uv.lock`、`.env.example`、`frontend/.env.example`。
 
 ## 不要提交
@@ -45,7 +45,7 @@ git diff --check
 
 ```powershell
 git status --short
-git add app frontend/src tests resources/knowledge resources/device_profiles docs scripts .github README.md pyproject.toml uv.lock
+git add app frontend/src tests resources/knowledge resources/device_profiles docs scripts README.md pyproject.toml uv.lock
 git diff --cached --stat
 git diff --cached --name-only
 ```
