@@ -10,6 +10,23 @@ jobs:
   backend:
     name: Python tests
     runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://ci:ci@127.0.0.1:5432/shicha_qianji_ci
+      TEST_DATABASE_URL: postgresql://ci:ci@127.0.0.1:5432/shicha_qianji_ci
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: shicha_qianji_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U ci -d shicha_qianji_ci"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
