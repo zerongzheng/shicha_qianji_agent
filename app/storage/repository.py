@@ -940,6 +940,21 @@ class IndustrialRepository:
             ).fetchone()
         return _run_record(row, include_result=True) if row else None
 
+    def update_run_result(self, run_id: str, result: dict[str, Any]) -> None:
+        """更新已有成功任务的解释附加字段，不重新生成分析或工单。"""
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE analysis_runs
+                SET result_json = ?
+                WHERE run_id = ? AND status = 'success'
+                """,
+                (_to_json(result), run_id),
+            )
+            if cursor.rowcount != 1:
+                raise LookupError(f"找不到可更新的成功任务：{run_id}")
+
     def find_successful_run(
         self,
         *,

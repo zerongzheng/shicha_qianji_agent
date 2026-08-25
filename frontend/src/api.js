@@ -9,7 +9,7 @@ const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:800
 const API_KEY = import.meta.env.VITE_API_KEY || "";
 const REQUEST_TIMEOUT_MS = Number(import.meta.env.VITE_API_TIMEOUT_MS || 30000);
 const MAX_GET_RETRIES = 2;
-const SESSION_TOKEN_KEY = "shichi_qianji_session_token";
+const SESSION_TOKEN_KEY = "shicha_qianji_session_token";
 
 export function getSessionToken() {
   return window.localStorage.getItem(SESSION_TOKEN_KEY) || "";
@@ -241,6 +241,15 @@ export function getJobResult(runId) {
 
 export function getRun(runId) {
   return request(`/api/v1/runs/${encodeURIComponent(runId)}`);
+}
+
+// 对已完成任务按需生成辅助解释；不重新上传文件或执行工业分析。
+export function explainRun(runId, question = "") {
+  return request("/api/v1/wanwu/jobs/explain", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ run_id: runId, ...(question.trim() ? { question: question.trim() } : {}) }),
+  });
 }
 
 export function listRuns(status = "", includeArchived = false, archivedOnly = false) {

@@ -13,6 +13,7 @@ import {
   getFilePreflight,
   getJobStatus,
   getRun,
+  explainRun,
   getMonitoringStatus,
   health,
   listCases,
@@ -112,6 +113,7 @@ const autoRefreshTimer = ref(null);
 const selectedSensor = ref("");
 const selectedForecastSensor = ref("");
 const retryingRunId = ref("");
+const explainLoading = ref(false);
 const sampleLoading = ref(false);
 const selectedSampleFileId = ref("");
 const deviceProfiles = ref([]);
@@ -609,6 +611,28 @@ async function startAnalysis() {
     await runAnalysisJob();
   } catch (error) {
     errorMessage.value = error.message;
+  }
+}
+
+async function explainCurrentRun() {
+  const targetRunId = currentAnalysisRunId.value;
+  if (!targetRunId || explainLoading.value) return;
+  explainLoading.value = true;
+  errorMessage.value = "";
+  try {
+    const response = await explainRun(targetRunId);
+    if (analysis.value && response.automatic_diagnosis) {
+      analysis.value = {
+        ...analysis.value,
+        automatic_diagnosis: response.automatic_diagnosis,
+        model_audit: response.model_audit,
+      };
+    }
+    successMessage.value = "辅助解释已生成，RAG 来源和模型审计已写入当前任务。";
+  } catch (error) {
+    errorMessage.value = error.message;
+  } finally {
+    explainLoading.value = false;
   }
 }
 
@@ -1579,7 +1603,12 @@ function contributionWidth(item) {
             @toggle-event="toggleEvidenceEvent"
             @open-work-order="openRelatedWorkOrder"
           />
-          <ModelEvidencePanel v-if="analysis" :analysis="analysis" />
+          <ModelEvidencePanel
+            v-if="analysis"
+            :analysis="analysis"
+            :explain-loading="explainLoading"
+            @explain="explainCurrentRun"
+          />
         </section>
 
         <section v-else-if="activeTab === 'forecast'" class="content-stack">

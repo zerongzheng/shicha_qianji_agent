@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
+from types import SimpleNamespace
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -69,6 +70,24 @@ class AutomaticDiagnosis:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class StoredAnalysisView:
+    """让已落库的结构化结果复用解释层，而不重新执行工业分析。"""
+
+    summary: dict[str, Any]
+    events: tuple[Any, ...]
+    event_diagnoses: tuple[Any, ...]
+    risk_alerts: tuple[dict[str, Any], ...]
+    trend_summary: dict[str, dict[str, Any]]
+    profile: Any
+    recommendations: tuple[str, ...]
+
+    def to_summary(self) -> dict[str, Any]:
+        """返回分析时已经生成的摘要，避免把原始 CSV 重新送入解释层。"""
+
+        return self.summary
+
+
 class AutomaticDiagnosisService:
     """生成完整诊断；比赛演示可关闭所有外部模型调用。"""
 
@@ -83,9 +102,10 @@ class AutomaticDiagnosisService:
 
     def diagnose(
         self,
-        result: AnalysisResult,
+        result: AnalysisResult | StoredAnalysisView,
         *,
         run_id: str | None = None,
+        question: str | None = None,
     ) -> AutomaticDiagnosis:
         """根据已经完成的工业分析结果生成自动诊断。"""
 
@@ -93,6 +113,7 @@ class AutomaticDiagnosisService:
             result,
             use_embeddings=self.allow_external_calls,
             run_id=run_id,
+            question=question,
         )
         limitations = (
             "异常检测表示数据偏离健康模式，不等于设备故障已经确诊。",
@@ -162,16 +183,17 @@ class AutomaticDiagnosisService:
 
 
 def build_diagnosis_evidence(
-    result: AnalysisResult,
+    result: AnalysisResult | StoredAnalysisView,
     top_k: int = 4,
     *,
     use_embeddings: bool = True,
     run_id: str | None = None,
+    question: str | None = None,
 ) -> DiagnosisEvidence:
     """构造检索问题并收集带来源的知识片段。"""
 
     summary = result.to_summary()
-    retrieval_query = _build_retrieval_query(result)
+    retrieval_query = _build_retrieval_query(result, question=question)
     chunks = search_knowledge(
         retrieval_query,
         top_k=top_k,
@@ -187,7 +209,7 @@ def build_diagnosis_evidence(
 
 
 def build_fallback_diagnosis(
-    result: AnalysisResult,
+    result: AnalysisResult | StoredAnalysisView,
     evidence: DiagnosisEvidence | None = None,
 ) -> str:
     """在大模型不可用时，用确定性证据生成可展示的诊断摘要。"""
@@ -258,10 +280,14 @@ def build_fallback_diagnosis(
     )
 
 
-def _build_retrieval_query(result: AnalysisResult) -> str:
+def _build_retrieval_query(
+    result: AnalysisResult | StoredAnalysisView,
+    *,
+    question: str | None = None,
+) -> str:
     """从高风险事件、趋势和关系证据中提取检索线索。"""
 
-    terms: list[str] = []
+    terms: list[str] = [str(question).strip()] if question and question.strip() else []
     for event in result.events[:3]:
         terms.extend(event.dominant_sensors[:3])
         terms.append(event.severity)
@@ -285,6 +311,55 @@ def _build_retrieval_query(result: AnalysisResult) -> str:
     # 保序去重，避免重复传感器词淹没真正的工况和现象词。
     unique_terms = list(dict.fromkeys(term.strip() for term in terms if term.strip()))
     return " ".join(unique_terms[:24])
+
+
+def build_stored_analysis_view(result: dict[str, Any]) -> StoredAnalysisView:
+    """把 PostgreSQL 中的 JSON 结果适配为解释层所需的最小对象。"""
+
+    analysis = result.get("analysis") if isinstance(result.get("analysis"), dict) else result
+    data_profile = analysis.get("data_profile") or {}
+    summary = analysis.get("summary") or {
+        "数据文件": data_profile.get("source_name", "未知数据"),
+        "数据点数": data_profile.get("row_count", 0),
+        "传感器数量": len(data_profile.get("sensor_columns") or []),
+        "模型选择": analysis.get("model_selection") or {},
+        "异常事件数": len(analysis.get("anomaly_events") or []),
+    }
+    events = tuple(
+        _namespace(item)
+        for item in (analysis.get("anomaly_events") or [])
+        if isinstance(item, dict)
+    )
+    diagnoses = tuple(
+        _namespace(item)
+        for item in (analysis.get("root_cause_diagnoses") or [])
+        if isinstance(item, dict)
+    )
+    profile = SimpleNamespace(
+        source_name=data_profile.get("source_name", "未知数据"),
+        sensor_columns=list(data_profile.get("sensor_columns") or []),
+    )
+    return StoredAnalysisView(
+        summary=summary,
+        events=events,
+        event_diagnoses=diagnoses,
+        risk_alerts=tuple(
+            item for item in (analysis.get("risk_alerts") or []) if isinstance(item, dict)
+        ),
+        trend_summary=dict(analysis.get("trend_summary") or {}),
+        profile=profile,
+        recommendations=tuple(str(item) for item in (analysis.get("recommendations") or [])),
+    )
+
+
+def _namespace(value: Any) -> Any:
+    """递归转换解释层需要读取的英文 JSON 字段，保留列表和标量。"""
+
+    if isinstance(value, dict):
+        return SimpleNamespace(**{str(key): _namespace(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_namespace(item) for item in value)
+    return value
 
 
 def _knowledge_record(chunk: KnowledgeChunk) -> dict[str, Any]:

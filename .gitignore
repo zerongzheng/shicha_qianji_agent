@@ -8,6 +8,7 @@ dist/
 
 # uv / Python 虚拟环境
 .venv/
+.venv-*/
 .uv-cache/
 .uv-cache-local/
 
@@ -37,6 +38,8 @@ frontend/node_modules/
 .pytest_cache/
 .ruff_cache/
 .runtime-temp/
+.codex-*/
+.pytest-tmp-*/
 .mypy_cache/
 .tox/
 .nox/

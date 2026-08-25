@@ -20,7 +20,7 @@ Vue3 页面不会因为导入 OpenAPI 自动嵌入万悟。OpenAPI 只描述工�
 ### 2. 启动时察千机 FastAPI
 
 ```powershell
-cd "E:\大学课程\竞赛\shichi_qianji_agent"
+cd "E:\大学课程\竞赛\shicha_qianji_agent"
 & "E:\Tools\uv\uv.exe" run python api_main.py
 ```
 
@@ -35,7 +35,7 @@ Invoke-RestMethod http://127.0.0.1:8000/health
 另开终端：
 
 ```powershell
-cd "E:\大学课程\竞赛\shichi_qianji_agent\frontend"
+cd "E:\大学课程\竞赛\shicha_qianji_agent\frontend"
 & "E:\Tools\nodejs\npm.cmd" run dev
 ```
 
@@ -46,7 +46,7 @@ cd "E:\大学课程\竞赛\shichi_qianji_agent\frontend"
 如果内存足够，可以从万悟目录启动完整配置；内存不足时使用项目脚本的基础模式：
 
 ```powershell
-cd "E:\大学课程\竞赛\shichi_qianji_agent"
+cd "E:\大学课程\竞赛\shicha_qianji_agent"
 .\scripts\start_basic_stack.ps1 -SkipApi
 ```
 
@@ -93,8 +93,8 @@ http://host.docker.internal:8000/integrations/wanwu/quick-openapi.json
 如果页面不支持 URL 导入，可以在时察千机 API 运行后生成本地协议文件：
 
 ```powershell
-cd "E:\大学课程\竞赛\shichi_qianji_agent"
-& "E:\Tools\uv\uv.exe" run shichi-qianji-wanwu-check
+cd "E:\大学课程\竞赛\shicha_qianji_agent"
+& "E:\Tools\uv\uv.exe" run shicha-qianji-wanwu-check
 ```
 
 导出文件：
@@ -169,7 +169,7 @@ SLA 督办、维修后复检和班次简报使用各自独立工作流；人工�
 ## 联合自检
 
 ```powershell
-cd "E:\大学课程\竞赛\shichi_qianji_agent"
+cd "E:\大学课程\竞赛\shicha_qianji_agent"
 .\scripts\check_basic_stack.ps1
 ```
 
@@ -188,7 +188,7 @@ cd "E:\大学课程\竞赛\shichi_qianji_agent"
 停止万悟但保留数据：
 
 ```powershell
-cd "E:\大学课程\竞赛\shichi_qianji_agent"
+cd "E:\大学课程\竞赛\shicha_qianji_agent"
 .\scripts\stop_basic_stack.ps1
 ```
 

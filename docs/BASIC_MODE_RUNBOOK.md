@@ -13,7 +13,7 @@
 ## 目录
 
 ```text
-时察千机：E:\大学课程\竞赛\shichi_qianji_agent
+时察千机：E:\大学课程\竞赛\shicha_qianji_agent
 万悟平台：E:\大学课程\竞赛\wanwu
 ```
 
@@ -22,7 +22,7 @@
 第一个终端启动后端：
 
 ```powershell
-cd "E:\大学课程\竞赛\shichi_qianji_agent"
+cd "E:\大学课程\竞赛\shicha_qianji_agent"
 & "E:\Tools\uv\uv.exe" run python api_main.py
 ```
 
@@ -35,7 +35,7 @@ Invoke-RestMethod http://127.0.0.1:8000/health
 第二个终端启动前端：
 
 ```powershell
-cd "E:\大学课程\竞赛\shichi_qianji_agent\frontend"
+cd "E:\大学课程\竞赛\shicha_qianji_agent\frontend"
 & "E:\Tools\nodejs\npm.cmd" install
 & "E:\Tools\nodejs\npm.cmd" run dev
 ```
@@ -56,7 +56,7 @@ cd "E:\大学课程\竞赛\shichi_qianji_agent\frontend"
 本机内存不足时使用基础模式，不启动全部本体服务。先启动 Docker Desktop，然后执行：
 
 ```powershell
-cd "E:\大学课程\竞赛\shichi_qianji_agent"
+cd "E:\大学课程\竞赛\shicha_qianji_agent"
 .\scripts\start_basic_stack.ps1
 ```
 
@@ -92,7 +92,7 @@ Invoke-RestMethod http://127.0.0.1:8000/api/v1/system/diagnostics | ConvertTo-Js
 竞赛完整演示直接执行：
 
 ```powershell
-cd "E:\大学课程\竞赛\shichi_qianji_agent"
+cd "E:\大学课程\竞赛\shicha_qianji_agent"
 .\scripts\start_basic_stack.ps1
 ```
 
@@ -137,8 +137,8 @@ FastAPI 分析、PostgreSQL 落库、工单或通知步骤。
 ```
 
 不要执行 `docker compose down -v` 或 `docker system prune`，它们可能删除万悟数据库、知识库、数据卷或镜像缓存。
-启动脚本会在 `outputs/` 写入 `shichi_qianji_api.pid`、
-`shichi_qianji_frontend.pid` 以及四个 `wanwu_*_trigger.pid`；停止脚本只回收这些项目拥有且
+启动脚本会在 `outputs/` 写入 `shicha_qianji_api.pid`、
+`shicha_qianji_frontend.pid` 以及四个 `wanwu_*_trigger.pid`；停止脚本只回收这些项目拥有且
 命令行匹配的进程，并清理失效 PID 文件。手工在其他终端启动的 Vite 不会被停止脚本误杀。
 纯后端调试时可使用 `-SkipFrontend` 跳过 Vue3；旧的 `-IncludeFrontend` 参数仍兼容但无需再传。
 

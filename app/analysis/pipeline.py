@@ -13,7 +13,7 @@ from time import perf_counter
 from typing import Any
 
 from app.analysis.advice import generate_recommendations
-from app.analysis.detection import detect_anomalies
+from app.analysis.detection import describe_feature_pipeline, detect_anomalies
 from app.analysis.evaluation import evaluate_predictions
 from app.analysis.forecast import forecast_sensors
 from app.analysis.model_selection import select_detection_model
@@ -244,6 +244,55 @@ def analyze_file(
             },
             duration_seconds=_elapsed_seconds(started_at),
             limitation="选择规则来自冻结实验和设备配置，企业现场数据到位后仍需重新校准。",
+        )
+    )
+
+    feature_pipeline = describe_feature_pipeline(dataframe, profile.sensor_columns, config)
+    feature_summary = feature_pipeline["feature_construction"]
+    execution_trace.append(
+        ExecutionTraceStep(
+            step_id="feature_construction",
+            title="多变量特征构建",
+            module="app.analysis.detection._build_multivariate_features",
+            status="completed" if feature_summary["feature_count"] else "skipped",
+            input_summary={"sensor_count": len(profile.sensor_columns), "detector": config.detector},
+            output_summary=feature_summary,
+            limitation="动态特征用于统计检测和归因，不等同于物理因果特征；单点 MAD 检测器不构建展平多变量特征。",
+        )
+    )
+    window_summary = feature_pipeline["window_generation"]
+    execution_trace.append(
+        ExecutionTraceStep(
+            step_id="window_generation",
+            title="滑动窗口生成",
+            module="app.analysis.detection._build_sliding_windows",
+            status=window_summary["status"],
+            input_summary={"row_count": profile.row_count, "detector": config.detector},
+            output_summary={
+                key: value
+                for key, value in window_summary.items()
+                if key != "status" and value is not None
+            },
+            limitation="窗口异常量只回填到窗口结束点，避免把未来采样点带入在线告警；非窗口检测器会明确跳过。",
+        )
+    )
+    normalization_summary = feature_pipeline["normalization"]
+    execution_trace.append(
+        ExecutionTraceStep(
+            step_id="normalization",
+            title="模型归一化与防泄漏",
+            module="app.analysis.preprocessing.adaptive_preprocess + detector scaling",
+            status=normalization_summary["status"],
+            input_summary={
+                "detector": config.detector,
+                "raw_values_preserved": normalization_summary["raw_values_preserved"],
+            },
+            output_summary={
+                "methods": normalization_summary["methods"],
+                "fit_scope": normalization_summary["fit_scope"],
+                "future_leakage_guard": normalization_summary["future_leakage_guard"],
+            },
+            limitation="归一化只改变模型计算尺度，不改变原始物理量，也不代表完成设备计量校准。",
         )
     )
 

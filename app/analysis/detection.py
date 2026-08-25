@@ -1116,6 +1116,114 @@ def _build_multivariate_features(
     return pd.DataFrame(feature_columns, index=clean_data.index), groups
 
 
+def describe_feature_pipeline(
+    dataframe: pd.DataFrame,
+    sensor_columns: list[str],
+    config: AnalysisConfig,
+) -> dict[str, Any]:
+    """返回本次检测实际采用的特征、窗口和缩放元数据。
+
+    该函数只计算可审计的形状和策略信息，不训练模型、不保存逐点数据。它与检测器复用
+    同一特征构造函数和窗口参数，供执行轨迹和页面展示“模型到底看到了什么”。
+    """
+
+    clean_data = _prepare_sensor_data(dataframe[sensor_columns])
+    detector = config.detector.lower().strip()
+    feature_detectors = {
+        "isolation_forest",
+        "pca_reconstruction",
+        "window_autoencoder",
+        "hybrid",
+        "time_frequency_relation",
+    }
+    uses_dynamic_features = detector in feature_detectors
+    if uses_dynamic_features:
+        features, groups = _build_multivariate_features(clean_data, config)
+        feature_summary = {
+            "feature_count": int(features.shape[1]),
+            "features_per_sensor": 3,
+            "feature_types": ["局部残差", "一阶变化率", "局部波动"],
+            "sensor_count": len(groups),
+            "detector_scope": "多变量动态特征",
+        }
+        if detector == "time_frequency_relation":
+            _, frequency_weight, relation_weight = _normalized_tfr_weights(config)
+            feature_summary["additional_feature_types"] = [
+                label
+                for label, weight in (
+                    ("频谱形态", frequency_weight),
+                    ("传感器关系", relation_weight),
+                )
+                if weight > 0
+            ]
+    else:
+        feature_summary = {
+            "feature_count": 0,
+            "features_per_sensor": 0,
+            "feature_types": [],
+            "sensor_count": len(sensor_columns),
+            "detector_scope": "当前检测器直接使用逐测点局部尺度",
+        }
+
+    window_detectors = {"window_autoencoder", "time_frequency_relation"}
+    if detector in window_detectors:
+        window_size = max(
+            4 if detector == "window_autoencoder" else 8,
+            int(config.autoencoder_window),
+        )
+        window_count = max(0, len(clean_data) - window_size + 1)
+        window_summary = {
+            "window_size": window_size,
+            "window_count": window_count,
+            "window_layout": "连续采样点 × 特征，窗口异常量回填到结束点",
+            "window_stride": 1,
+            "status": "completed" if window_count else "skipped",
+            "reason": None if window_count else "数据点不足以构造一个完整窗口",
+        }
+    else:
+        window_summary = {
+            "window_size": None,
+            "window_count": 0,
+            "window_layout": None,
+            "window_stride": None,
+            "status": "skipped",
+            "reason": "当前主检测器不使用展平滑动窗口",
+        }
+
+    if detector == "mad":
+        normalization_summary = {
+            "methods": ["局部中位数 + MAD 稳健尺度"],
+            "fit_scope": "每个测点仅使用当前点之前的历史滚动窗口",
+        }
+    elif detector == "hybrid":
+        normalization_summary = {
+            "methods": ["局部 MAD 稳健尺度", "训练段 RobustScaler"],
+            "fit_scope": "MAD 仅使用历史滚动窗口；多变量分支只在健康基线或当前文件前段拟合",
+        }
+    elif detector in feature_detectors:
+        normalization_summary = {
+            "methods": ["训练段 RobustScaler"],
+            "fit_scope": "健康基线或当前文件前段训练窗口，随后变换全部待分析点",
+        }
+    else:
+        normalization_summary = {
+            "methods": [],
+            "fit_scope": "当前检测器未声明缩放方法",
+        }
+    normalization_summary.update(
+        {
+            "status": "completed",
+            "future_leakage_guard": "缩放器只在健康基线或训练段拟合，不使用预测起点后的数据",
+            "raw_values_preserved": True,
+        }
+    )
+    return {
+        "feature_construction": feature_summary,
+        "window_generation": window_summary,
+        "normalization": normalization_summary,
+    }
+
+
 def _feature_deviation_score(
     features: pd.DataFrame,
     baseline_features: pd.DataFrame,

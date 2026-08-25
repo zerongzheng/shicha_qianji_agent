@@ -1,0 +1,10 @@
+{
+  "wanwu_base_url": "http://127.0.0.1:8081",
+  "workflow_uuid": "WANWU_WORKFLOW_UUID",
+  "api_key_env": "WANWU_WORKFLOW_API_KEY",
+  "interval_seconds": 60,
+  "parameters": {
+    "source_id": "",
+    "max_sources": 1
+  }
+}

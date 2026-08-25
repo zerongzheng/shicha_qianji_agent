@@ -72,14 +72,14 @@ VITE_API_KEY=
 先在第一个终端启动后端：
 
 ```powershell
-cd "E:\大学课程\竞赛\shichi_qianji_agent"
+cd "E:\大学课程\竞赛\shicha_qianji_agent"
 & "E:\Tools\uv\uv.exe" run python api_main.py
 ```
 
 再在第二个终端启动前端：
 
 ```powershell
-cd "E:\大学课程\竞赛\shichi_qianji_agent\frontend"
+cd "E:\大学课程\竞赛\shicha_qianji_agent\frontend"
 & "E:\Tools\nodejs\npm.cmd" install
 & "E:\Tools\nodejs\npm.cmd" run dev
 ```
@@ -97,7 +97,7 @@ http://127.0.0.1:5173
 ## 前端测试
 
 ```powershell
-cd "E:\大学课程\竞赛\shichi_qianji_agent\frontend"
+cd "E:\大学课程\竞赛\shicha_qianji_agent\frontend"
 & "E:\Tools\nodejs\npm.cmd" run test
 ```
 
@@ -117,7 +117,7 @@ cd "E:\大学课程\竞赛\shichi_qianji_agent\frontend"
 ## 生产构建
 
 ```powershell
-cd "E:\大学课程\竞赛\shichi_qianji_agent\frontend"
+cd "E:\大学课程\竞赛\shicha_qianji_agent\frontend"
 & "E:\Tools\nodejs\npm.cmd" run build
 & "E:\Tools\nodejs\npm.cmd" run preview
 ```

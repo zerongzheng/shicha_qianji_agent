@@ -930,7 +930,7 @@ wheels = [
 ]
 
 [[package]]
-name = "shichi-qianji-agent"
+name = "shicha-qianji-agent"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

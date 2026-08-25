@@ -108,7 +108,7 @@ def test_system_diagnostics_does_not_expose_local_paths() -> None:
     response = TestClient(server.app).get("/api/v1/system/diagnostics")
     assert response.status_code == 200
     payload = response.json()
-    assert payload["service"] == "shichi-qianji"
+    assert payload["service"] == "shicha-qianji"
     assert "checks" in payload
     assert "warnings" in payload
     assert "project_root" not in str(payload)

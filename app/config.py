@@ -109,7 +109,7 @@ def get_settings() -> Settings:
         output_dir=PROJECT_ROOT / "outputs",
         database_url=os.getenv(
             "DATABASE_URL",
-            "postgresql://shichi_qianji_app:change-me@127.0.0.1:5432/shichi_qianji",
+            "postgresql://shicha_qianji_app:change-me@127.0.0.1:5432/shicha_qianji",
         ),
         database_schema=os.getenv("DATABASE_SCHEMA", "public").strip() or "public",
         knowledge_dir=PROJECT_ROOT / "resources" / "knowledge",

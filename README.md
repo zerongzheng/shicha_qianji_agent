@@ -4,6 +4,13 @@
 
 时察千机持续监测工业多变量传感器数据，在新批次到达后自动完成采集、分析、风险判断、异常取证、根因诊断、工单生成与分级通知，并通过现场反馈沉淀历史故障案例。当前校赛阶段使用公开 SKAB 数据集完成工程验证，企业真实数据接入后主要替换数据适配和设备知识，不改变整体应用闭环。
 
+## 双环境运行
+
+本项目同时提供 Windows 本机模式和 Ubuntu 服务器模式。本机继续使用
+`scripts/start_basic_stack.ps1` 与 `scripts/stop_basic_stack.ps1`；服务器使用
+`scripts/start_server_stack.sh` 与 `scripts/stop_server_stack.sh`。两套环境的数据、工作流 UUID、API
+Key 和运行输出相互独立，具体迁移与启动步骤见 `docs/DUAL_ENV_RUNBOOK.md`。
+
 ## 项目定位
 
 本项目不是单纯的聊天机器人，也不是只输出一个异常标签的检测脚本，而是一套面向工业运维闭环的时序智能体：
@@ -87,7 +94,7 @@ B --> F["阿里云百炼 DashScope 可选模型"]
 | --- | --- | --- |
 | Vue3 前端 | 图表、风险总览、异常证据、预测、工单和历史案例 | 专业工业运维看板 |
 | FastAPI 后端 | 文件接收、异步任务、算法调用、数据库读写、万悟接口 | 前后端和平台之间的业务服务层 |
-| 万悟平台 | 无人值守工作流编排、执行记录、智能体、知识库和模型 | 竞赛自动化主入口与平台化展示 |
+| 万悟平台 | 无人值守工作流编排、调用统计、智能体、知识库和模型 | 竞赛自动化主入口与平台化展示 |
 
 风险总览中的“自动分析链路”来自后端 `execution_trace` 字段。标准分析接口和本地历史任务返回完整步骤；
 万悟快速诊断接口只返回紧凑摘要，以控制上下文长度和模型调用额度。
@@ -97,7 +104,7 @@ Vue3 不会因为导入 OpenAPI 自动出现在万悟网页内部。OpenAPI 让�
 ## 目录结构
 
 ```text
-shichi_qianji_agent/
+shicha_qianji_agent/
 ├─ app/
 │  ├─ analysis/                 # 数据画像、异常检测、预测、工况和流程编排
 │  ├─ api/                      # FastAPI 接口、异步任务和万悟 OpenAPI
@@ -137,7 +144,7 @@ SKAB 与项目目录并列：
 
 ```text
 E:\大学课程\竞赛\SKAB
-E:\大学课程\竞赛\shichi_qianji_agent
+E:\大学课程\竞赛\shicha_qianji_agent
 ```
 
 默认样例由根目录 `.env` 配置：
@@ -171,7 +178,7 @@ Vue3 前端用于查看图表和处置工单，但不是自动巡检的运行依
 .\scripts\start_basic_stack.ps1 -SkipFrontend
 ```
 
-启动脚本默认管理 `shichi_qianji_frontend.pid`，统一停止命令不变。旧的 `-IncludeFrontend`
+启动脚本默认管理 `shicha_qianji_frontend.pid`，统一停止命令不变。旧的 `-IncludeFrontend`
 参数仍可使用，但已不再需要。
 
 数据源既可在 Vue3“自动监测”页面配置，也可由万悟的“数据源接入配置”工作流调用
@@ -182,7 +189,7 @@ Vue3 前端用于查看图表和处置工单，但不是自动巡检的运行依
 ```text
 名称：SKAB 演示实时目录
 方式：监控目录
-目录：E:\大学课程\竞赛\shichi_qianji_agent\outputs\demo_feed\skab_valve1
+目录：E:\大学课程\竞赛\shicha_qianji_agent\outputs\demo_feed\skab_valve1
 周期：30 秒（后台无人值守工作流触发频率为 60 秒）
 P1：生产值班负责人
 P2：设备工程师
@@ -193,7 +200,8 @@ P3：运行值班员
 外部定时器分别调用已发布的四个万悟工作流。无人值守巡检工作流以 SHA-256 内容指纹跳过已处理数据、
 保存不可变快照、提交异步分析、读取结果并调用通知工具；SLA 督办和维修后复检由各自独立周期推进，
 班次简报汇总最近 8 小时状态。启用企业微信群机器人后，风险等级、责任岗位、接收人员、数据来源和工单
-编号会被主动推送至运维群；整个业务链可在万悟运行记录中查看。
+编号会被主动推送至运维群；工作流调用次数和耗时可在万悟统计看板查看，详细算法执行链路在
+Vue3看板和后端审计结果中查看。当前基础版万悟画布不保证提供逐次节点运行历史。
 
 万悟当前随附文档提供工作流 OpenAPI，但未发现画布内置 Cron 节点，因此时间信号由
 Windows 任务计划程序、Linux cron 或 `wanwu/scripts/trigger_wanwu_workflow.ps1` 提供。
@@ -210,7 +218,7 @@ WECOM_TIMEOUT_SECONDS=10
 
 校赛演示使用一个运维群即可：系统仍按 P1/P2/P3 在 PostgreSQL 中完成责任岗位与接收人路由，同一个机器人负责实际送达，消息正文会明确标注应由谁处理。若企业后续要求分别推送到多个群，可在通知适配层增加“岗位到机器人”的部署配置，不需要修改异常检测和工单逻辑。
 
-比赛演示可使用 `scripts/simulate_skab_live_feed.ps1` 将下一份公开 SKAB 样本投递到独立模拟目录，再展示万悟自动处理记录和分级通知。该脚本只模拟“新批次到达”，不修改原始数据，也不把公开数据包装成企业成效。当前目录轮询与 HTTP 轮询属于秒级或分钟级准实时采集，不宣称为 Kafka/MQTT 流式计算。企业后续提供消息队列、时序数据库或 CDC 接口时，只需新增采集适配器。
+比赛演示可使用 `scripts/simulate_skab_live_feed.ps1`（Windows）或 `scripts/simulate_skab_live_feed.sh`（服务器）将下一份公开 SKAB 样本投递到独立模拟目录，再展示万悟自动处理记录和分级通知。服务器演示不需要先在本机生成 CSV 再拖拽上传：服务器端脚本直接读取服务器上的 `SKAB/data/valve1`，把下一份样本原子投递到项目的 `outputs/demo_feed/skab_valve1`。两个脚本只模拟“新批次到达”，不修改原始数据，也不把公开数据包装成企业成效。当前目录轮询与 HTTP 轮询属于秒级或分钟级准实时采集，不宣称为 Kafka/MQTT 流式计算。企业后续提供消息队列、时序数据库或 CDC 接口时，只需新增采集适配器。
 
 后台正式频率为 60 秒，单独执行 `-RunOnce` 可能额外等待 0 至 60 秒。录制演示视频时可在
 投递后立即调用已发布的无人值守工作流，不修改正式频率：
@@ -229,6 +237,33 @@ WECOM_TIMEOUT_SECONDS=10
 `-Replay` 只重置模拟器进度，并平移复制样本的时间列以形成新的演示批次，不删除历史任务、工单、
 报告或 PostgreSQL 数据。本轮时间偏移会写入 `.feed_state.json`，后续不带 `-Replay` 的
 `-RunOnce` 会自动继承，确保整轮样本都生成新的内容指纹。
+
+服务器上四个工作流触发器已经由 `scripts/start_server_stack.sh` 后台运行时，每次演示只需在服务器执行：
+
+```bash
+cd /home/ubuntu/apps/shicha_qianji_agent
+bash scripts/simulate_skab_live_feed.sh --run-once
+```
+
+需要从第一份样本重新演示时执行：
+
+```bash
+bash scripts/simulate_skab_live_feed.sh --replay --run-once
+```
+
+`--replay` 只重置服务器端投放进度，不删除已有 CSV、分析记录、工单或报告。服务器端投放后由无人值守巡检触发器自动发现，正式频率仍为 60 秒。
+
+如果需要像 Windows 投放器一样在投放后立即调用无人值守工作流，可直接给现有服务器投放器增加参数：
+
+```bash
+bash scripts/simulate_skab_live_feed.sh --run-once --trigger-autonomous-workflow
+```
+
+从第一份样本重新演示并立即调用：
+
+```bash
+bash scripts/simulate_skab_live_feed.sh --replay --run-once --trigger-autonomous-workflow
+```
 
 设备配置采用“显式指定、自动匹配、通用回退”三层机制：
 
@@ -253,7 +288,7 @@ resources/knowledge/
 项目使用 uv 管理 Python 环境，当前要求 Python 3.13 或更高版本；前端使用 Node.js 和 npm。
 
 ```powershell
-cd "E:\大学课程\竞赛\shichi_qianji_agent"
+cd "E:\大学课程\竞赛\shicha_qianji_agent"
 & "E:\Tools\uv\uv.exe" sync
 ```
 
@@ -266,7 +301,7 @@ Copy-Item .env.example .env
 然后编辑 `.env`，至少检查：
 
 ```dotenv
-DATABASE_URL=postgresql://shichi_qianji_app:你的数据库密码@127.0.0.1:5432/shichi_qianji
+DATABASE_URL=postgresql://shicha_qianji_app:你的数据库密码@127.0.0.1:5432/shicha_qianji
 DATABASE_SCHEMA=public
 LLM_PROVIDER=dashscope
 LLM_API_KEY=你的阿里云百炼 DashScope API Key
@@ -294,14 +329,14 @@ AUTH_BOOTSTRAP_PASSWORD=请设置一个校赛演示密码
 先开一个终端启动后端：
 
 ```powershell
-cd "E:\大学课程\竞赛\shichi_qianji_agent"
+cd "E:\大学课程\竞赛\shicha_qianji_agent"
 & "E:\Tools\uv\uv.exe" run python api_main.py
 ```
 
 再开第二个终端启动前端：
 
 ```powershell
-cd "E:\大学课程\竞赛\shichi_qianji_agent\frontend"
+cd "E:\大学课程\竞赛\shicha_qianji_agent\frontend"
 & "E:\Tools\nodejs\npm.cmd" install
 & "E:\Tools\nodejs\npm.cmd" run dev
 ```
@@ -328,7 +363,7 @@ Invoke-RestMethod http://127.0.0.1:8000/health
 ### B. 只运行后端接口
 
 ```powershell
-cd "E:\大学课程\竞赛\shichi_qianji_agent"
+cd "E:\大学课程\竞赛\shicha_qianji_agent"
 & "E:\Tools\uv\uv.exe" run python api_main.py
 ```
 
@@ -417,7 +452,7 @@ SLA 督办、维修后复检和班次简报分别由独立周期工作流执行�
 项目统一使用 PostgreSQL，不再创建或读取 SQLite 文件。本机默认连接信息由 `.env` 提供：
 
 ```dotenv
-DATABASE_URL=postgresql://shichi_qianji_app:你的数据库密码@127.0.0.1:5432/shichi_qianji
+DATABASE_URL=postgresql://shicha_qianji_app:你的数据库密码@127.0.0.1:5432/shicha_qianji
 DATABASE_SCHEMA=public
 ```
 
@@ -530,7 +565,7 @@ outputs/logs/              运行日志
 ## 测试
 
 ```powershell
-cd "E:\大学课程\竞赛\shichi_qianji_agent"
+cd "E:\大学课程\竞赛\shicha_qianji_agent"
 & "E:\Tools\uv\uv.exe" sync --extra dev
 & "E:\Tools\uv\uv.exe" run pytest -q
 ```
@@ -540,7 +575,7 @@ cd "E:\大学课程\竞赛\shichi_qianji_agent"
 前端构建检查：
 
 ```powershell
-cd "E:\大学课程\竞赛\shichi_qianji_agent\frontend"
+cd "E:\大学课程\竞赛\shicha_qianji_agent\frontend"
 & "E:\Tools\nodejs\npm.cmd" run build
 ```
 

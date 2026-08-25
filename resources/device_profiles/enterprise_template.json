@@ -1,0 +1,52 @@
+{
+  "profile_id": "enterprise_template",
+  "version": "0.1.0",
+  "display_name": "企业设备配置模板",
+  "device_type": "待补充",
+  "enabled": false,
+  "auto_match": false,
+  "schema": {
+    "time_column": "datetime",
+    "label_columns": [],
+    "required_columns": ["datetime", "Pressure", "FlowRate"],
+    "optional_columns": ["Temperature", "Current"]
+  },
+  "match": {
+    "columns": ["Pressure", "FlowRate"],
+    "minimum_match_count": 2
+  },
+  "column_aliases": {
+    "采集时间": "datetime",
+    "压力值": "Pressure",
+    "流量值": "FlowRate",
+    "温度值": "Temperature",
+    "电流值": "Current"
+  },
+  "expected_sampling_seconds": null,
+  "healthy_baseline_path": null,
+  "recommended_analysis": {
+    "detector": "time_frequency_relation",
+    "threshold": 4.5
+  },
+  "sensors": {
+    "Pressure": {
+      "display_name": "压力",
+      "unit": null,
+      "category": "工艺",
+      "safe_range": null,
+      "description": "由企业确认测点位置、量纲和安全边界。"
+    },
+    "FlowRate": {
+      "display_name": "流量",
+      "unit": null,
+      "category": "工艺",
+      "safe_range": null,
+      "description": "由企业确认测点位置、量纲和安全边界。"
+    }
+  },
+  "scope": ["复制本文件后按一类真实设备建立独立配置"],
+  "limitations": [
+    "本文件仅是结构模板，填写并经企业确认前不得启用。",
+    "禁止凭经验编造单位、安全阈值、设备拓扑和故障结论。"
+  ]
+}

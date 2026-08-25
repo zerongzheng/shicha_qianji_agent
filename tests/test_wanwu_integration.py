@@ -114,6 +114,7 @@ def test_wanwu_openapi_only_exposes_json_tools() -> None:
         "/api/v1/wanwu/jobs/status",
         "/api/v1/wanwu/jobs/result",
         "/api/v1/wanwu/jobs/decision-brief",
+        "/api/v1/wanwu/jobs/explain",
         "/api/v1/wanwu/reports/shift-brief",
         "/api/v1/wanwu/jobs/cancel",
         "/api/v1/wanwu/cases/list",
@@ -166,6 +167,119 @@ def test_wanwu_autonomous_cycle_returns_run_id_for_workflow_branch(monkeypatch) 
     assert payload["primary_run_id"] == "run_autonomous001"
     assert payload["submitted_count"] == 1
     assert "查询任务状态" in payload["next_action"]
+
+
+def test_wanwu_explains_existing_run_without_reanalysis(monkeypatch) -> None:
+    """辅助解释只读取已有结果，并把 RAG 证据和审计附加回同一任务。"""
+
+    class FakeRepository:
+        def __init__(self) -> None:
+            self.updated_result = None
+
+        def get_run(self, run_id: str) -> dict:
+            return {
+                "run_id": run_id,
+                "status": "success",
+                "result": {
+                    "status": "success",
+                    "run_id": run_id,
+                    "data_profile": {
+                        "source_name": "3.csv",
+                        "row_count": 180,
+                        "sensor_columns": ["Pressure"],
+                    },
+                    "anomaly_events": [],
+                    "root_cause_diagnoses": [],
+                    "risk_alerts": [],
+                    "recommendations": ["继续监测"],
+                    "summary": {"数据文件": "3.csv", "异常事件数": 0},
+                },
+            }
+
+        def list_model_calls(self, *, limit: int, run_id: str) -> list[dict]:
+            assert limit == 20
+            return [
+                {
+                    "call_id": "model_test",
+                    "run_id": run_id,
+                    "operation": "automatic_diagnosis",
+                    "provider": "test",
+                    "model": "test-model",
+                    "status": "success",
+                    "duration_ms": 12.0,
+                    "input_character_count": 100,
+                    "output_character_count": 20,
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                    "error_type": None,
+                    "content_stored": 0,
+                }
+            ]
+
+        def update_run_result(self, run_id: str, result: dict) -> None:
+            assert run_id == "run_existing001"
+            self.updated_result = result
+
+    class FakeDiagnosis:
+        status = "generated"
+        model = "test-model"
+        diagnosis = "基于结构化证据生成的辅助解释。"
+        limitations = ("不能替代现场确诊。",)
+        evidence = SimpleNamespace(
+            knowledge=(
+                {
+                    "source": "industrial_diagnosis.md",
+                    "text": "压力异常需核对工况。",
+                    "score": 0.88,
+                    "retrieval_mode": "hybrid_embedding",
+                },
+            )
+        )
+
+        def to_dict(self) -> dict:
+            return {
+                "status": self.status,
+                "model": self.model,
+                "diagnosis": self.diagnosis,
+                "evidence": {
+                    "retrieval_query": "Pressure 压力异常",
+                    "knowledge": list(self.evidence.knowledge),
+                },
+                "limitations": list(self.limitations),
+                "error": None,
+            }
+
+    class FakeService:
+        def diagnose(self, result, *, run_id: str, question: str | None = None):
+            assert result.to_summary()["数据文件"] == "3.csv"
+            assert run_id == "run_existing001"
+            assert question == "为什么压力异常"
+            return FakeDiagnosis()
+
+    repository = FakeRepository()
+    monkeypatch.setattr(server, "get_repository", lambda: repository)
+    monkeypatch.setattr(server, "AutomaticDiagnosisService", FakeService)
+    monkeypatch.setattr(
+        server,
+        "analyze_file",
+        lambda *args, **kwargs: pytest.fail("辅助解释不得重新运行 analyze_file"),
+    )
+
+    client = TestClient(server.app)
+    response = client.post(
+        "/api/v1/wanwu/jobs/explain",
+        json={"run_id": "run_existing001", "question": "为什么压力异常"},
+    )
+    client.close()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["diagnosis_status"] == "generated"
+    assert payload["knowledge_sources"][0]["source"] == "industrial_diagnosis.md"
+    assert payload["model_audit"]["call_count"] == 1
+    assert repository.updated_result["automatic_diagnosis"]["status"] == "generated"
+    assert repository.updated_result["model_audit"]["content_stored"] is False
 
 
 def test_wanwu_can_manage_and_verify_directory_data_source(
@@ -545,6 +659,7 @@ def test_wanwu_check_can_verify_platform_and_complete_toolset(tmp_path, monkeypa
                     "get_industrial_analysis_status",
                     "get_industrial_analysis_result",
                     "get_industrial_decision_brief",
+                    "explain_industrial_run",
                     "generate_industrial_shift_brief",
                     "cancel_industrial_analysis",
                     "list_industrial_work_orders",
@@ -577,7 +692,7 @@ def test_wanwu_check_can_verify_platform_and_complete_toolset(tmp_path, monkeypa
         """分别模拟健康检查、完整 Schema 和比赛演示 Schema。"""
 
         if url.endswith("/health"):
-            return {"status": "ok", "service": "shichi-qianji"}
+            return {"status": "ok", "service": "shicha-qianji"}
         if url.endswith("/quick-openapi.json"):
             return quick_schema
         return schema
@@ -595,7 +710,7 @@ def test_wanwu_check_can_verify_platform_and_complete_toolset(tmp_path, monkeypa
         quick_output_path=tmp_path / "wanwu-quick.json",
     )
 
-    assert result["tool_count"] == 18
+    assert result["tool_count"] == 19
     assert result["platform_http_status"] == 200
     assert result["schema_server"] == "http://host.docker.internal:8000"
     assert result["quick_tool_count"] == 1
@@ -680,7 +795,7 @@ def test_wanwu_quick_payload_keeps_decision_ledger(monkeypatch) -> None:
 
 
 def test_wanwu_decision_brief_exposes_compact_algorithm_evidence(monkeypatch) -> None:
-    """决策摘要应显式返回选模、交叉验证、趋势风险、优化建议和工单信息。"""
+    """决策摘要应显式返回选模、交叉验证、处理证据、优化建议和工单信息。"""
 
     stored_result = {
         "detector": "time_frequency_relation",
@@ -751,6 +866,24 @@ def test_wanwu_decision_brief_exposes_compact_algorithm_evidence(monkeypatch) ->
         "work_order_drafts": [
             {"record_id": "run_decision001:WO-001", "priority": "P1"}
         ],
+        "execution_trace": [
+            {
+                "step_id": "adaptive_preprocessing",
+                "output_summary": {"processed_row_count": 100, "filled_count": 2},
+            },
+            {
+                "step_id": "feature_construction",
+                "output_summary": {"feature_count": 6},
+            },
+            {
+                "step_id": "window_generation",
+                "output_summary": {"window_count": 93, "window_size": 8},
+            },
+            {
+                "step_id": "normalization",
+                "output_summary": {"methods": ["训练段 RobustScaler"]},
+            },
+        ],
         "limitations": ["公开数据验证不代表企业现场成效。"],
     }
     monkeypatch.setattr(
@@ -768,6 +901,9 @@ def test_wanwu_decision_brief_exposes_compact_algorithm_evidence(monkeypatch) ->
     assert payload["trend_risk"]["forecast_summaries"][0]["backtest_rmse"] == 0.12
     assert payload["optimization"]["recommendation_count"] == 1
     assert "不直接下发控制指令" in payload["optimization"]["human_gate"]
+    assert payload["processing_evidence"]["feature_construction"]["feature_count"] == 6
+    assert payload["processing_evidence"]["window_generation"]["window_count"] == 93
+    assert "数据处理证据" in payload["presentation"]
     assert payload["work_order_summary"]["highest_priority"] == "P1"
     assert payload["rag_context"]["sensor_terms"] == ["Pressure"]
     assert "知识库只补充" in payload["rag_context"]["usage_rule"]
@@ -883,7 +1019,7 @@ def test_wanwu_schema_declares_api_key_when_remote_auth_is_enabled() -> None:
 
     schema = build_wanwu_openapi(
         server.app.openapi(),
-        "http://shichi-qianji-api:8000",
+        "http://shicha-qianji-api:8000",
         quick_only=True,
         api_key_required=True,
     )

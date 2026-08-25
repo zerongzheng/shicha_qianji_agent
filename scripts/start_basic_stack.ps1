@@ -1,11 +1,11 @@
-﻿param(
+param(
     [switch]$SkipApi,
     [switch]$SkipTrigger,
     [switch]$SkipFrontend,
     [switch]$IncludeFrontend
 )
 
-# Start PostgreSQL, the low-memory Wanwu Docker stack, the Shichi Qianji API,
+# Start PostgreSQL, the low-memory Wanwu Docker stack, the Shicha Qianji API,
 # the four published Wanwu workflow triggers, and the Vue3 console.
 # This script never deletes containers, images, volumes, or database data.
 
@@ -21,12 +21,12 @@ $outputDirectory = Join-Path $projectRoot "outputs"
 $frontendRoot = Join-Path $projectRoot "frontend"
 $uvPath = if (Test-Path "E:\Tools\uv\uv.exe") { "E:\Tools\uv\uv.exe" } else { "uv" }
 $triggerScript = Join-Path $projectRoot "wanwu\scripts\trigger_wanwu_workflow.ps1"
-$apiPidPath = Join-Path $outputDirectory "shichi_qianji_api.pid"
-$apiStdoutPath = Join-Path $outputDirectory "shichi_qianji_api.log"
-$apiStderrPath = Join-Path $outputDirectory "shichi_qianji_api.error.log"
-$frontendPidPath = Join-Path $outputDirectory "shichi_qianji_frontend.pid"
-$frontendStdoutPath = Join-Path $outputDirectory "shichi_qianji_frontend.log"
-$frontendStderrPath = Join-Path $outputDirectory "shichi_qianji_frontend.error.log"
+$apiPidPath = Join-Path $outputDirectory "shicha_qianji_api.pid"
+$apiStdoutPath = Join-Path $outputDirectory "shicha_qianji_api.log"
+$apiStderrPath = Join-Path $outputDirectory "shicha_qianji_api.error.log"
+$frontendPidPath = Join-Path $outputDirectory "shicha_qianji_frontend.pid"
+$frontendStdoutPath = Join-Path $outputDirectory "shicha_qianji_frontend.log"
+$frontendStderrPath = Join-Path $outputDirectory "shicha_qianji_frontend.error.log"
 
 $composeArgs = @(
     "--env-file", ".env",
@@ -270,7 +270,7 @@ function Wait-WanwuGateway {
     throw "Wanwu gateway did not become ready within 2 minutes. Run check_basic_stack.ps1 for details."
 }
 
-function Wait-ShichiQianjiApi {
+function Wait-ShichaQianjiApi {
     $deadline = (Get-Date).AddMinutes(2)
     do {
         try {
@@ -279,15 +279,15 @@ function Wait-ShichiQianjiApi {
             if ($response.StatusCode -eq 200) { return }
         }
         catch {
-            Write-Host "Waiting for Shichi Qianji API: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "Waiting for Shicha Qianji API: $($_.Exception.Message)" -ForegroundColor Yellow
         }
         Start-Sleep -Seconds 3
     } while ((Get-Date) -lt $deadline)
 
-    throw "Shichi Qianji API did not become ready within 2 minutes. Check $apiStderrPath."
+    throw "Shicha Qianji API did not become ready within 2 minutes. Check $apiStderrPath."
 }
 
-function Wait-ShichiQianjiFrontend {
+function Wait-ShichaQianjiFrontend {
     $deadline = (Get-Date).AddMinutes(1)
     do {
         try {
@@ -296,16 +296,16 @@ function Wait-ShichiQianjiFrontend {
             if ($response.StatusCode -eq 200) { return }
         }
         catch {
-            Write-Host "Waiting for Shichi Qianji frontend: $($_.Exception.Message)" `
+            Write-Host "Waiting for Shicha Qianji frontend: $($_.Exception.Message)" `
                 -ForegroundColor Yellow
         }
         Start-Sleep -Seconds 2
     } while ((Get-Date) -lt $deadline)
 
-    throw "Shichi Qianji frontend did not become ready within 1 minute. Check $frontendStderrPath."
+    throw "Shicha Qianji frontend did not become ready within 1 minute. Check $frontendStderrPath."
 }
 
-function Start-ShichiQianjiApi {
+function Start-ShichaQianjiApi {
     $tracked = Test-TrackedProcess $apiPidPath @("api_main.py") @("uv", "python")
     if ($tracked) {
         Write-Host "时察千机后端已运行（PID $($tracked.Id)）。" -ForegroundColor Green
@@ -336,7 +336,7 @@ function Start-ShichiQianjiApi {
     Write-Host "时察千机后端已启动（PID $($process.Id)）。" -ForegroundColor Green
 }
 
-function Start-ShichiQianjiFrontend {
+function Start-ShichaQianjiFrontend {
     $tracked = Test-TrackedProcess $frontendPidPath @("vite", "frontend") @("node")
     if ($tracked) {
         Write-Host "Vue3 运维工作台已运行（PID $($tracked.Id)）。" -ForegroundColor Green
@@ -513,13 +513,13 @@ Wait-WanwuGateway
 Write-Host "Wanwu gateway ready: http://127.0.0.1:8081" -ForegroundColor Green
 
 if (-not $SkipApi) {
-    Write-Host "[5/8] Starting Shichi Qianji API on port 8000..." -ForegroundColor Cyan
-    Start-ShichiQianjiApi
-    Wait-ShichiQianjiApi
-    Write-Host "Shichi Qianji API ready: http://127.0.0.1:8000" -ForegroundColor Green
+    Write-Host "[5/8] Starting Shicha Qianji API on port 8000..." -ForegroundColor Cyan
+    Start-ShichaQianjiApi
+    Wait-ShichaQianjiApi
+    Write-Host "Shicha Qianji API ready: http://127.0.0.1:8000" -ForegroundColor Green
 }
 else {
-    Write-Host "[5/8] Skipping Shichi Qianji API by request." -ForegroundColor Yellow
+    Write-Host "[5/8] Skipping Shicha Qianji API by request." -ForegroundColor Yellow
 }
 
 if (-not $SkipTrigger) {
@@ -534,8 +534,8 @@ else {
 
 if ($startFrontend) {
     Write-Host "[7/8] Starting Vue3 competition console on port 5173..." -ForegroundColor Cyan
-    Start-ShichiQianjiFrontend
-    Wait-ShichiQianjiFrontend
+    Start-ShichaQianjiFrontend
+    Wait-ShichaQianjiFrontend
     Write-Host "Vue3 competition console ready: http://127.0.0.1:5173" -ForegroundColor Green
 }
 else {
@@ -544,7 +544,7 @@ else {
 
 Write-Host "[8/8] Basic competition stack is ready." -ForegroundColor Green
 Write-Host "Wanwu: http://127.0.0.1:8081" -ForegroundColor Green
-Write-Host "Shichi Qianji API: http://127.0.0.1:8000" -ForegroundColor Green
+Write-Host "Shicha Qianji API: http://127.0.0.1:8000" -ForegroundColor Green
 if ($startFrontend) {
     Write-Host "Vue3 console: http://127.0.0.1:5173" -ForegroundColor Green
 }

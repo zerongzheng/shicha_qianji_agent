@@ -17,6 +17,7 @@ from app.analysis.detection import (
     _map_window_values_to_endpoints,
     _normalized_tfr_weights,
     clear_autoencoder_cache,
+    describe_feature_pipeline,
     detect_anomalies,
 )
 from app.analysis.evaluation import evaluate_predictions
@@ -124,6 +125,9 @@ def test_execution_trace_records_stable_automatic_chain(tmp_path) -> None:
         "data_profile",
         "adaptive_preprocessing",
         "model_selection",
+        "feature_construction",
+        "window_generation",
+        "normalization",
         "anomaly_detection",
         "model_cross_validation",
         "operating_regime",
@@ -135,6 +139,10 @@ def test_execution_trace_records_stable_automatic_chain(tmp_path) -> None:
     ]
     trace_by_id = {step.step_id: step for step in result.execution_trace}
     assert trace_by_id["model_cross_validation"].status == "skipped"
+    assert trace_by_id["feature_construction"].status == "skipped"
+    assert trace_by_id["window_generation"].status == "skipped"
+    assert trace_by_id["normalization"].output_summary["methods"]
+    assert trace_by_id["normalization"].output_summary["future_leakage_guard"]
     assert trace_by_id["operating_regime"].status == "skipped"
     assert trace_by_id["forecast_analysis"].status == "skipped"
     assert trace_by_id["anomaly_detection"].output_summary["event_count"] == 0
@@ -148,6 +156,32 @@ def test_execution_trace_records_stable_automatic_chain(tmp_path) -> None:
     assert decision_ids[-1] == "constrained_optimization"
     assert "智能体执行链" in result.report_text
     assert "智能体决策记录" in result.report_text
+
+
+def test_feature_pipeline_trace_describes_real_window_and_scaling_metadata() -> None:
+    """窗口型检测器的展示证据应来自真实特征和窗口参数。"""
+
+    dataframe = pd.DataFrame(
+        {
+            "datetime": pd.date_range("2026-01-01", periods=100, freq="s"),
+            "Pressure": np.linspace(1.0, 2.0, 100),
+            "Current": np.linspace(2.0, 2.5, 100),
+        }
+    )
+    summary = describe_feature_pipeline(
+        dataframe,
+        ["Pressure", "Current"],
+        AnalysisConfig(detector="time_frequency_relation", autoencoder_window=8),
+    )
+
+    assert summary["feature_construction"]["feature_count"] == 6
+    assert summary["feature_construction"]["features_per_sensor"] == 3
+    assert summary["feature_construction"]["additional_feature_types"] == ["传感器关系"]
+    assert summary["window_generation"]["window_size"] == 8
+    assert summary["window_generation"]["window_count"] == 93
+    assert summary["window_generation"]["status"] == "completed"
+    assert summary["normalization"]["methods"] == ["训练段 RobustScaler"]
+    assert summary["normalization"]["raw_values_preserved"] is True
 
 
 def test_pipeline_can_run_detector_cross_validation(tmp_path) -> None:

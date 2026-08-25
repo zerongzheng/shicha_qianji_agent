@@ -1,0 +1,126 @@
+{
+  "profile_id": "skab_valve",
+  "version": "1.0.0",
+  "display_name": "SKAB 水循环阀门测试台",
+  "device_type": "工业水循环阀门系统",
+  "enabled": true,
+  "auto_match": true,
+  "schema": {
+    "time_column": "datetime",
+    "label_columns": ["anomaly", "changepoint"],
+    "required_columns": [
+      "datetime",
+      "Accelerometer1RMS",
+      "Accelerometer2RMS",
+      "Current",
+      "Pressure",
+      "Temperature",
+      "Thermocouple",
+      "Voltage",
+      "Volume Flow RateRMS"
+    ],
+    "optional_columns": ["anomaly", "changepoint"]
+  },
+  "match": {
+    "columns": [
+      "Accelerometer1RMS",
+      "Accelerometer2RMS",
+      "Current",
+      "Pressure",
+      "Thermocouple",
+      "Volume Flow RateRMS"
+    ],
+    "minimum_match_count": 5
+  },
+  "column_aliases": {
+    "DateTime": "datetime",
+    "timestamp": "datetime",
+    "PressureBar": "Pressure",
+    "FlowRateRMS": "Volume Flow RateRMS",
+    "VolumeFlowRateRMS": "Volume Flow RateRMS"
+  },
+  "expected_sampling_seconds": 1.0,
+  "healthy_baseline_path": "../SKAB/data/anomaly-free/anomaly-free.csv",
+  "recommended_analysis": {
+    "detector": "time_frequency_relation",
+    "threshold": 3.5,
+    "rolling_window": 61,
+    "min_event_length": 12,
+    "merge_gap": 30,
+    "selection_evidence": "SKAB 固定验证集与独立测试集的事件召回、误报和多路径证据综合结果",
+    "goal_policy": {
+      "balanced": "time_frequency_relation",
+      "high_recall": "time_frequency_relation",
+      "low_false_alarm": "mad",
+      "relationship_fault": "time_frequency_relation",
+      "nonlinear_pattern": "window_autoencoder",
+      "fast_screening": "mad"
+    }
+  },
+  "sensors": {
+    "Accelerometer1RMS": {
+      "display_name": "振动测点 1 RMS",
+      "unit": null,
+      "category": "振动",
+      "safe_range": null,
+      "description": "SKAB 测试台第一路加速度有效值。"
+    },
+    "Accelerometer2RMS": {
+      "display_name": "振动测点 2 RMS",
+      "unit": null,
+      "category": "振动",
+      "safe_range": null,
+      "description": "SKAB 测试台第二路加速度有效值。"
+    },
+    "Current": {
+      "display_name": "电流",
+      "unit": "A",
+      "category": "电气",
+      "safe_range": null,
+      "description": "驱动回路电流测点。"
+    },
+    "Pressure": {
+      "display_name": "压力",
+      "unit": null,
+      "category": "工艺",
+      "safe_range": null,
+      "description": "水循环回路压力测点。"
+    },
+    "Temperature": {
+      "display_name": "温度",
+      "unit": "degC",
+      "category": "温度",
+      "safe_range": null,
+      "description": "测试台环境或设备温度测点。"
+    },
+    "Thermocouple": {
+      "display_name": "热电偶温度",
+      "unit": "degC",
+      "category": "温度",
+      "safe_range": null,
+      "description": "热电偶温度测点。"
+    },
+    "Voltage": {
+      "display_name": "电压",
+      "unit": "V",
+      "category": "电气",
+      "safe_range": null,
+      "description": "驱动回路电压测点。"
+    },
+    "Volume Flow RateRMS": {
+      "display_name": "体积流量 RMS",
+      "unit": null,
+      "category": "工艺",
+      "safe_range": null,
+      "description": "水循环回路体积流量有效值。"
+    }
+  },
+  "scope": [
+    "SKAB 公共数据集的阀门故障与异常工况验证",
+    "校赛阶段异常检测、工况分析和闭环演示"
+  ],
+  "limitations": [
+    "SKAB 测点单位和设备边界不能直接替代联通企业现场参数。",
+    "进入企业验证阶段后必须重新确认字段、单位、安全范围、采样周期和阈值。"
+  ]
+}

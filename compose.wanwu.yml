@@ -1,9 +1,9 @@
 services:
-  shichi-qianji-api:
+  shicha-qianji-api:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: shichi-qianji-api
+    container_name: shicha-qianji-api
     restart: unless-stopped
     init: true
     env_file:
@@ -16,12 +16,12 @@ services:
       SKAB_DEFAULT_DIR: /datasets/SKAB/data/valve1
       HEALTHY_BASELINE_FILE: /datasets/SKAB/data/anomaly-free/anomaly-free.csv
       # 万悟与本服务加入同一个外部网络后，OpenAPI 直接使用稳定容器名。
-      API_PUBLIC_BASE_URL: ${API_PUBLIC_BASE_URL:-http://shichi-qianji-api:8000}
+      API_PUBLIC_BASE_URL: ${API_PUBLIC_BASE_URL:-http://shicha-qianji-api:8000}
     ports:
       # 默认只允许服务器本机和 SSH 隧道访问；万悟容器通过 wanwu-net 直接调用服务名。
       - "${API_BIND_ADDRESS:-127.0.0.1}:${API_HOST_PORT:-8000}:8000"
     volumes:
-      - ${SHICHI_OUTPUT_DIR:-./outputs}:/app/outputs
+      - ${SHICHA_OUTPUT_DIR:-./outputs}:/app/outputs
       - ${SKAB_HOST_DIR:-../SKAB}:/datasets/SKAB:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"

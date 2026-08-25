@@ -102,7 +102,7 @@ def _download_file(
     )
     request = Request(
         raw_url,
-        headers={"User-Agent": "shichi-qianji-wanwu-adapter/1.0"},
+        headers={"User-Agent": "shicha-qianji-wanwu-adapter/1.0"},
     )
     try:
         with opener.open(request, timeout=timeout) as response:

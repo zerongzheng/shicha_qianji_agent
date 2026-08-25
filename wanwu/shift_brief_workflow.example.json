@@ -1,0 +1,10 @@
+{
+  "wanwu_base_url": "http://127.0.0.1:8081",
+  "workflow_uuid": "WANWU_SHIFT_BRIEF_WORKFLOW_UUID",
+  "api_key_env": "WANWU_SHIFT_BRIEF_API_KEY",
+  "interval_seconds": 28800,
+  "parameters": {
+    "hours": 8,
+    "max_records": 200
+  }
+}

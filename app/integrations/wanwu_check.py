@@ -15,6 +15,7 @@ EXPECTED_OPERATION_IDS = {
     "get_industrial_analysis_status",
     "get_industrial_analysis_result",
     "get_industrial_decision_brief",
+    "explain_industrial_run",
     "generate_industrial_shift_brief",
     "cancel_industrial_analysis",
     "list_industrial_work_orders",
@@ -96,7 +97,7 @@ def check_wanwu_integration(
 def _get_json(url: str) -> dict[str, Any]:
     """读取 JSON，并把网络错误转换为容易定位的中文说明。"""
 
-    request = Request(url, headers={"User-Agent": "shichi-qianji-wanwu-check/1.0"})
+    request = Request(url, headers={"User-Agent": "shicha-qianji-wanwu-check/1.0"})
     try:
         with urlopen(request, timeout=10) as response:
             return json.loads(response.read().decode("utf-8"))
@@ -109,7 +110,7 @@ def _get_json(url: str) -> dict[str, Any]:
 def _check_http(url: str) -> int:
     """检查万悟网页是否能返回成功状态，不解析前端 HTML。"""
 
-    request = Request(url.rstrip("/"), headers={"User-Agent": "shichi-qianji-check/1.0"})
+    request = Request(url.rstrip("/"), headers={"User-Agent": "shicha-qianji-check/1.0"})
     try:
         with urlopen(request, timeout=10) as response:
             status = int(response.status)

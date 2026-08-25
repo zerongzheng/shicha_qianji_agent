@@ -269,6 +269,17 @@ class RunIdRequest(StrictApiModel):
     run_id: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
 
 
+class WanwuRunExplanationRequest(RunIdRequest):
+    """辅助解释智能体读取已完成任务时使用的请求。"""
+
+    question: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=500,
+        description="可选关注问题；只用于限定解释范围，不改变结构化分析结论",
+    )
+
+
 class WanwuModelSelectionBrief(StrictApiModel):
     """万悟画布可直接展示的主模型选择证据。"""
 
@@ -383,6 +394,31 @@ class WanwuModelAuditBrief(StrictApiModel):
     calls: list[dict[str, Any]]
 
 
+class WanwuProcessingEvidenceBrief(StrictApiModel):
+    """万悟工作流可直接展示的数据处理和模型输入证据。"""
+
+    available: bool
+    adaptive_preprocessing: dict[str, Any]
+    feature_construction: dict[str, Any]
+    window_generation: dict[str, Any]
+    normalization: dict[str, Any]
+
+
+class WanwuRunExplanationResponse(StrictApiModel):
+    """已有任务的 RAG 辅助解释和脱敏模型审计。"""
+
+    status: Literal["success"]
+    run_id: str
+    diagnosis_status: str
+    model: str | None = None
+    diagnosis: str
+    automatic_diagnosis: dict[str, Any]
+    knowledge_sources: list[dict[str, Any]]
+    model_audit: WanwuModelAuditBrief
+    limitations: list[str]
+    presentation: str
+
+
 class WanwuDecisionBriefResponse(StrictApiModel):
     """供万悟工作流展示和分支判断的工业决策证据摘要。"""
 
@@ -395,6 +431,7 @@ class WanwuDecisionBriefResponse(StrictApiModel):
     trend_risk: WanwuTrendRiskBrief
     optimization: WanwuOptimizationBrief
     work_order_summary: WanwuWorkOrderBrief
+    processing_evidence: WanwuProcessingEvidenceBrief
     rag_context: WanwuRagContextBrief
     model_audit: WanwuModelAuditBrief
     limitations: list[str]

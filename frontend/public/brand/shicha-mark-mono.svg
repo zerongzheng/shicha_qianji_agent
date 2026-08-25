@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">时察千机单色标志</title>
+  <desc id="desc">工业时序波形与闭环状态节点单色标志</desc>
+  <path d="M67 59c36-26 84-29 123-9 15 8 27 18 36 31" fill="none" stroke="currentColor" stroke-width="9" stroke-linecap="round"/>
+  <path d="m211 67 17 15-23 2" fill="none" stroke="currentColor" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M34 151c22 0 30-28 49-28 22 0 24 42 48 42 22 0 25-70 49-70 17 0 26 20 42 20" fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="130" cy="165" r="25" fill="none" stroke="currentColor" stroke-width="10"/>
+  <path d="m119 165 8 8 17-20" fill="none" stroke="currentColor" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

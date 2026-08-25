@@ -1,4 +1,4 @@
-# Check Wanwu basic services, the Shichi Qianji API, and the captcha endpoint.
+# Check Wanwu basic services, the Shicha Qianji API, and the captcha endpoint.
 # Read-only: this script does not restart, stop, or modify services.
 
 $ErrorActionPreference = "Continue"
@@ -47,7 +47,7 @@ function Test-Http($url, $label) {
     }
 }
 
-Write-Host "`n=== Shichi Qianji API ===" -ForegroundColor Cyan
+Write-Host "`n=== Shicha Qianji API ===" -ForegroundColor Cyan
 Test-Http "http://127.0.0.1:8000/health" "API health" | Out-Null
 Test-Http "http://127.0.0.1:8000/integrations/wanwu/openapi.json" "API OpenAPI" | Out-Null
 

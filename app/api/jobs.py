@@ -29,7 +29,7 @@ class BackgroundJobManager:
         self._max_workers = max_workers
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
-            thread_name_prefix="shichi-job",
+            thread_name_prefix="shicha-job",
         )
         self._slots = BoundedSemaphore(max_workers + max_queue_size)
         self._futures: dict[str, Future[Any]] = {}

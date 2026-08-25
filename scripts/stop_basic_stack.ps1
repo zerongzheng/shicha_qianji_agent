@@ -1,4 +1,4 @@
-﻿# Stop the Shichi Qianji API and all four project-owned workflow triggers.
+# Stop the Shicha Qianji API and all four project-owned workflow triggers.
 # The optional Vue3 console is stopped through its project-owned PID file.
 # Wanwu data, PostgreSQL data, containers, images, and volumes are preserved.
 
@@ -6,8 +6,8 @@ $ErrorActionPreference = "Continue"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $wanwuRoot = Join-Path (Split-Path -Parent $projectRoot) "wanwu"
 $outputDirectory = Join-Path $projectRoot "outputs"
-$apiPidPath = Join-Path $outputDirectory "shichi_qianji_api.pid"
-$frontendPidPath = Join-Path $outputDirectory "shichi_qianji_frontend.pid"
+$apiPidPath = Join-Path $outputDirectory "shicha_qianji_api.pid"
+$frontendPidPath = Join-Path $outputDirectory "shicha_qianji_frontend.pid"
 $triggerScriptName = "trigger_wanwu_workflow.ps1"
 $baseContainers = @(
     "mysql-wanwu", "mysql-wanwu-setup", "redis-wanwu", "minio-wanwu", "kafka-wanwu",

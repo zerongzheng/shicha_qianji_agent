@@ -39,7 +39,7 @@
 http://host.docker.internal:8000/integrations/wanwu/openapi.json
 ```
 
-它包含 18 个万悟可稳定调用的工具，并为每个工具固定英文 `operationId`。其中三个数据源工具
+它包含 19 个万悟可稳定调用的工具，并为每个工具固定英文 `operationId`。其中三个数据源工具
 负责查询、配置和只读验收；无人值守巡检、SLA 督办、维修后复检和班次简报分别由独立工具负责；
 `quick_industrial_diagnosis` 保留为人工上传调试入口。
 
@@ -183,7 +183,7 @@ POST /api/v1/wanwu/reports/shift-brief
 
 ### 自动化验收
 
-`scripts/accept_wanwu_workflows.ps1` 默认只检查后端健康状态、PostgreSQL、18 个工具、万悟网关验证码
+`scripts/accept_wanwu_workflows.ps1` 默认只检查后端健康状态、PostgreSQL、19 个工具、万悟网关验证码
 接口和四个运行工作流配置。传入 `-RunWorkflows` 才调用已发布工作流，传入 `-InjectSample` 才从
 公开 SKAB 向模拟目录投递一个新批次。验收报告位于
 `outputs/wanwu_acceptance_report.json`，不包含密钥和 Webhook。
@@ -363,8 +363,9 @@ POST /api/v1/forecast-compare
 ### 辅助解释、RAG 与模型日志
 
 辅助智能体与五个工作流属于同一个“时察千机工业时序智能体”能力体系，不需要创建第二个智能体。
-它可以查询任务、结果、工单和历史案例，并基于万悟知识库补充机理、验证步骤和规程来源。RAG 和
-聊天模型只能解释后端已经形成的结构化证据，不能修改异常事件、风险等级、工单编号或复检结论。
+它可以查询任务、结果、工单和历史案例，并使用 `explain_industrial_run` 基于已有 `run_id`
+补充机理、验证步骤和规程来源。该工具不接受 CSV、不重复运行工业分析，也不修改异常事件、风险
+等级、工单编号或复检结论；RAG 和聊天模型只能解释后端已经形成的结构化证据。
 
 在对话中调用会产生副作用的工具前必须得到用户明确确认；后台周期工作流视为预授权。模型调用日志
 只记录提供方、模型、状态、耗时、Token 和输入输出规模，不保存 API Key、完整提示词、回答正文或
@@ -383,7 +384,7 @@ http://host.docker.internal:8000/integrations/wanwu/openapi.json
 
 也可以在浏览器打开该地址后导入万悟“资源库 → 自定义工具”。OpenAPI 中的
 `servers` 来自 `.env` 的 `API_PUBLIC_BASE_URL`。时察千机和万悟都运行在 Docker 且加入
-`wanwu-net` 时使用 `http://shichi-qianji-api:8000`；只有时察千机直接运行在 Windows
+`wanwu-net` 时使用 `http://shicha-qianji-api:8000`；只有时察千机直接运行在 Windows
 时才使用 `http://host.docker.internal:8000`。在线万悟必须改成公网 HTTPS 地址后重启 API。
 
 ## 暂无部署环境时怎么做
@@ -392,10 +393,10 @@ http://host.docker.internal:8000/integrations/wanwu/openapi.json
 
 ```powershell
 uv run python api_main.py
-uv run shichi-qianji-wanwu-check
+uv run shicha-qianji-wanwu-check
 ```
 
-第二条命令会检查健康状态、完整 18 个万悟工具、快速单工具 Schema 和 OpenAPI 服务地址，并同时导出：
+第二条命令会检查健康状态、完整 19 个万悟工具、快速单工具 Schema 和 OpenAPI 服务地址，并同时导出：
 
 ```text
 outputs/wanwu_openapi.json
@@ -425,10 +426,10 @@ docker network create wanwu-net 2>/dev/null || true
 时察千机 `.env` 推荐至少确认以下配置：
 
 ```dotenv
-API_PUBLIC_BASE_URL=http://shichi-qianji-api:8000
+API_PUBLIC_BASE_URL=http://shicha-qianji-api:8000
 API_BIND_ADDRESS=127.0.0.1
 API_HOST_PORT=8000
-SHICHI_OUTPUT_DIR=/data/shichi-qianji/outputs
+SHICHA_OUTPUT_DIR=/data/shicha-qianji/outputs
 SKAB_HOST_DIR=/data/datasets/SKAB
 WANWU_ALLOW_PRIVATE_FILE_URLS=false
 WANWU_ALLOWED_FILE_HOSTS=
@@ -436,10 +437,10 @@ INDUSTRIAL_API_KEY=请生成独立随机密钥
 ```
 
 `API_BIND_ADDRESS=127.0.0.1` 使主机端口只允许服务器本机和 SSH 隧道访问；万悟容器仍可通过
-`http://shichi-qianji-api:8000` 调用。不要为了方便直接把 API 暴露到 `0.0.0.0`。
+`http://shicha-qianji-api:8000` 调用。不要为了方便直接把 API 暴露到 `0.0.0.0`。
 
-万悟文件节点返回的临时 URL 可能指向 Docker 内部文件服务。先在工作流运行详情中确认
-`file_url` 的主机名，再把该主机名加入 `WANWU_ALLOWED_FILE_HOSTS`，例如：
+万悟文件节点返回的临时 URL 可能指向 Docker 内部文件服务。应从试运行结果、API 调用详情或
+触发器日志中确认 `file_url` 的主机名，再把该主机名加入 `WANWU_ALLOWED_FILE_HOSTS`，例如：
 
 ```dotenv
 WANWU_ALLOWED_FILE_HOSTS=nginx-wanwu,minio-wanwu

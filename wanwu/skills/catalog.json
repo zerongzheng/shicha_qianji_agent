@@ -1,0 +1,69 @@
+{
+  "agent_id": "shicha_qianji_industrial_agent",
+  "agent_name": "时察千机工业时序智能体",
+  "version": "1.0",
+  "interaction_policy": {
+    "read_only_default": true,
+    "confirmation_required_for_side_effects": true,
+    "background_workflows_are_pre_authorized": true,
+    "model_role": "只负责按需解释结构化工业证据和知识库资料，不承担异常检测、工单生成或通知主链"
+  },
+  "skills": [
+    {
+      "id": "data_source_configuration",
+      "name": "工业数据源接入配置",
+      "mode": "manual_action",
+      "read_only_tools": ["list_industrial_data_sources", "verify_industrial_data_source"],
+      "action_tools": ["configure_industrial_data_source"],
+      "confirmation": "required",
+      "schedule": null,
+      "success_signal": "数据源已保存并通过可达性验证"
+    },
+    {
+      "id": "unattended_inspection",
+      "name": "无人值守工业巡检",
+      "mode": "background_and_confirmed_manual",
+      "read_only_tools": [
+        "get_unattended_monitoring_status",
+        "get_industrial_analysis_status",
+        "get_industrial_analysis_result",
+        "get_industrial_decision_brief",
+        "explain_industrial_run"
+      ],
+      "action_tools": ["run_unattended_industrial_cycle", "dispatch_industrial_alerts"],
+      "confirmation": "required_for_chat_optional_for_scheduled_run",
+      "schedule": "60s",
+      "success_signal": "新批次已分析、决策证据已读取并完成通知编排"
+    },
+    {
+      "id": "sla_follow_up",
+      "name": "工单 SLA 督办",
+      "mode": "background_and_confirmed_manual",
+      "read_only_tools": ["list_industrial_work_orders"],
+      "action_tools": ["run_industrial_sla_cycle"],
+      "confirmation": "required_for_chat_optional_for_scheduled_run",
+      "schedule": "300s",
+      "success_signal": "催办和升级动作已幂等记录"
+    },
+    {
+      "id": "repair_reinspection",
+      "name": "维修后自动复检",
+      "mode": "background_and_confirmed_manual",
+      "read_only_tools": ["list_industrial_work_orders", "list_industrial_feedback_cases"],
+      "action_tools": ["run_industrial_reinspection_cycle"],
+      "confirmation": "required_for_chat_optional_for_scheduled_run",
+      "schedule": "300s",
+      "success_signal": "同一数据源新批次完成复检，或明确保持待验证等待"
+    },
+    {
+      "id": "shift_brief",
+      "name": "工业班次简报",
+      "mode": "background_and_read_only",
+      "read_only_tools": ["generate_industrial_shift_brief"],
+      "action_tools": [],
+      "confirmation": "not_required",
+      "schedule": "28800s",
+      "success_signal": "最近 8 小时任务、异常、工单、SLA、复检和通知汇总已生成"
+    }
+  ]
+}

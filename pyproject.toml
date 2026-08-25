@@ -1,5 +1,5 @@
 [project]
-name = "shichi-qianji-agent"
+name = "shicha-qianji-agent"
 version = "0.1.0"
 description = "时察千机：面向工业多变量时序数据的异常诊断与运维决策智能体"
 readme = "README.md"
@@ -26,9 +26,9 @@ dev = [
 ]
 
 [project.scripts]
-shichi-qianji = "app.cli:main"
-shichi-qianji-api = "app.api.server:run"
-shichi-qianji-wanwu-check = "app.integrations.wanwu_check:main"
+shicha-qianji = "app.cli:main"
+shicha-qianji-api = "app.api.server:run"
+shicha-qianji-wanwu-check = "app.integrations.wanwu_check:main"
 
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"

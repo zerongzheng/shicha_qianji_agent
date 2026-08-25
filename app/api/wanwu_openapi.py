@@ -18,6 +18,7 @@ _READ_ONLY_OPERATIONS = {
     "get_industrial_analysis_status",
     "get_industrial_analysis_result",
     "get_industrial_decision_brief",
+    "explain_industrial_run",
     "list_industrial_work_orders",
     "list_industrial_feedback_cases",
     "generate_industrial_shift_brief",
@@ -51,6 +52,7 @@ def build_wanwu_openapi(
             "再完成任务追踪、结果读取和 dispatch_industrial_alerts 主动告警；"
             "get_industrial_decision_brief 将模型选择、交叉验证、趋势风险和受约束优化建议"
             "转换为画布可直接引用的证据字段；"
+            "explain_industrial_run 只读取已有 run_id，按需检索知识库并生成带脱敏审计的辅助解释；"
             "generate_industrial_shift_brief 按时间窗口生成任务、工单、SLA 与复检简报；"
             "run_industrial_sla_cycle 独立执行工单催办和超时升级，"
             "run_industrial_reinspection_cycle 独立执行维修后同源数据复检；"

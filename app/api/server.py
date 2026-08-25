@@ -71,6 +71,8 @@ from app.api.schemas import (
     WanwuNotificationDispatchResponse,
     WanwuQuickDiagnosisRequest,
     WanwuQuickDiagnosisResponse,
+    WanwuRunExplanationRequest,
+    WanwuRunExplanationResponse,
     WanwuShiftBriefRequest,
     WanwuShiftBriefResponse,
     WanwuWorkOrderListRequest,
@@ -93,7 +95,11 @@ from app.data.loader import (
     load_time_series,
     load_time_series_with_context,
 )
-from app.diagnosis import AutomaticDiagnosisService, diagnosis_to_dict
+from app.diagnosis import (
+    AutomaticDiagnosisService,
+    build_stored_analysis_view,
+    diagnosis_to_dict,
+)
 from app.integrations import receive_wanwu_csv
 from app.model_store import list_autoencoder_models
 from app.models import (
@@ -991,6 +997,34 @@ def _model_audit_payload(run_id: str, limit: int = 20) -> dict[str, Any]:
     }
 
 
+def _explanation_presentation(
+    run_id: str,
+    automatic: Any,
+    audit: dict[str, Any],
+) -> str:
+    """为辅助智能体提供短文本；完整证据仍保留在结构化字段中。"""
+
+    sources = [
+        str(item.get("source"))
+        for item in (automatic.evidence.knowledge or ())
+        if isinstance(item, dict) and item.get("source")
+    ]
+    source_text = "、".join(dict.fromkeys(sources)) or "未命中本地知识片段"
+    return "\n".join(
+        [
+            "【时察千机辅助解释】",
+            f"任务编号：{run_id}",
+            f"解释状态：{automatic.status}",
+            f"知识来源：{source_text}",
+            f"模型调用：{audit.get('call_count', 0)} 次（仅记录脱敏元数据）",
+            "",
+            automatic.diagnosis.strip(),
+            "",
+            "边界：解释只依据结构化算法证据和带来源知识，不等同于现场故障确诊。",
+        ]
+    )
+
+
 def _wanwu_decision_brief_payload(run_id: str) -> dict[str, Any]:
     """从已落库结果提取万悟可直接编排的决策证据，不重复执行算法。"""
 
@@ -1118,6 +1152,24 @@ def _wanwu_decision_brief_payload(run_id: str) -> dict[str, Any]:
         else next(iter(retrieval_modes), "not_run")
     )
     model_audit = _model_audit_payload(run_id)
+    trace_by_id = {
+        str(item.get("step_id")): item
+        for item in (result.get("execution_trace") or [])
+        if isinstance(item, dict) and item.get("step_id")
+    }
+
+    def trace_output(step_id: str) -> dict[str, Any]:
+        step = trace_by_id.get(step_id) or {}
+        output = step.get("output_summary")
+        return dict(output) if isinstance(output, dict) else {}
+
+    processing_evidence = {
+        "available": bool(trace_by_id),
+        "adaptive_preprocessing": trace_output("adaptive_preprocessing"),
+        "feature_construction": trace_output("feature_construction"),
+        "window_generation": trace_output("window_generation"),
+        "normalization": trace_output("normalization"),
+    }
     sensor_terms = sorted(
         {
             str(sensor).strip()
@@ -1146,6 +1198,21 @@ def _wanwu_decision_brief_payload(run_id: str) -> dict[str, Any]:
     primary_action = str(primary_alert.get("recommended_action") or "继续观察并核对现场工况")
     primary_optimization = optimization_summaries[0] if optimization_summaries else {}
     optimization_action = str(primary_optimization.get("action") or "暂无新增优化建议")
+    preprocessing_output = processing_evidence["adaptive_preprocessing"]
+    feature_output = processing_evidence["feature_construction"]
+    window_output = processing_evidence["window_generation"]
+    normalization_output = processing_evidence["normalization"]
+    processing_text = (
+        "数据处理证据："
+        f"自适应处理后 {preprocessing_output.get('processed_row_count', '未记录')} 个数据点，"
+        f"填补 {preprocessing_output.get('filled_count', '未记录')} 个缺失点；"
+        f"构建 {feature_output.get('feature_count', '未记录')} 个动态特征；"
+        f"窗口 {window_output.get('window_count', '未记录')} 个、长度 "
+        f"{window_output.get('window_size', '未记录')}；"
+        f"缩放方式 {', '.join(normalization_output.get('methods') or ['未记录'])}。"
+        if processing_evidence["available"]
+        else "数据处理证据：该历史任务未保存细分执行轨迹。"
+    )
     work_order_ids = [
         str(item["record_id"])
         for item in work_orders[:3]
@@ -1180,6 +1247,7 @@ def _wanwu_decision_brief_payload(run_id: str) -> dict[str, Any]:
             else "模型明细：暂无可用结果"
         ),
         f"工单状态：{work_order_text}",
+        processing_text,
         f"建议处置：{primary_action}；{optimization_action}。",
         "安全边界：所有优化建议须经人工确认，系统不直接下发控制指令。",
     ]
@@ -1243,6 +1311,7 @@ def _wanwu_decision_brief_payload(run_id: str) -> dict[str, Any]:
                 if item.get("record_id")
             ],
         },
+        "processing_evidence": processing_evidence,
         "rag_context": {
             "query": str(
                 diagnosis_evidence.get("retrieval_query")
@@ -1758,7 +1827,7 @@ if app:
 
         if not get_repository().ping():
             raise HTTPException(status_code=503, detail="PostgreSQL 数据库不可用")
-        return {"status": "ok", "service": "shichi-qianji", "database": "postgresql"}
+        return {"status": "ok", "service": "shicha-qianji", "database": "postgresql"}
 
     @app.get("/api/v1/auth/config")
     def auth_config() -> dict[str, Any]:
@@ -1940,7 +2009,7 @@ if app:
 
         return {
             "status": "ready" if checks["database"] == "ok" and not warnings else "degraded",
-            "service": "shichi-qianji",
+            "service": "shicha-qianji",
             "version": app.version,
             "database": {"engine": "postgresql", "ready": database_ready},
             "knowledge_base": {"ready": bool(knowledge_files), "document_count": len(knowledge_files)},
@@ -2715,6 +2784,52 @@ if app:
 
         _check_api_key(x_api_key)
         return _wanwu_decision_brief_payload(payload.run_id)
+
+    @app.post(
+        "/api/v1/wanwu/jobs/explain",
+        operation_id="explain_industrial_run",
+        summary="解释已有工业分析任务",
+        response_model=WanwuRunExplanationResponse,
+        responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+    )
+    def wanwu_explain_run(
+        payload: WanwuRunExplanationRequest,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """按需检索知识库并解释已有任务，不重新上传或执行工业分析。"""
+
+        _check_api_key(x_api_key)
+        result = _job_result_payload(payload.run_id)["result"]
+        if not isinstance(result, dict):
+            raise HTTPException(status_code=409, detail="任务没有可解释的结构化结果")
+        view = build_stored_analysis_view(result)
+        automatic = AutomaticDiagnosisService().diagnose(
+            view,
+            run_id=payload.run_id,
+            question=payload.question,
+        )
+        audit = _model_audit_payload(payload.run_id)
+        merged_result = dict(result)
+        merged_result["automatic_diagnosis"] = automatic.to_dict()
+        merged_result["model_audit"] = audit
+        get_repository().update_run_result(payload.run_id, merged_result)
+        knowledge_sources = [
+            item
+            for item in automatic.evidence.knowledge
+            if isinstance(item, dict)
+        ]
+        return {
+            "status": "success",
+            "run_id": payload.run_id,
+            "diagnosis_status": automatic.status,
+            "model": automatic.model,
+            "diagnosis": automatic.diagnosis,
+            "automatic_diagnosis": automatic.to_dict(),
+            "knowledge_sources": knowledge_sources,
+            "model_audit": audit,
+            "limitations": list(automatic.limitations),
+            "presentation": _explanation_presentation(payload.run_id, automatic, audit),
+        }
 
     @app.post(
         "/api/v1/wanwu/reports/shift-brief",
